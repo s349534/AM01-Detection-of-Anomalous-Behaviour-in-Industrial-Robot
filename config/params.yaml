@@ -1,0 +1,60 @@
+# Model parameters for Anomaly Detection
+# Adversarial Autoencoder configuration
+
+model:
+  name: "adversarial_autoencoder"
+  input_dim: 86
+  encoding_dim: 32
+  latent_dim: 16
+
+  encoder:
+    hidden_layers: [128, 64]
+    activation: "relu"
+
+  decoder:
+    hidden_layers: [64, 128]
+    activation: "relu"
+
+  discriminator:
+    hidden_layers: [32, 16]
+    activation: "leaky_relu"
+
+training:
+  batch_size: 256
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  beta1: 0.5
+  beta2: 0.999
+
+  adversarial_weight: 0.1
+  reconstruction_weight: 1.0
+
+  early_stopping:
+    patience: 10
+    min_delta: 0.0001
+
+  train_split: 0.8
+  val_split: 0.1
+
+data:
+  normal_data_path: "data/raw/KukaVelocityDataset/KukaNormal.npy"
+  slow_data_path: "data/raw/KukaVelocityDataset/KukaSlow.npy"
+  column_names_path: "data/raw/KukaVelocityDataset/KukaColumnNames.npy"
+
+  normalization: "standard"
+  augmentation: false
+
+metrics:
+  - "accuracy"
+  - "precision"
+  - "recall"
+  - "f1_score"
+  - "auc_roc"
+
+paths:
+  processed_data_dir: "data/processed/"
+  models_dir: "src/models/"
+  results_dir: "reports/"
+  figures_dir: "reports/figures/"
+  tables_dir: "reports/tables/"
