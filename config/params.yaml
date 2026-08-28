@@ -3,16 +3,21 @@
 
 model:
   name: "adversarial_autoencoder"
-  input_dim: 86
-  encoding_dim: 32
-  latent_dim: 16
+  input_dim: 86            # numero di sensori (colonne)
+  window_size: 16          # timestep per finestra (sequence-aware)
+  encoding_dim: 32         # dim dello strato denso intermedio
+  latent_dim: 16           # dim del vettore latente z
 
   encoder:
-    hidden_layers: [128, 64]
+    # Architettura 1D-Conv (vedi §4.1.2 del project_plan)
+    conv_channels: [128, 64]   # canali in uscita da ogni Conv1d
+    conv_kernels: [5, 3]       # kernel size di ogni Conv1d
+    pool_size: 2               # MaxPool dopo la prima conv
     activation: "relu"
 
   decoder:
-    hidden_layers: [64, 128]
+    # Decoder speculare: ConvTranspose1d per upsampling temporale
+    conv_channels: [64, 128]   # canali (ordine inverso rispetto encoder)
     activation: "relu"
 
   discriminator:
@@ -41,6 +46,11 @@ data:
   normal_data_path: "data/raw/KukaVelocityDataset/KukaNormal.npy"
   slow_data_path: "data/raw/KukaVelocityDataset/KukaSlow.npy"
   column_names_path: "data/raw/KukaVelocityDataset/KukaColumnNames.npy"
+
+  # Sequence-aware: ogni sample = finestra di W timestep consecutivi
+  window_size: 16          # numero di timestep per finestra (vedi §4.1.1)
+  window_stride: 1         # passo della finestra scorrevole
+  drop_incomplete: true    # scarta i primi W-1 sample se non hanno storia
 
   normalization: "standard"
   augmentation: false
