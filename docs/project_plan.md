@@ -51,14 +51,22 @@ Detection"*, 2022 — citato esplicitamente nella traccia.
 
 | File | Shape | Note |
 |---|---|---|
-| `KukaNormal.npy` | `(233792, 86)` | Movimenti normali |
-| `KukaSlow.npy` | `(41538, 87)` | Movimenti anomali/lenti |
-| `KukaColumnNames.npy` | `(87,)` | Nomi delle 87 colonne |
+| `KukaNormal.npy` | `(233792, 86)` | Movimenti normali (action + 85 feature) |
+| `KukaSlow.npy` | `(41538, 87)` | Movimenti anomali (action + 85 feature + anomaly) |
+| `KukaColumnNames.npy` | `(87,)` | Nomi: action, 85 feature, anomaly |
 
-### Anomalie da chiarire (Fase 1)
-- `KukaSlow` ha 87 colonne vs 86 di `KukaNormal` → la colonna in più va
-  identificata (timestamp? label sintetica?).
-- Distribuzione temporale: ordinati? campionamento regolare? ci sono gap?
+### Struttura colonne (Fase 1 COMPLETATA)
+- **Colonna 0** (`action`): tipo di movimento, valori interi 0-31. **Presente in entrambi i dataset.**
+- **Colonne 1-85**: 85 feature numeriche (potenza, corrente, tensione, Gyro, Accelerometro, posizione, temperatura)
+- **Colonna 86** (`anomaly`): **solo in KukaSlow**, sempre valore 1 → conferma che KukaSlow = anomalie.
+- **Nessun timestamp**: l'ordine delle righe = ordine temporale (confermato da alta autocorrelazione lag-1).
+- **Nessun NaN, nessun inf**: dati puliti.
+- **Feature costanti (da rimuovere Fase 2)**: `sensor_id2_temp`, `sensor_id5_temp`, `sensor_id6_temp`, `sensor_id7_temp` (std ~1e-10).
+
+### Scale eterogenee → StandardScaler necessario
+- std massimo: ~51 (gyro Z)
+- std minimo (non costante): ~0.01 (AccZ)
+- **Confermata**: senza normalizzazione, le feature a grande varianza dominerebbero il latent space.
 
 ### Strategia di split
 - **KukaNormal NON va nel training per intero.** Va diviso 60/20/20.
@@ -80,16 +88,17 @@ Detection"*, 2022 — citato esplicitamente nella traccia.
 
 ## 3. Roadmap a fasi
 
-### Fase 1 — Esplorazione dati (Notebook 01)
-- Caricare i 3 `.npy`, shape/dtype/memoria.
-- Identificare la 87ª colonna di KukaSlow.
-- Statistiche descrittive per feature.
-- Distribuzioni Normal vs Slow (istogrammi, boxplot).
-- Heatmap correlazioni.
-- PCA 2D e t-SNE 2D (separabilità visiva).
-- Verifica ordinamento temporale → decide modalità di split.
-- **Output**: decisioni documentate (feature da scartare, normalizzazione,
-  W, split).
+### Fase 1 — Esplorazione dati (COMPLETATA — Notebook 01)
+- [x] Caricato i 3 `.npy`: KukaNormal (233792, 86), KukaSlow (41538, 87), KukaColumnNames (87, `<U37`).
+- [x] 87ª colonna = `anomaly` (label sempre 1). 1ª colonna = `action` (0-31). 85 feature numeriche.
+- [x] Statistiche descrittive: scale eterogenee (std 0.01–51).
+- [x] Distribuzioni Normal vs Slow: differenze significative in velocità, corrente, potenza.
+- [x] Heatmap Spearman: correlazione massima 0.9576 (feature ridondanti presenti).
+- [x] PCA: PC1 = 10.4%, PC2 = 10.2%. 10 PC = ~55% varianza. → dati non bassa-dimensionalità.
+- [x] t-SNE 2D: separabilità non-lineare esplorata (sottocampione 5000).
+- [x] Autocorrelazione lag-1 = 0.99+ → **split temporale** (no shuffle) confermato.
+- [x] **Output**: 4 feature costanti identificate (`sensor_id{2,5,6,7}_temp`).
+  Normalizzazione confermata (StandardScaler). W=16 rimane default (validazione Fase 3).
 
 ### Fase 2 — Preprocessing (Notebook 02 + `src/data/`)
 - Gestione colonna extra in KukaSlow.
@@ -270,15 +279,15 @@ altre celle, va spostato in `src/`.
 
 ## 6. Stato di avanzamento
 
-### Fase 1 — Esplorazione
-- [ ] Caricamento 3 `.npy` e shape/dtype
-- [ ] Identificazione 87ª colonna di KukaSlow
-- [ ] Statistiche descrittive per feature
-- [ ] Confronto distribuzioni Normal vs Slow
-- [ ] Heatmap correlazioni
-- [ ] PCA / t-SNE 2D
-- [ ] Verifica ordinamento temporale → decide split
-- [ ] Decisioni documentate
+### Fase 1 — Esplorazione (COMPLETATA)
+- [x] Caricamento 3 `.npy` e shape/dtype
+- [x] Identificazione 87ª colonna di KukaSlow
+- [x] Statistiche descrittive per feature
+- [x] Confronto distribuzioni Normal vs Slow
+- [x] Heatmap correlazioni
+- [x] PCA + t-SNE 2D
+- [x] Verifica ordinamento temporale → split temporale confermato
+- [x] Decisioni documentate (vedi §7 e §9)
 
 ### Fase 2 — Preprocessing
 - [ ] Gestione colonna extra
@@ -326,12 +335,12 @@ altre celle, va spostato in `src/`.
 
 ## 7. Decisioni aperte
 
-1. **87ª colonna di KukaSlow**: timestamp, label o errore? → Fase 1.
-2. **Feature da scartare**: varianza zero, correlazione > 0.95, dominio. → Fase 1.
-3. **Split temporale o random**: default temporale, da confermare in Fase 1.
+1. **87ª colonna di KukaSlow** ✅ RISOLTA: `anomaly` (label binaria, sempre 1). La colonna 86 è il target.
+2. **Feature da scartare** ✅ RISOLTO in Fase 1: 4 feature costanti (temp sensor 2,5,6,7, std~1e-10). Correlazione >0.95 → valutare in Fase 2.
+3. **Split temporale o random** ✅ RISOLTO: **temporale** (no shuffle). Autocorrelazione lag-1 = 0.99+ per tutte le feature → dati ordinati nel tempo.
 4. **W**: default 16, validato in Fase 3.
 5. **MAE vs MSE**: confronto in Fase 5.
-6. **Latent dim**: grid {8, 16, 32} in Fase 5.
+6. **Latent dim**: 16 (da params.yaml). Grid {8, 16, 32} validazione Fase 5.
 7. **Quanti run**: ≥1 AE + ≥1 AAE, idealmente 3+ con seed diversi.
 8. **Modelli extra** (Isolation Forest, OC-SVM): facoltativi, se avanza tempo.
 
@@ -348,7 +357,24 @@ altre celle, va spostato in `src/`.
 
 ## 9. Note di sessione
 
-> Sezione libera per annotare *cosa abbiamo fatto*, *cosa non ha funzionato*,
-> *idee emerse*. Da consultare a inizio sessione.
+### Sessione 1 — Fase 1: Esplorazione dati (15ago2026)
+**Cosa è stato fatto:**
+- Notebook `01_data_exploration.ipynb` popolato con caricamento, identificazione
+  colonne, statistiche, distribuzioni, correlazioni, PCA, t-SNE, autocorrelazione.
+- 4 immagini generate in `reports/figures/fase1_*.png`.
+- Script di verifica (`verify_fase1.py`) conferma tutti i blocchi.
 
-- *(da compilare)*
+**Bug risolti:**
+- `np.load(allow_pickle=True)` + try/except per robustezza.
+- Soglia feature costanti: `1e-8` (numpy ddof=0 dava std~3e-10, sotto soglia).
+- PCA argmax: `np.argmax(cumsum >= t)` restituisce 0 anche se non soddisfatto →
+  aggiunto controllo esplicito.
+
+**Decisioni chiuse:**
+- 87ª colonna = `anomaly` (label). Nessun timestamp → ordine riga = tempo.
+- 4 feature costanti → rimuovere in Fase 2: `sensor_id{2,5,6,7}_temp`.
+- Split = temporale (lag-1 AC = 0.99+). StandardScaler confermato.
+- W = 16 (default, validazione Fase 3).
+
+**Prossima fase:** Fase 2 — Preprocessing (`notebooks/02_preprocessing.ipynb`,
+`src/data/preprocessing.py`, `src/data/dataset.py`).
