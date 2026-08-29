@@ -58,4 +58,3 @@ logs/
 # Environment
 .env
 .env.local
-*.toml
