@@ -288,6 +288,9 @@ altre celle, va spostato in `src/`.
 - [x] PCA + t-SNE 2D
 - [x] Verifica ordinamento temporale → split temporale confermato
 - [x] Decisioni documentate (vedi §7 e §9)
+- [~] `src/data/dataset.py` e `src/data/preprocessing.py`: **scaffolding** presente
+  (docstring + firma); l'implementazione concreta di caricamento/split/normalizzazione
+  è spostata nella **Fase 2** — servono per `main.py` e per i notebook produttivi.
 
 ### Fase 2 — Preprocessing
 - [ ] Gestione colonna extra
@@ -378,3 +381,23 @@ altre celle, va spostato in `src/`.
 
 **Prossima fase:** Fase 2 — Preprocessing (`notebooks/02_preprocessing.ipynb`,
 `src/data/preprocessing.py`, `src/data/dataset.py`).
+
+### Sessione 2 — Infrastruttura HPC + riproducibilità (30ago2026)
+**Cosa è stato fatto:**
+- Automazione SSH/SLURM in `hpc/`: `hpc_connect.sh` (keycheck/deploy/submit/batch/interactive),
+  `setup_env.sh` (uv + Python 3.13 + Jupyter kernel `am01-hpc`), `slurm_job_template.sh`.
+- `uv` come unica fonte di verità: `pyproject.toml` + `uv.lock` + `.python-version`=3.13;
+  `uv sync`/`uv run`; `requirements.txt` rigenerato via `uv export`.
+- `src/main.py` reso entry-point CLI (`--config`), con report di device e import di tutti i
+  moduli `src.*`.
+- Correzioni SLURM: `SCRATCH_DIR="${SCRATCH:-${HOME}/scratch}"` (il cluster non esporta `$SCRATCH`
+  in tutti i batch context → "unbound variable"); `cmd_submit` crea `~/jobs/logs/` prima di
+  `sbatch` (SLURM non crea le directory `--output`).
+
+**Verifica GPU (job 1911144, partizione `gpu_a40`, 30' walltime):**
+- Remote: PyTorch 2.7.1+cu126, driver NVIDIA A40 = **570.86**.
+- `CUDA available: True`, `GPU: NVIDIA A40`, `CUDA version: 12.6`.
+- Log: `Job completed successfully.`, ExitCode **0:0**.
+- Nota: PyTorch 2.13.0/cu130 (CUDA 13) è incompatibile con driver 570.x (ne serve ≥580)
+  → `CUDA available: False`. Il pin `torch>=2.7,<2.8` (`cu126`) in `pyproject.toml` risolve.
+- Partizione `gpu_a40` meno congestionata di `gpu_a40_ext`.
