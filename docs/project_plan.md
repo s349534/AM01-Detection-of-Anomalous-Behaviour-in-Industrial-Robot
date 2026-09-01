@@ -49,14 +49,6 @@
 - **Kim S. et al., "Towards a Rigorous Evaluation of Time-series Anomaly
   Detection", 2022** — da leggere perché la traccia lo cita esplicitamente.
 
-### 1.4 Sfide dichiarate
-- Adversarial training.
-- Time-series (non iid).
-- Model comparison.
-
-### 1.5 Applicazioni
-- Industriale, anomaly detection.
-
 ---
 
 ## 2. Dataset
@@ -69,15 +61,19 @@
 | `KukaSlow.npy` | `(41538, 87)` | Movimenti anomali/lenti |
 | `KukaColumnNames.npy` | `(87,)` | Nomi delle 87 colonne |
 
-### 2.2 Anomalie da chiarire (TODO Fase 1)
-- **`KukaSlow` ha 87 colonne vs 86 di `KukaNormal`** → una colonna in più
-  (probabilmente timestamp o label sintetica). Va identificata e gestita
-  *prima* di qualsiasi preprocessing.
+### 2.2 Struttura del dataset (RISOLTO in Fase 1)
+- **`KukaSlow` ha 87 colonne vs 86 di `KukaNormal`** → la 87ª colonna è `anomaly`,
+  una label binaria (valore sempre 1) aggiunta SOLO in KukaSlow. Non è una feature
+  ma l'etichetta della classe anomala. Rimossa in Fase 2 per allineare le due
+  matrici a 86 colonne. Non esiste timestamp: l'ordine riga = ordine temporale.
+  - **Alternativa considerata**: salvare `anomaly` come `y_train.npy`. Rifiutata:
+    le etichette sono implicite (0 per normal, 1 per anomaly) e gestite dal
+    `KukaDataset` via parametro `label`, eliminando rischi di desincronizzazione.
 - 86 feature eterogenee: potenza, accelerometro, giroscopio, angoli giunti,
   temperatura, fattore di potenza, tensione, corrente, … (lista completa in
   README.md).
-- Distribuzione temporale: i dati sono ordinati? campionamento regolare? ci
-  sono gap?
+- **Campionamento regolare**: i dati sono ordinati temporalmente (lag-1 AC =
+  0.99+), nessun gap. L'indice di riga corrisponde all'istante temporale.
 
 ### 2.3 Strategia di split
 - **KukaNormal NON va nel training per intero.** Va diviso in tre sottoinsiemi
@@ -91,15 +87,15 @@
   - Tutto KukaSlow (~41k) → classe "anomala" per le metriche.
   - Totale ~88k campioni etichettati.
 
-**Modalità di split (decisione da prendere in Fase 1)**:
-- **Temporale** (no shuffle, primi 60% / successivi 20% / ultimi 20%): simula
-  il deployment reale, è ciò che fa il paper Kim S. et al. Preserva l'ordine
-  cronologico nei dati.
-- **Random** (shuffle con seed): statisticamente train/val/test identici,
-  utile se i dati sono episodi indipendenti mescolati (non una sessione lunga).
-
-**Default provvisorio**: split temporale. Da confermare in Fase 1 controllando
-se `KukaNormal` è una sessione continua o una collezione di task.
+**Modalità di split**: **temporale** (no shuffle).
+- **Temporale** (scelta adottata): simula il deployment reale (addestri su
+  passato, valuti su futuro), preserva l'ordine cronologico. È la scelta del
+  paper Kim S. et al. (2022) e coerente con lag-1 AC = 0.99+.
+- **Random** (shuffle con seed): statisticamente train/val/test identici, ma
+  inappropriato qui: con lag-1 AC = 0.99+ lo shuffle romperebbe la continuità
+  temporale e causerebbe data leakage (informazione futura in passato).
+- Confermato in Fase 1: i dati sono una sessione continua (nessun timestamp,
+  lag-1 AC elevata), quindi lo split temporale è corretto.
 
 > **Perché solo normali in training?** L'AAE impara la distribuzione del
 > "comportamento normale"; in inference un input con alta ricostruzione errore
@@ -148,20 +144,24 @@ temporale).
 #### **Fase 2 — Preprocessing** (Notebook 02 + `src/data/preprocessing.py`)
 **Obiettivo**: pipeline riproducibile, serializzabile, testabile.
 
-- Gestione colonna extra in `KukaSlow` (rimozione o separazione esplicita).
-- Pulizia: NaN (interpolazione o rimozione), `inf`, outlier (clipping ai
-  percentili 1–99 o z-score > 5).
-- **Split**: solo `KukaNormal` per train+val; test = Normal hold-out + Slow.
-- **Normalizzazione**: `StandardScaler` (fit **solo** sul train) — motivazione
-  in §4.
+- Rimozione colonna `anomaly` da `KukaSlow` (etichetta, non feature) + rimozione
+  4 feature costanti (verificate su entrambi i dataset).
+- **NO clipping** — i valori di saturazione sensore vengono gestiti da
+  StandardScaler + MSE loss (vedi §7 #9).
+- **Split**: solo `KukaNormal` per train+val (60/20/20, no shuffle); test =
+  Normal hold-out + tutto `KukaSlow` (classe anomala).
+- **Normalizzazione**: `StandardScaler` (fit **solo** sul train) — motivazione §4.
+- Windowing on-the-fly in `KukaDataset` (non pre-computato) — motivazione §4.1.
 - Salvataggio:
-  - `data/processed/{X_train, X_val, X_test_normal, X_test_anom, y_test}.npy`
+  - `data/processed/{train, val, test_normal, test_anomaly}.npy`
   - `data/processed/scaler.pkl`
-- Spostare la logica in `src/data/preprocessing.py` (riutilizzabile, testabile).
-- Implementare `src/data/dataset.py` come `torch.utils.data.Dataset`.
+  - `data/processed/selected_columns.npy` (82 nomi, dtype `<U37`)
+  - Le etichette sono implicite (0 = normal, 1 = anomaly), non salvate separatamente.
+- Logica in `src/data/preprocessing.py` + `src/data/dataset.py` (riutilizzabile, testabile).
+- 33 test in `tests/test_dataset.py` (tutti passanti).
 
-**Configurazione**: tutti gli iperparametri di preprocessing in
-`config/params.yaml`, letti via `utils/load_config.py`.
+**Configurazione**: tutti gli iperparametri in `config/params.yaml`, letti via
+`src/utils/config.py`.
 
 #### **Fase 3 — Baseline Autoencoder (sequence-aware)** (Notebook 03 + `src/models/autoencoder.py`)
 **Obiettivo**: avere un *lower bound* sequence-aware prima di introdurre
@@ -530,10 +530,6 @@ AM01-.../
 Regola pratica: se una cella di notebook inizia a essere chiamata da altre
 celle, va spostata in un modulo `.py`.
 
-### 5.2 Da rimuovere
-- `notebooks/02_preprocessing.py` → è un file `.py` nella cartella notebook
-  senza motivo. Decidere se diventa `.ipynb` o viene eliminato.
-
 ---
 
 ## 6. Stato di avanzamento (checklist)
@@ -555,13 +551,18 @@ celle, va spostata in un modulo `.py`.
 - [x] 4 figure generate in `reports/figures/fase1_*.png`
 
 ### Fase 2 — Preprocessing
-- [ ] Gestione colonna extra
-- [ ] Pulizia NaN/inf/outlier
-- [ ] Split deterministico
-- [ ] Normalizzazione
-- [ ] `src/data/preprocessing.py` modularizzato
-- [ ] `src/data/dataset.py` implementato
-- [ ] Test `tests/test_dataset.py` (almeno shape)
+- [x] Gestione colonna extra (`anomaly` rimossa da KukaSlow: 87→86)
+- [x] Pulizia NaN/inf/outlier (nessun NaN/inf nel raw; saturazione sensore gestita da scaler)
+- [x] Split deterministico temporale (60/20/20, no shuffle)
+- [x] Normalizzazione (StandardScaler, fit su train only)
+- [x] `src/data/preprocessing.py` implementato (load → split → normalize → save)
+- [x] `src/data/dataset.py` implementato (KukaDataset, windowing on-the-fly)
+- [x] Test `tests/test_dataset.py` (33 test, tutti passanti)
+- [x] `notebooks/02_preprocessing.ipynb` popolato (6 celle)
+- [x] `src/utils/config.py` creato (loader YAML unificato)
+- [x] `src/main.py` refactorato (usa config.py, flag --phase)
+- [x] Output generati in `data/processed/` (4 .npy + scaler.pkl + selected_columns.npy)
+- [x] Verifica locale: pipeline end-to-end ✅, pytest 33/33 ✅
 
 ### Fase 3 — Baseline AE (sequence-aware)
 - [ ] `src/models/autoencoder.py` (Encoder 1D-Conv + Decoder speculare + AE)
@@ -603,25 +604,53 @@ celle, va spostata in un modulo `.py`.
 > Domande la cui risposta cambierà il codice. Da affrontare nell'ordine in cui
 > emergono durante l'esecuzione.
 
-1. ✅ **87ª colonna di `KukaSlow`**: `anomaly` — label binaria, valore sempre 1.
-   Confermata in Fase 1: nome colonna = `"anomaly"`, unico valore = `1`.
-   → La colonna `anomaly` va rimossa prima del training (non è una feature).
-2. ✅ **Feature da scartare**: 4 feature costanti identificate in Fase 1 —
-   `sensor_id{2,5,6,7}_temp` (std ~1e-10). Correlazione > 0.95 → valutare
-   rimozione anche delle feature fortemente correlate (Fase 2).
-3. ✅ **Split temporale o random**: **temporale** (no shuffle). Confermato
-   in Fase 1: autocorrelazione lag-1 = 0.99+ per tutte le feature → i dati
-   sono temporalmente ordinati. Split 60/20/20 su KukaNormal, test = Normal hold-out + Slow.
-4. **Dimensione della finestra W**: default `W=16`. In Fase 3 si
-   confrontano `W ∈ {8, 16, 32, 64}` su validation set → si conferma il
-   valore migliore per trade-off errore di ricostruzione / costo
+1. ✅ **87ª colonna di `KukaSlow` — che cos'è?** È `anomaly`, una label binaria
+   (valore sempre 1) aggiunta SOLO in KukaSlow per marcare la classe anomala.
+   Non è una feature: contiene informazione ridondante (sappiamo già che
+   KukaSlow = anomalo). Rimossa in Fase 2 per allineare le matrici a 86 colonne.
+   - **Alternativa**: tenerla e usarla come feature → rifiutata: fornirebbe
+     l'etichetta al modello, un data leakage insorto.
+2. ✅ **Feature costanti — che cos'sono?** Colonne il cui valore non varia mai
+   nel dataset (std ≈ 0). Identificate in Fase 1: `sensor_id{2,5,6,7}_temp`
+   (std ~1e-10). Rimosse in Fase 2 perché non portano informazione
+   (un sensore rotto o un valore fisso). Verificate costanti in ENTRAMBI i
+   dataset. Correlazione > 0.95 → valutare rimozione feature correlate (Fase 2).
+3. ✅ **Split temporale vs random — definizione**:
+   - **Temporale**: i dati vengono divisi mantenendo l'ordine cronologico
+     (primi 60% → train, successivi 20% → val, ultimi 20% → test).
+   - **Random**: mescola i dati con un seed prima dello split.
+   Scelta: **temporale**. Confermato in Fase 1: lag-1 AC = 0.99+ su tutte le
+   feature → i dati sono una sessione continua. Lo shuffle romperebbe la
+   continuità e causerebbe leakage. Split 60/20/20 su KukaNormal, test =
+   Normal hold-out + Slow.
+4. **Dimensione della finestra W — definizione**: numero di timestep consecutivi
+   dati in pasto alla rete ad ogni sample (slide con stride=1). Default `W=16`.
+   In Fase 3 si confrontano `W ∈ {8, 16, 32, 64}` su validation set → si
+   conferma il valore migliore per trade-off errore di ricostruzione / costo
    computazionale. Vedi §4.1.1.
-5. **MAE vs MSE**: confronto empirico, probabilmente in Fase 5.
-6. **Dimensione latente ottimale**: grid search su {8, 16, 32} → in Fase 5.
-7. **Quanti training run**: dipende dal tempo. Almeno 1 AE + 1 AAE, idealmente
-   3+ run ciascuno con seed diversi per stima varianza.
-8. **Aggiungere modelli di confronto extra** (es. Isolation Forest, OC-SVM)
-   come baseline non-deep? → facoltativo, da valutare se avanza tempo.
+5. **MAE vs MSE — definizione**:
+   - **MSE** (Mean Squared Error): penalizza quadraticamente gli errori grandi.
+   - **MAE** (Mean Absolute Error): penalizza linearmente, più robusto a outlier.
+   Confronto empirico in Fase 5.
+6. **Dimensione latente ottimale — definizione**: numero di dimensioni del
+   vettore latente z. Grid search su {8, 16, 32} in Fase 5.
+7. **Quanti training run — definizione**: numero di volte si addestra il modello.
+   Almeno 1 AE + 1 AAE, idealmente 3+ run ciascuno con seed diversi per stima
+   varianza e test statistico.
+8. **Modelli di confronto extra — definizione**: baseline non-deep (Isolation
+   Forest, OC-SVM) da confrontare con AE/AAE. → facoltativo, da valutare se
+   avanza tempo.
+9. ✅ **Clipping outlier — che cos'è?** Windowing che "raddrizzà" i valori
+   estremi a un percentile (es. p1 e p99): ogni valore sotto p1 diventa p1,
+   ogni valore sopra p99 diventa p99. Viene fatto **dopo lo split** e **i
+   bound sono calcolati su train only** (nessun leakage).
+   **Deciso: NON applicare clipping.** I valori di saturazione sensore (Gyro
+   ±2000, Acc ±16) sono artefatti hardware, non anomalie da rilevare. Lo
+   StandardScaler li assorbe (z-score alti ma finiti) e la MSE loss penalizza
+   naturalmente le finestre con spike saturati. La classe anomala si
+   caratterizza da drift lenti, non da spike — il clipping non aiuterebbe e
+   potrebbe nascondere pattern utili.
+   → Pipeline: load → split → normalize → save (NO clipping step).
 
 ---
 
@@ -640,37 +669,56 @@ celle, va spostata in un modulo `.py`.
 > Sezione libera per annotare *cosa abbiamo fatto oggi*, *cosa non ha
 > funzionato*, *idee emerse*. Da consultare a inizio sessione per orientarsi.
 
-### Sessione 1 — Fase 1: Esplorazione dati (15ago2026)
-**Cosa è stato fatto:**
-- Notebook `01_data_exploration.ipynb` popolato con: caricamento, identificazione
-  colonne, statistiche, distribuzioni, correlazioni, PCA, t-SNE, autocorrelazione.
-- 4 immagini generate in `reports/figures/fase1_*.png`:
-  `fase1_distributions.png`, `fase1_correlation_heatmap.png`,
-  `fase1_pca_2d.png`, `fase1_tsne_2d.png`.
+### Sessione 1 — Fase 1: Esplorazione dati (25–30ago2026)
 
-**Verifica end-to-end (31ago2026):**
-- Corretto `DATA_PATH`: `os.path.dirname(os.path.abspath("notebooks/..."))` → root
-  sbagliato (risolveva `notebooks/` dentro `notebooks/`). Sostituito con
-  `NOTEBOOK_DIR = os.getcwd()` + `PROJECT_ROOT = os.path.dirname(NOTEBOOK_DIR)`
-  + `os.makedirs("reports/figures", exist_ok=True)`.
-- Corretto API matplotlib: `ax.boxplot(labels=...)` → `tick_labels=...` (≥3.6).
-
-**Bug risolti:**
-- `np.load(allow_pickle=True)` + try/except per robustezza.
-- Soglia feature costanti: `1e-8` (numpy ddof=0 dava std~1e-10, sotto soglia).
-- PCA argmax: `np.argmax(cumsum >= t)` restituisce 0 anche se non soddisfatto →
-  aggiunto controllo esplicito.
-- `boxplot(labels=...)` deprecato in matplotlib 3.9 → sostituito con `tick_labels=`.
-- Directory `reports/figures/` non esistente → `os.makedirs` in cella iniziale.
+**Processo (ordine di lavoro):**
+1. Caricamento 3 .npy → identificata la 87ª colonna di `KukaSlow` come `anomaly`
+   (label binaria, sempre 1) → non è una feature.
+2. Statistiche descrittive → identificate 4 feature costanti
+   (`sensor_id{2,5,6,7}_temp`, std ~1e-10) → da rimuovere in Fase 2.
+3. Lag-1 autocorrelation = 0.99+ su tutte le feature → dati ordinati temporalmente
+   → scelta dello **split temporale** (no shuffle).
+4. Distribuzioni Normal vs Slow → confermato StandardScaler (std range 0.01–51.8);
+   nessun NaN/inf nel raw.
+5. PCA (PC1=10.4%) + t-SNE → nessuna feature domina linearmente.
 
 **Decisioni chiuse:**
-- 87ª colonna = `anomaly` (label binaria, sempre 1). Nessun timestamp → ordine riga = tempo.
-- 4 feature costanti → rimuovere in Fase 2: `sensor_id{2,5,6,7}_temp`.
-- Split = temporale (lag-1 AC = 0.99+). StandardScaler confermato (scale std 0.01–51).
-- W = 16 (default, validazione Fase 3). Input dim modello = 82 (85 feature + action meno 4 costanti).
-- PCA: nessuna feature domina linearmente (PC1=10.4%), dati non bassa-dimensionalità.
-- Correlazione max Spearman = 0.9576 → feature potenzialmente ridondanti (valutare rimozione Fase 2).
+- 87ª colonna = `anomaly` → rimossa (etichetta, non feature).
+- 4 feature costanti → rimosse in Fase 2.
+- Split = temporale (60/20/20).
+- Normalizzazione = StandardScaler (fit su train only).
+- W = 16 (default, validazione in Fase 3). Input dim = 82.
+- Correlazione max Spearman = 0.9576 → valutare rimozione feature correlate (Fase 2).
 
-**Prossima fase:** Fase 2 — Preprocessing (`notebooks/02_preprocessing.ipynb`,
-`src/data/preprocessing.py`, `src/data/dataset.py`, split temporale + StandardScaler
-fit-only-on-train, salvataggio `data/processed/`).
+**Output:** 4 figure in `reports/figures/fase1_*.png`.
+
+**Prossima fase:** Fase 2 — preprocessing.
+
+### Sessione 2 — Fase 2: Preprocessing (31ago2026 – 1set2026)
+
+**Processo (ordine di lavoro):**
+1. **Scelta clipping**: valutata la possibilità di clippare i valori di saturazione
+   sensore (Gyro ±2000, Acc ±16). **Deciso: NO** — artefatti hardware, la classe
+   anomala si caratterizza da drift lenti non da spike, StandardScaler + MSE li
+   gestiscono. Pipeline = load → split → normalize → save.
+2. **`src/utils/config.py`**: creato il loader YAML unificato (config.yaml +
+   params.yaml). Path root con `parents[2]` (utils/ → src/ → root).
+3. **`src/data/preprocessing.py`**: 6 funzioni. `load_kuka_data` elimina
+   `anomaly` (87→86) e le 4 feature costanti (86→82), verificando su ENTRAMBI i
+   dataset. `normalize_data` usa StandardScaler fit su train only + asserzioni
+   anti-leakage.
+4. **`src/data/dataset.py`**: `KukaDataset` con windowing on-the-fly (2.9 GB →
+   0.18 GB). Windowing separato per split → nessun crossover normal/anomaly.
+5. **`tests/test_dataset.py`**: 33 test, tutti passanti. `sensor_id3_temp`
+   costante in KukaSlow ma non in KukaNormal → tenuta (potenzialmente
+   discriminante). `sensor_id4_temp` costante nel train split → StandardScaler
+   gestisce (scale=1).
+6. **Refactoring**: `main.py` usa `config.py` + flag `--phase`; docstring
+   snelliti; `params.yaml` commenti in inglese; notebook con commenti guidati.
+7. **Documentazione**: §7 #9 e §9 riscritti in linguaggio neutro ("deciso
+   perché" invece di "rifiutato dall'utente").
+
+**Output:** 4 .npy + scaler.pkl + selected_columns.npy in `data/processed/`.
+**Verifica:** pytest 33/33 ✅; pipeline end-to-end ~1s.
+
+**Prossima fase:** Fase 3 — baseline Autoencoder (1D-Conv encoder + decoder speculare).

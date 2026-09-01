@@ -3,21 +3,21 @@
 
 model:
   name: "adversarial_autoencoder"
-  input_dim: 86            # numero di sensori (colonne)
-  window_size: 16          # timestep per finestra (sequence-aware)
-  encoding_dim: 32         # dim dello strato denso intermedio
-  latent_dim: 16           # dim del vettore latente z
+  input_dim: 82            # 86 original columns - 4 constant features (sensor_id{2,5,6,7}_temp)
+  window_size: 16          # timesteps per sliding window
+  encoding_dim: 32         # intermediate dense layer dimension
+  latent_dim: 16           # latent vector dimension
 
   encoder:
-    # Architettura 1D-Conv (vedi §4.1.2 del project_plan)
-    conv_channels: [128, 64]   # canali in uscita da ogni Conv1d
-    conv_kernels: [5, 3]       # kernel size di ogni Conv1d
-    pool_size: 2               # MaxPool dopo la prima conv
+    # 1D-Conv architecture (see §4.1.2 in project_plan)
+    conv_channels: [128, 64]   # output channels per Conv1d
+    conv_kernels: [5, 3]       # kernel size per Conv1d
+    pool_size: 2               # MaxPool after first conv
     activation: "relu"
 
   decoder:
-    # Decoder speculare: ConvTranspose1d per upsampling temporale
-    conv_channels: [64, 128]   # canali (ordine inverso rispetto encoder)
+    # Symmetric decoder: ConvTranspose1d for temporal upsampling
+    conv_channels: [64, 128]   # channels (reverse order of encoder)
     activation: "relu"
 
   discriminator:
@@ -39,32 +39,21 @@ training:
     patience: 10
     min_delta: 0.0001
 
-  train_split: 0.8
-  val_split: 0.1
+  train_split: 0.6       # 60% of KukaNormal → training (semi-supervised: normal only)
+  val_split: 0.2         # 20% of KukaNormal → validation + threshold calibration
+  # test_split = 1.0 - train_split - val_split = 0.2 (20% KukaNormal → test_normal)
 
 data:
   normal_data_path: "data/raw/KukaVelocityDataset/KukaNormal.npy"
   slow_data_path: "data/raw/KukaVelocityDataset/KukaSlow.npy"
   column_names_path: "data/raw/KukaVelocityDataset/KukaColumnNames.npy"
 
-  # Sequence-aware: ogni sample = finestra di W timestep consecutivi
-  window_size: 16          # numero di timestep per finestra (vedi §4.1.1)
-  window_stride: 1         # passo della finestra scorrevole
-  drop_incomplete: true    # scarta i primi W-1 sample se non hanno storia
+  # Sequence-aware: each sample = window of W consecutive timesteps
+  window_size: 16          # number of timesteps per window (see §4.1.1)
+  window_stride: 1         # sliding-window stride
+  drop_incomplete: true    # drop first W-1 samples (insufficient history)
 
-  normalization: "standard"
+  normalization: "standard"   # StandardScaler fit on train only
   augmentation: false
-
-metrics:
-  - "accuracy"
-  - "precision"
-  - "recall"
-  - "f1_score"
-  - "auc_roc"
-
-paths:
-  processed_data_dir: "data/processed/"
-  models_dir: "src/models/"
-  results_dir: "reports/"
-  figures_dir: "reports/figures/"
-  tables_dir: "reports/tables/"
+  # No outlier clipping — by project design (see §7 #9 in project_plan).
+  # Sensor saturation (Gyro ±2000, Acc ±16) is handled by StandardScaler + MSE loss.
