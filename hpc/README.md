@@ -62,8 +62,8 @@ cd hpc
 | `./hpc_connect.sh keycheck` | Verifica che l'auth a chiave funzioni (senza aprire sessione) | Prima di ogni sessione / se l'auth dà errore |
 | `./hpc_connect.sh check` | Mostra user, host, `$SCRATCH`, partizioni disponibili | Diagnostica iniziale |
 | `./hpc_connect.sh deploy` | ① `rsync` del progetto su `~/am01_project` (esclude `.venv`, `.git`, `data/raw`, checkpoint); ② `uv sync --frozen` (Python 3.13 richiesto da `.python-version`), registra kernel Jupyter `am01-hpc` | **Prima volta** e dopo ogni cambiamento di dipendenze (`pyproject.toml`/`uv.lock`) |
-| `./hpc_connect.sh batch slurm_job_template.sh` | `deploy` + `sbatch` in un solo passo (upload → build → submit GPU job) | **Start uno-shot**: vai dal repository vuoto al job in coda |
-| `./hpc_connect.sh submit slurm_job_template.sh` | Carica solo il template in `~/jobs/` + `sbatch` | Se il progetto è **già** deployato e vuoi rilanciare solo il job |
+| `./hpc_connect.sh batch slurm_job_template.sh` | `deploy` + `sbatch` + **stream log live** (`tail -f`) + **auto-fetch risultati**. Uno-shot completo: upload → build → submit → vedi output in tempo reale → a fine job scarica `data/processed/*.npy` `.pkl` e il log localmente | **Start uno-shot**: vai dal repository vuoto al risultato in locale |
+| `./hpc_connect.sh submit slurm_job_template.sh` | Carica il template in `~/jobs/` + `sbatch` (ritorna subino) | Se il progetto è **già** deployato e vuoi rilanciare solo il job |
 | `./hpc_connect.sh interactive gpu_a40 04:00:00` | `srun --pty` su un nodo compute con GPU | Sviluppo interattivo — **solo da qui hai `$SCRATCH`** |
 | `./hpc_connect.sh exec "comando"` | Esegue `comando` una volta sola sul login node | Comandi ad hoc (es. `ls`, `cat <log>`, `nvidia-smi`) |
 | `./hpc_connect.sh download <remoto> <locale>` | Copia file/dati dal cluster | Portare i risultati a casa |
@@ -83,60 +83,61 @@ export PROJECT_DIR_REMOTE='$HOME/am01_project'   # dove caricare il progetto (re
 
 ```bash
 cd hpc
-./hpc_connect.sh keycheck                                  # 0. registra la chiave se non l'hai fatto
-./hpc_connect.sh batch slurm_job_template.sh              # 1. upload + build env + sbatch (GPU)
+./hpc_connect.sh keycheck                                   # 0. registra la chiave
+./hpc_connect.sh batch hpc/slurm_job_template.sh            # 1. upload + build env + sbatch + stream + fetch
 ```
-`sbatch` stampa l'id del job, es.:
+`sbatch` stampa l'id del job:
 ```
 Submitted batch job 1911144
 ```
-Poi leggi il log (sostituisci `<JID>` con l'id appena ottenuto):
-```bash
-./hpc_connect.sh exec 'cat ~/jobs/logs/am01_train_<JID>.out'
+Poi **il comando mantiene aperta la connessione** e streamma il log live (`tail -f`)
+fino a quando il job non termina. Alla fine scarica **automaticamente** i risultati:
 ```
-**A fine job aspettati** (in fondo al `.out`):
+=== Fetching results to local ===
+Results: ./data/processed/   Log: ./logs/
 ```
-Job completed successfully.
-```
-e (se usi GPU) `CUDA available: True` / `GPU: NVIDIA A40`.
 
 ---
 
 ### Vedere l'esecuzione al volo (live, come in locale)
 
-Il job gira **in background su SLURM**: lanci `sbatch`, lui ti restituisce subito l'id
-del job e il terminale torna libero. Per "vedere l'esecuzione passo passo" come faresti
-in locale, scegli uno di questi tre modi:
+Con `batch` il log viene streammato automaticamente finché il job è in esecuzione.
+Puoi staccare in qualsiasi momento con **Ctrl-C**: **il job continua** su SLURM.
+I risultati verranno comunque scaricati quando il job termina.
 
-1. **Streaming del log** (vedi l'output riga per riga man mano che il job avanza):
+Se invece preferisci il controllo manuale:
+
+1. **Stream via `tail -f`** su log unico (`.log` contiene stdout+stderr con tag):
    ```bash
-   ./hpc_connect.sh exec 'tail -n +1 -f ~/jobs/logs/am01_train_<JID>.out'
+   ./hpc_connect.sh exec 'tail -n +1 -f ~/jobs/logs/am01_train_<JID>.log'
    ```
-   Il template forza `PYTHONUNBUFFERED=1` così `print()` arriva subito nel log
-   (altrimenti Python lo bufferizza e il `tail -f` resta bloccato). `Ctrl-C` per
-   staccare: **il job continua a girare**.
+   Il template forza `PYTHONUNBUFFERED=1` e `src/main.py` logga su `sys.stdout`
+   (con tag `%(levelname)s`), così `print()` e `logger.info()` compaiono insieme
+   nel file `.log`. `Ctrl-C` per staccare.
 
-2. **Controlla lo stato** finché non finisce, poi leggi il log completo:
+2. **Controlla lo stato**, poi leggi il log unico:
    ```bash
-   ./hpc_connect.sh exec 'squeue -j <JID> -h -o "%T"'   # PENDING/RUNNING/(vuoto=finito)
-   ./hpc_connect.sh exec 'cat ~/jobs/logs/am01_train_<JID>.out'
+   ./hpc_connect.sh exec 'squeue -j <JID> -h -o "%T"'
+   ./hpc_connect.sh exec 'cat ~/jobs/logs/am01_train_<JID>.log'
    ```
 
-3. **Sessione interattiva** (esegui il comando direttamente, output identico a locale):
+3. **Sessione interattiva** (output identico a locale):
    ```bash
-   ./hpc_connect.sh interactive gpu_a40 02:00:00       # ti butta su un nodo con GPU
-   uv run python src/main.py --config config/config.yaml   # <─ qui vedi l'output live
+   ./hpc_connect.sh interactive gpu_a40 02:00:00
+   uv run python src/main.py --config config/config.yaml
    ```
-   Consigliato per il **debug**; per il training lungo usa invece il job batch (1) o (2).
+   Consigliato per il **debug**; per training lungo usa `batch` (con streaming).
 
-## 4. Dove finiscono i log
+## 4. Dove finiscono i file
 
-- `sbatch` scrive stdout/stderr (gli `#SBATCH --output=logs/...`) in **`~/jobs/logs/`**
-  **sul login node**. Il comando `submit` crea `~/jobs/logs/` automaticamente
-  (SLURM **non** crea le directory `#SBATCH --output` da sé).
-- All'interno del job, artefatti extra (es. plot) vanno in `$SCRATCH_DIR/am01/logs/`
-  dove `SCRATCH_DIR` = `$SCRATCH` (BeeGFS, sui compute node) se disponibile, altrimenti
-  `$HOME/scratch`.
+- **Log**: `sbatch` scrive stdout+stderr (uniti dal `#SBATCH --output=logs/...`) in
+  **`~/jobs/logs/am01_train_<JID>.log`** **sul login node**. Il comando `submit`
+  crea `~/jobs/logs/` automaticamente (SLURM **non** crea le directory `#SBATCH`).
+- **Risultati** (`data/processed/*.npy`, `*.pkl`, `*.log`): il template SLURM esegue
+  un **post-run rsync** da `$SCRATCH_DIR/am01/` → `$HOME/am01_project/` così sono
+  disponibili anche da login node.
+- **`batch`** scarica automaticamente `data/processed/` + il log più recente in
+  `./data/processed/` e `./logs/` della tua macchina locale alla fine del job.
 
 ---
 

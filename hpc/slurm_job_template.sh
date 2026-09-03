@@ -40,9 +40,11 @@
 # Memory per node (default is usually fine)
 #SBATCH --mem=64GB
 
-# Output and error logs
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
+# Output and error logs — unified into a single .log file so that print()
+# and logger.info() appear together in order, with severity tags from the
+# logging format configured in src/main.py (stream=sys.stdout).
+#SBATCH --output=logs/%x_%j.log
+#SBATCH --error=logs/%x_%j.log
 
 # Mail notifications (optional)
 #SBATCH --mail-type=END,FAIL
@@ -111,3 +113,27 @@ echo "Starting AM01 training..."
 uv run python src/main.py --config config/config.yaml
 
 echo "Job completed successfully."
+
+# ── Fetch automatico dei risultati su $HOME (visibile da login node) ──────
+# Copia data/processed/*.npy, *.pkl e il log su $HOME/am01_project/ così
+# ``hpc_connect.sh`` può scaricarli localmente con un solo comando.
+RESULTS_DIR="${SCRATCH_DIR}/${SCRATCH_PROJECT}"
+HOME_PROJECT="${HOME}/am01_project"
+
+# data/processed/*.npy, *.pkl, *.json
+mkdir -p "${HOME_PROJECT}/data/processed"
+rsync -a --ignore-existing \
+    --include='*.npy' --include='*.pkl' --include='*.json' --exclude='*' \
+    "${RESULTS_DIR}/data/processed/" "${HOME_PROJECT}/data/processed/" 2>/dev/null || true
+
+# data/models/*.pth (se esistono)
+mkdir -p "${HOME_PROJECT}/data/models"
+rsync -a --ignore-existing \
+    --include='*.pth' --include='*.pt' --exclude='*' \
+    "${RESULTS_DIR}/data/models/" "${HOME_PROJECT}/data/models/" 2>/dev/null || true
+
+# logs/am01_train_*.log
+mkdir -p "${HOME_PROJECT}/logs"
+cp "${RESULTS_DIR}/logs"/am01_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+
+echo "Results fetched to ${HOME_PROJECT}/data/processed/ and ${HOME_PROJECT}/logs/"

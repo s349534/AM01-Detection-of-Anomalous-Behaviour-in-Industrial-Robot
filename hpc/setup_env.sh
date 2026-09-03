@@ -105,6 +105,16 @@ print('All project modules import successfully!')
 "
 
 echo ""
+# ── Step 7.5: Check for data/raw/ (needed by preprocessing) ────────────────
+if [[ ! -d "${PROJECT_DIR}/data/raw" ]]; then
+    echo ""
+    echo "WARNING: data/raw/ not found on cluster."
+    echo "  Preprocesing will fail without the Kuka .npy files."
+    echo "  Upload once:  ./hpc_connect.sh upload data/raw/ ~/am01_project/data/raw/"
+else
+    echo "data/raw/ present — preprocessing can run."
+fi
+
 echo "=========================================="
 echo "  Setup complete!"
 echo "=========================================="
@@ -112,7 +122,7 @@ echo ""
 echo "Next steps:"
 echo "  1. Run './hpc_connect.sh interactive' for a compute node session"
 echo "  2. On compute node, cd to \$SCRATCH and run your training"
-echo "  3. Or submit: ./hpc_connect.sh submit hpc/slurm_job_template.sh"
+echo "  3. Or one-shot: ./hpc_connect.sh batch hpc/slurm_job_template.sh"
 echo ""
 echo "BeeGFS scratch path: \${SCRATCH:-Not available (need compute node)}"
 echo "Project directory:   ${PROJECT_DIR}"

@@ -95,10 +95,18 @@ def main() -> None:
     args = parse_args()
     config = load_config(args.config, args.params)
 
+    # Ensure UTF-8 output on Windows (cp1252 can't encode em-dashes etc.)
+    # On Linux this is a no-op.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
         datefmt="%H:%M:%S",
+        stream=sys.stdout,
     )
 
     print("AM01 Anomaly Detection Pipeline")

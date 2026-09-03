@@ -15,7 +15,7 @@
 #   ./hpc_connect.sh upload-project             # rsync entire project to HPC (excludes .venv/.git)
 #   ./hpc_connect.sh download <remote> <local>  # scp download from HPC
 #   ./hpc_connect.sh submit <slurm_script>      # Submit a SLURM batch job
-#   ./hpc_connect.sh batch <slurm_script>       # Upload-project + setup + submit in one shot
+#   ./hpc_connect.sh batch <slurm_script>       # Deploy + submit + stream log + auto-fetch results
 #   ./hpc_connect.sh deploy                     # Upload-project + one-shot environment setup
 #   ./hpc_connect.sh scratch                    # SSH to compute node (via srun) to access $SCRATCH
 #   ./hpc_connect.sh check                      # Print connectivity and environment info
@@ -276,19 +276,101 @@ cmd_deploy() {
     echo "Start working: ./hpc_connect.sh interactive"
 }
 
-# ── Batch: deploy + submit a SLURM job in one shot ──────────────────────────
+# ── Batch: deploy + submit + stream log + fetch results ──────────────────────
 #   usage:  ./hpc_connect.sh batch <slurm_script>
 #           ./hpc_connect.sh batch --dry-run <slurm_script>   # preview only
+#
+#   After submitting, streams the unified log (stdout+stderr) live via tail -f.
+#   Ctrl-C detaches the stream — the job keeps running on SLURM. When the job
+#   finishes, results (data/processed/*.npy, *.pkl) and the latest log are
+#   downloaded to the local project directory automatically.
 cmd_batch() {
     local dry=0
     local script
     if [[ "${1:-}" == "--dry-run" ]]; then dry=1; shift; fi
     script="$1"
     [[ -n "${script}" ]] || { echo "ERROR: usage: ./hpc_connect.sh batch [--dry-run] <slurm_script>"; exit 1; }
+
     cmd_deploy $([[ "$dry" == "1" ]] && echo "--dry-run")
     [[ "$dry" == "1" ]] && { echo "[dry-run] would then submit ${script} (via upload+sbatch)."; return 0; }
+
     echo ""
-    cmd_submit "${script}"
+
+    # ── Upload SLURM script ─────────────────────────────────────────────────
+    local basename_script
+    basename_script=$(basename "${script}")
+    ssh_run "$(ssh_target)" "mkdir -p ~/jobs/logs"
+    scp "${script}" "$(ssh_target):~/jobs/${basename_script}"
+    echo "Uploaded ${basename_script} → ~/jobs/"
+
+    # ── Submit and capture job ID ───────────────────────────────────────────
+    local jid
+    jid=$(ssh_run "$(ssh_target)" "cd ~/jobs && sbatch ${basename_script}" 2>&1 \
+          | sed -n 's/.*Submitted batch job \([0-9]*\).*/\1/p')
+    if [[ -z "${jid:-}" ]]; then
+        echo "ERROR: could not extract job ID from sbatch output."
+        echo "Try manually: ssh $(ssh_target) 'cd ~/jobs && sbatch ${basename_script}'"
+        return 1
+    fi
+    echo "Submitted batch job ${jid}"
+    echo ""
+
+    # ── Stream log live until job completes ─────────────────────────────────
+    # The SLURM template writes to logs/am01_train_<JID>.log (unified stdout+stderr).
+    # Ctrl-C detaches — the job continues on SLURM.
+    echo "=== Live log (Ctrl-C to detach, job continues) ==="
+    echo "  tail -f ~/jobs/logs/am01_train_${jid}.log"
+    echo ""
+    ssh_run "$(ssh_target)" "
+        set +e
+        LOG=\"~/jobs/logs/am01_train_${jid}.log\"
+        # Wait for log file to appear (job may be PENDING)
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            [[ -f \$LOG ]] && break
+            sleep 5
+        done
+        # Stream live
+        tail -n +1 -f \$LOG 2>/dev/null &
+        TAIL_PID=\$!
+        # Poll every 15s until the job leaves the queue
+        while squeue -j ${jid} -h -o '%T' 2>/dev/null | grep -q .; do
+            sleep 15
+        done
+        kill \$TAIL_PID 2>/dev/null || true
+        wait \$TAIL_PID 2>/dev/null || true
+        echo ''
+        echo '=== Job ${jid} completed ==='
+        tail -8 \$LOG 2>/dev/null || true
+    "
+
+    # ── Auto-download results ───────────────────────────────────────────────
+    echo ""
+    echo "=== Fetching results to local ==="
+    mkdir -p ./data/processed ./logs
+
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -av --progress \
+            "$(ssh_target):~/am01_project/data/processed/" \
+            ./data/processed/ 2>/dev/null || true
+    else
+        # Fallback: scp individual files
+        for f in train.npy val.npy test_normal.npy test_anomaly.npy \
+                 scaler.pkl selected_columns.npy preprocessing_config.json; do
+            scp "$(ssh_target):~/am01_project/data/processed/${f}" \
+                ./data/processed/ 2>/dev/null || true
+        done
+    fi
+
+    # Download latest log (fetched to ~/am01_project/logs/ by SLURM post-run rsync)
+    local latest_log
+    latest_log=$(ssh_run "$(ssh_target)" "ls -t ~/am01_project/logs/am01_train_*.log 2>/dev/null | head -1")
+    if [[ -n "${latest_log}" ]]; then
+        scp "$(ssh_target):${latest_log}" ./logs/ 2>/dev/null || true
+        echo "Log downloaded → ./logs/$(basename "${latest_log}")"
+    fi
+
+    echo ""
+    echo "Done.  Results: ./data/processed/   Log: ./logs/"
 }
 
 cmd_help() {
@@ -308,7 +390,7 @@ Usage:
   ./hpc_connect.sh download <remote_path> <local_path>      Download files from HPC
   ./hpc_connect.sh submit <slurm_script.sh>                 Submit SLURM batch job
   ./hpc_connect.sh deploy                                   Upload-project + one-shot setup
-  ./hpc_connect.sh batch <slurm_script.sh>                  Deploy + submit SLURM job
+  ./hpc_connect.sh batch <slurm_script.sh>                Deploy + submit + stream log + fetch results
 
 Examples:
   ./hpc_connect.sh check
