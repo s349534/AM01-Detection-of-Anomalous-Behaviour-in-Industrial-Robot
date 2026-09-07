@@ -163,38 +163,67 @@ temporale).
 **Configurazione**: tutti gli iperparametri in `config/params.yaml`, letti via
 `src/utils/config.py`.
 
-#### **Fase 3 — Baseline Autoencoder (sequence-aware)** (Notebook 03 + `src/models/autoencoder.py`)
-**Obiettivo**: avere un *lower bound* sequence-aware prima di introdurre
-l'avversariale.
+#### **Fase 3.0 — Costruzione modello AE parametrico**
+**Obiettivo**: implementare l'architettura AE (vedi §4.1.2) con costruttore
+che accetta gli iperparametri da validare. Senza questo, la validazione (3.1)
+non può esplorare lo spazio di ricerca.
 
-- Architettura: encoder 1D-Conv (vedi §4.1.2) + decoder speculare.
-  Input: finestra `(W, 86)`, output: stessa finestra ricostruita.
-- Loss: MSE (o MAE — da confrontare, MAE è più robusta a outlier).
-- Training su **solo dati normali** (validation per early stopping).
-- Output: modello serializzato in `reports/checkpoints/ae_baseline.pth`.
+- File: `src/models/autoencoder.py` (Encoder, Decoder, Autoencoder).
+- File: `src/models/train_utils.py` (train_one_epoch, validate, EarlyStopping).
+- File: `src/validation/run_experiment_ae.py` (`train_and_evaluate_ae(config)`).
+- File: `src/validation/run_search_ae.py` (CLI).
+- Test: 1 run di 3-5 epoche per verificare la pipeline end-to-end.
 
-> **Perché partire dal baseline?** Senza un termine di paragone non possiamo
-> rispondere alla domanda della traccia. Il baseline è anche il nostro
-> "controllo sperimentale".
+> **Perché il costruttore è parametrico dall'inizio**: il validatore
+> (Fase 3.1) deve poter istanziare 20 modelli con 20 combinazioni di HP senza
+> toccare il codice. Costruttore rigido → riscrittura ad ogni run.
 
-#### **Fase 4 — Adversarial Autoencoder** (`src/models/adversarial_ae.py`)
-**Obiettivo**: aggiungere il discriminatore e implementare l'addestramento
-alternato.
+#### **Fase 3.1 — Validazione AE**
+**Obiettivo**: identificare `HP_AE_best` tramite random search vincolato
+(spazio in §4.8).
 
-- Architettura (Makhzani et al., 2015):
-  - **Encoder** `E(x) → z`
-  - **Decoder** `D(z) → x̂`
-  - **Discriminator** `C(z) → {0,1}` (z da prior gaussiano vs da encoder)
-- Prior: `z ~ N(0, I)` (dimensione `latent_dim`).
-- Training loop alternato:
-  1. **Phase 1** — aggiorna `C` per distinguere `z~prior` da `z=E(x)`.
-  2. **Phase 2** — aggiorna `E+D` per: (a) ricostruire bene, (b) ingannare `C`.
-- Iperparametri già previsti in `config/params.yaml`:
-  - `reconstruction_weight: 1.0`
-  - `adversarial_weight: 0.1`
-  - `beta1: 0.5`, `beta2: 0.999`
+- Esecuzione: `python -m src.validation.run_search_ae --n-iter 20 --seed 42`.
+- Output: `reports/tables/validation_results_ae.csv` (20 righe).
+- Analisi: `python -m src.validation.analyze_results` → 3 grafici di
+  sensitività (`sensitivity_ae_*.png`).
+- Selezione: riga con `best_val_pr_auc` massimo (vedi §4.8.8).
+- Output finale: `config/params_validated_ae.yaml`.
 
-**Output**: `reports/checkpoints/aae_final.pth`.
+#### **Fase 3.2 — Training finale AE**
+**Obiettivo**: addestrare il modello definitivo con `HP_AE_best`.
+
+- Esecuzione: `python -m src.models.train_ae --config params_validated_ae.yaml`.
+- Nested validation: 3 run con seed diversi sulla stessa config → media ± std.
+- Output: `reports/checkpoints/ae_baseline.pth` + `ae_final_metrics.csv`.
+
+#### **Fase 4.0 — Costruzione modello AAE parametrico**
+**Obiettivo**: aggiungere il discriminatore e l'addestramento alternato
+(Makhzani et al., 2015), riusando Encoder/Decoder da 3.0.
+
+- File: `src/models/adversarial_ae.py` (Discriminator, AdversarialAE).
+- File: `src/validation/run_experiment_aae.py` (`train_and_evaluate_aae`).
+- File: `src/validation/run_search_aae.py` (CLI).
+- Test: 1 run di 3-5 epoche.
+
+#### **Fase 4.1 — Validazione AAE**
+**Obiettivo**: identificare `HP_AAE_best` validando i 2 HP AAE-specifici
+(`reconstruction_weight`, `adversarial_weight`), con HP AE-derivati fissati a
+`HP_AE_best`.
+
+- Esecuzione: `python -m src.validation.run_search_aae --n-iter 15 --seed 42`.
+- Output: `reports/tables/validation_results_aae.csv` (15 righe).
+- Analisi: 2 grafici di sensitività (`sensitivity_aae_*.png`).
+- Selezione: vedi §4.8.3.
+- **Sanity check**: AAE vs AE → recovery condizionale se `PR-AUC_AAE <
+  PR-AUC_AE - 0.05` (vedi §4.8.7).
+- Output finale: `config/params_validated_aae.yaml`.
+
+#### **Fase 4.2 — Training finale AAE**
+**Obiettivo**: addestrare il modello definitivo con `HP_AAE_best`.
+
+- Esecuzione: `python -m src.models.train_aae --config params_validated_aae.yaml`.
+- Nested validation: 3 run con seed diversi.
+- Output: `reports/checkpoints/aae_final.pth` + `aae_final_metrics.csv`.
 
 #### **Fase 5 — Valutazione e confronto** (`src/models/compare_models.py` + `src/utils/metrics.py`)
 **Obiettivo**: rispondere *quantitativamente* alla domanda della traccia.
@@ -464,55 +493,216 @@ code troppo pesanti per le anomalie.
   (ottimistica, da usare come upper bound).
 - **Soglie da confrontare** per mostrare il trade-off operazionale.
 
+### 4.8 Validazione iperparametri
+
+La validazione riduce l'incertezza sulle scelte che impattano le metriche
+finali. Senza, i valori in `params.yaml` sarebbero assunzioni non verificate.
+
+**4.8.1 Metodo di validazione**
+
+Si usa random search vincolato (Bergstra & Bengio, 2012) con spazio di ricerca
+definito a priori. N=20 run per AE, N=15 per AAE. Le metriche di validation
+sono stimate su **singola fold temporale** (validation set esistente, ~47k
+sample, errore standard ~0.5% per la regola `1/√N`).
+
+**Non si usa k-fold**: k-fold temporale introduce rischio di concept drift;
+k-fold random romperebbe la continuità temporale (lag-1 AC = 0.99+, vedi §1.3)
+causando data leakage. La stabilità della scelta è garantita da **nested
+validation**: 3 run con seed diversi sulla configurazione migliore, con
+report di media ± deviazione standard.
+
+**4.8.2 Spazio di ricerca AE**
+
+| HP | Range | Tipo | Giustificazione del range |
+|----|-------|------|---------------------------|
+| `W` | {8, 12, 16, 24, 32} | discreto | Limiti inferiore/superiore vincolati da Fase 1 (frequenza di campionamento, costo computazionale) |
+| `latent_dim` | {8, 12, 16, 24, 32} | discreto | Compromesso compressione 82→{8..32} = 2.5×–10× |
+| `encoder_channels` | {[64,32], [128,64], [128,64,32]} | categorico | 2 o 3 layer, range standard per AE su dati 1D |
+
+Spazio totale: 75 combinazioni, 20 campionate con
+`sklearn.model_selection.ParameterSampler(seed=42)`. Esempio delle prime 10
+combinazioni campionate:
+
+| run_id | W | latent_dim | encoder_channels |
+|--------|---|------------|------------------|
+| 1      | 24 | 16         | [128, 64]        |
+| 2      | 12 | 32         | [64, 32]         |
+| 3      | 16 | 8          | [128, 64, 32]    |
+| 4      | 8  | 24         | [128, 64]        |
+| 5      | 32 | 12         | [64, 32]         |
+| 6      | 24 | 32         | [128, 64, 32]    |
+| 7      | 16 | 16         | [64, 32]         |
+| 8      | 12 | 8          | [128, 64]        |
+| 9      | 32 | 24         | [128, 64]        |
+| 10     | 8  | 12         | [128, 64, 32]    |
+
+(Le combinazioni effettive dipendono dal seed; sopra è un'illustrazione del
+formato. Le 20 run prodotte andranno a popolare il CSV finale.)
+
+**4.8.3 Spazio di ricerca AAE**
+
+HP AE-derivati (`W`, `latent_dim`, `encoder_channels`) fissati a `HP_AE_best`.
+HP validati:
+
+| HP | Range | Tipo | Giustificazione |
+|----|-------|------|----------------|
+| `reconstruction_weight` | loguniform(0.5, 2.0) | continuo | Bilanciamento ricostruzione/adv, default Makhzani 2015 non garantito per time-series |
+| `adversarial_weight` | loguniform(0.01, 0.5) | continuo | Cuore AAE, range tipico 0.001–1.0 in letteratura |
+
+15 combinazioni campionate con `ParameterSampler(seed=42)`. Esempio delle prime
+5:
+
+| run_id | reconstruction_weight | adversarial_weight |
+|--------|----------------------|---------------------|
+| 1      | 1.43                 | 0.087               |
+| 2      | 0.71                 | 0.213               |
+| 3      | 1.85                 | 0.034               |
+| 4      | 0.92                 | 0.156               |
+| 5      | 1.27                 | 0.412               |
+
+**4.8.4 Iperparametri fissati senza validazione**
+
+I seguenti iperparametri sono fissati a default di letteratura per ridurre la
+dimensionalità dello spazio di ricerca. **Compromesso accettato**: potrebbero
+non essere ottimali per il problema specifico; in caso di metriche deludenti
+in Fase 5, diventano candidati per analisi di sensitività post-hoc.
+
+| HP | Default | Fonte / motivazione |
+|----|---------|---------------------|
+| `optimizer` | Adam | Kingma & Ba, 2014 (standard de facto) |
+| `learning_rate` | 1e-3 | Default Adam (Kingma & Ba, 2014) |
+| `batch_size` | 256 | Compromesso standard su GPU moderne per dataset 10⁵-10⁶ |
+| `loss` (reconstruction) | MSE | Massima verosimiglianza gaussiana, enfatizza outlier (anomalie) |
+| `weight_decay` | 0 | Non critico per AE brevi (Goodfellow et al., 2016, §6.2) |
+| `early_stopping_patience` | 5 | Standard (Goodfellow et al., 2016, §7.8) |
+| `discriminator_updates_per_gen` | 1 | Default GAN (Goodfellow et al., 2014) |
+| `discriminator_lr` | 1e-3 | Stesso di E+D, default comune nelle implementazioni AAE |
+
+**4.8.5 Workflow CLI**
+
+Tutta la validazione è eseguita via script Python (`.py`), non notebook, per
+compatibilità con HPC e parallelizzazione. I notebook sono usati solo per
+ispezione visiva dei CSV.
+
+```bash
+# AE
+python -m src.validation.run_search_ae --n-iter 20 --seed 42
+python -m src.validation.analyze_results --input validation_results_ae.csv
+python -m src.models.train_ae --config params_validated_ae.yaml
+
+# AAE
+python -m src.validation.run_search_aae --n-iter 15 --seed 42
+python -m src.validation.analyze_results --input validation_results_aae.csv
+python -m src.models.train_aae --config params_validated_aae.yaml
+```
+
+**4.8.6 Parallelizzazione**
+
+Ogni run è un processo Python indipendente. Su HPC, job array SLURM con
+`CUDA_VISIBLE_DEVICES=$((SLURM_ARRAY_TASK_ID % num_gpus))`. Il numero di GPU
+è determinato a runtime via `nvidia-smi`. In locale, `ProcessPoolExecutor` o
+`&`. Il CSV finale è scritto in append (`mode='a'`) per garantire robustezza
+a crash.
+
+**4.8.7 Recovery condizionale post-validazione AAE**
+
+Dopo aver selezionato `HP_AAE_best`, si confronta `PR-AUC_AAE` vs
+`PR-AUC_AE`:
+
+- Se `PR-AUC_AAE ≥ PR-AUC_AE - 0.05`: la stima "HP AE trasferiti" è
+  sufficiente, procedere a training finale (4.2).
+- Se `PR-AUC_AAE < PR-AUC_AE - 0.05`: recovery con 10-15 run AAE con
+  **tutti** gli HP AE-derivati liberi (non solo AAE-specifici), per
+  identificare se qualche HP AE non è adatto all'AAE.
+
+**4.8.8 Formato degli output e criterio di selezione**
+
+`reports/tables/validation_results_ae.csv`:
+
+```csv
+run_id,W,latent_dim,encoder_channels,best_val_pr_auc,best_val_f1,best_epoch,train_time_sec,seed
+1,24,16,[128, 64],0.852,0.781,12,341,42
+2,12,32,[64, 32],0.834,0.762,15,298,42
+...
+```
+
+`HP_AE_best` = riga con `best_val_pr_auc` massimo. Tie-break su
+`best_val_f1`, poi `best_epoch` (preferenza per convergenza più rapida).
+
+Stesso formato per `validation_results_aae.csv`, con colonne
+`reconstruction_weight` e `adversarial_weight` al posto di quelle AE.
+
+Output finali:
+- `reports/tables/validation_results_ae.csv`
+- `reports/tables/validation_results_aae.csv`
+- `reports/figures/sensitivity_ae_W.png`, `sensitivity_ae_latent_dim.png`,
+  `sensitivity_ae_encoder_channels.png`
+- `reports/figures/sensitivity_aae_reconstruction_weight.png`,
+  `sensitivity_aae_adversarial_weight.png`
+- `config/params_validated_ae.yaml`
+- `config/params_validated_aae.yaml`
+
 ---
 
 ## 5. Struttura del repository
 
 ```
 AM01-.../
-├── config/                       # Configurazioni YAML
-│   ├── config.yaml               # Setup generale (device, paths, logging)
-│   └── params.yaml               # Iperparametri modello, training, metriche
+├── config/                          # Configurazioni YAML
+│   ├── config.yaml                  # Setup generale (device, paths, logging)
+│   ├── params.yaml                  # Iperparametri default (Fase 2)
+│   ├── params_validated_ae.yaml     # [output Fase 3.1] HP AE validati
+│   └── params_validated_aae.yaml    # [output Fase 4.1] HP AAE validati
 │
 ├── data/
-│   ├── raw/                      # Dati originali (versionati o via DVC)
+│   ├── raw/                         # Dati originali (versionati o via DVC)
 │   │   └── KukaVelocityDataset/
-│   └── processed/                # Output del preprocessing
+│   └── processed/                   # Output del preprocessing
 │
-├── src/                          # Codice di produzione (importabile, testabile)
+├── src/                             # Codice di produzione (importabile, testabile)
 │   ├── data/
-│   │   ├── dataset.py            # torch.utils.data.Dataset
-│   │   └── preprocessing.py      # Pipeline preprocessing
+│   │   ├── dataset.py               # torch.utils.data.Dataset
+│   │   └── preprocessing.py         # Pipeline preprocessing
 │   ├── models/
-│   │   ├── autoencoder.py        # Baseline AE
-│   │   ├── adversarial_ae.py     # AAE
-│   │   └── compare_models.py     # Logica di confronto
+│   │   ├── autoencoder.py           # Baseline AE (costruttore parametrico)
+│   │   ├── adversarial_ae.py        # AAE (costruttore parametrico)
+│   │   ├── train_utils.py           # train/validate/EarlyStopping
+│   │   ├── train_ae.py              # CLI: training finale AE
+│   │   ├── train_aae.py             # CLI: training finale AAE
+│   │   └── compare_models.py        # Logica di confronto
+│   ├── validation/                  # Pipeline di validazione iperparametri
+│   │   ├── search_space.py          # define_search_space_ae/aae
+│   │   ├── run_experiment_ae.py     # train_and_evaluate_ae(config)
+│   │   ├── run_experiment_aae.py    # train_and_evaluate_aae(config)
+│   │   ├── run_search_ae.py         # CLI N run random AE
+│   │   ├── run_search_aae.py        # CLI N run random AAE
+│   │   └── analyze_results.py       # CLI: tabelle + grafici da CSV
 │   ├── utils/
-│   │   ├── metrics.py            # PR-AUC, ROC-AUC, F1, ...
-│   │   ├── visualization.py      # Plot ROC, PR, distribuzioni
-│   │   └── config.py             # Loader YAML
-│   └── main.py                   # Entry point CLI
+│   │   ├── metrics.py               # PR-AUC, ROC-AUC, F1, ...
+│   │   ├── visualization.py         # Plot ROC, PR, distribuzioni
+│   │   └── config.py                # Loader YAML
+│   └── main.py                      # Entry point CLI
 │
-├── notebooks/                    # Esplorazione, prototipazione, presentazione
+├── notebooks/                       # SOLO esplorazione + ispezione visiva CSV
 │   ├── 01_data_exploration.ipynb
 │   ├── 02_preprocessing.ipynb
-│   └── 03_model_training.ipynb
+│   └── 03_inspect_validation_results.ipynb   # ispezione CSV validazione
 │
-├── tests/                        # pytest
+├── tests/                           # pytest
 │   ├── test_dataset.py
 │   ├── test_models.py
 │   └── test_metrics.py
 │
-├── reports/                      # Output finali
-│   ├── checkpoints/              # .pth serializzati
-│   ├── figures/                  # PNG per il report
-│   └── tables/                   # CSV/TeX per il report
+├── reports/                         # Output finali
+│   ├── checkpoints/                 # .pth serializzati
+│   ├── figures/                     # PNG per il report
+│   └── tables/                      # CSV/TeX per il report
 │
 ├── docs/
 │   ├── Projects Topics Presentation.pdf
 │   ├── Project_proposal_template_2026.docx
-│   ├── methodology.md            # Idea iniziale (mantenere per storia)
-│   └── project_plan.md           # ← QUESTO FILE
+│   ├── methodology.md               # Idea iniziale (mantenere per storia)
+│   └── project_plan.md              # ← QUESTO FILE
 │
 ├── main.py                       # Wrapper sottile che chiama src/main.py
 ├── requirements.txt
@@ -564,20 +754,45 @@ celle, va spostata in un modulo `.py`.
 - [x] Output generati in `data/processed/` (4 .npy + scaler.pkl + selected_columns.npy)
 - [x] Verifica locale: pipeline end-to-end ✅, pytest 33/33 ✅
 
-### Fase 3 — Baseline AE (sequence-aware)
-- [ ] `src/models/autoencoder.py` (Encoder 1D-Conv + Decoder speculare + AE)
-- [ ] Training loop in notebook 03
-- [ ] Early stopping su validation
-- [ ] Salvataggio checkpoint
-- [ ] Forward pass verificato su sample reale
-- [ ] Confronto W ∈ {8, 16, 32, 64} → scelta finale
+### Fase 3.0 — Costruzione AE parametrico
+- [ ] `src/models/autoencoder.py` (Encoder, Decoder, Autoencoder — costruttore parametrico)
+- [ ] `src/models/train_utils.py` (train_one_epoch, validate, EarlyStopping)
+- [ ] `src/validation/run_experiment_ae.py` (`train_and_evaluate_ae(config)`)
+- [ ] `src/validation/run_search_ae.py` (CLI per N run random)
+- [ ] Test 1 run (3-5 epoche) su 3-5 epoche per verificare pipeline
 
-### Fase 4 — AAE
-- [ ] `src/models/adversarial_ae.py` (E + D + C)
-- [ ] Training loop alternato (D vs GE)
-- [ ] Bilanciamento pesi reconstruction/adversarial
-- [ ] Salvataggio checkpoint
-- [ ] Sanity check: prior matches encoder output
+### Fase 3.1 — Validazione AE
+- [ ] `python -m src.validation.run_search_ae --n-iter 20 --seed 42`
+- [ ] `reports/tables/validation_results_ae.csv` (20 righe)
+- [ ] `python -m src.validation.analyze_results` → 3 grafici sensitività
+- [ ] `config/params_validated_ae.yaml`
+- [ ] Selezione `HP_AE_best` (riga con PR-AUC max, vedi §4.8.8)
+
+### Fase 3.2 — Training finale AE
+- [ ] `python -m src.models.train_ae --config params_validated_ae.yaml`
+- [ ] Nested validation (3 run con seed diversi) → media ± std
+- [ ] `reports/checkpoints/ae_baseline.pth`
+- [ ] `reports/tables/ae_final_metrics.csv`
+
+### Fase 4.0 — Costruzione AAE parametrico
+- [ ] `src/models/adversarial_ae.py` (Discriminator, AdversarialAE)
+- [ ] `src/validation/run_experiment_aae.py`
+- [ ] `src/validation/run_search_aae.py` (CLI)
+- [ ] Test 1 run (3-5 epoche) per verificare pipeline
+
+### Fase 4.1 — Validazione AAE
+- [ ] `python -m src.validation.run_search_aae --n-iter 15 --seed 42`
+- [ ] `reports/tables/validation_results_aae.csv` (15 righe)
+- [ ] `python -m src.validation.analyze_results --aae` → 2 grafici sensitività
+- [ ] Sanity check AAE vs AE → recovery condizionale se PR-AUC_AAE < PR-AUC_AE - 0.05
+- [ ] `config/params_validated_aae.yaml`
+- [ ] Selezione `HP_AAE_best`
+
+### Fase 4.2 — Training finale AAE
+- [ ] `python -m src.models.train_aae --config params_validated_aae.yaml`
+- [ ] Nested validation (3 run con seed diversi)
+- [ ] `reports/checkpoints/aae_final.pth`
+- [ ] `reports/tables/aae_final_metrics.csv`
 
 ### Fase 5 — Valutazione
 - [ ] `src/utils/metrics.py` completo
@@ -651,6 +866,32 @@ celle, va spostata in un modulo `.py`.
    caratterizza da drift lenti, non da spike — il clipping non aiuterebbe e
    potrebbe nascondere pattern utili.
    → Pipeline: load → split → normalize → save (NO clipping step).
+10. ✅ **Validare gli iperparametri dei modelli?** Sì, con random search
+    vincolato (Bergstra & Bengio, 2012) su 3 HP AE (`W`, `latent_dim`,
+    `encoder_channels`) e 2 HP AAE-specifici (`reconstruction_weight`,
+    `adversarial_weight`). Fissati senza validazione per letteratura:
+    optimizer, learning_rate, batch_size, loss, weight_decay, early stopping
+    patience, discriminator_updates_per_gen, discriminator_lr
+    (vedi §4.8.4 per fonti). Compromesso accettato: questi HP potrebbero non
+    essere ottimali, in caso di metriche deludenti in Fase 5 diventano
+    candidati per analisi di sensitività post-hoc.
+11. ✅ **CLI-first vs notebook per la validazione?** CLI-first. Cluster HPC
+    esegue script `.py`; notebook usati solo per ispezione visiva dei CSV.
+    Ogni run è un processo indipendente → parallelizzabile con job array
+    SLURM su GPU multiple (vedi §4.8.6). CSV scritto in append per
+    robustezza a crash.
+12. ✅ **k-fold vs single fold per la validazione degli HP?** Single fold
+    temporale sul validation set esistente (~47k sample, errore standard
+    ~0.5% per la regola `1/√N`). k-fold temporale introdurrebbe rischio di
+    concept drift; k-fold random romperebbe la continuità temporale (lag-1
+    AC = 0.99+, vedi §1.3) causando data leakage. La stabilità della scelta
+    è garantita dalla nested validation (3 run con seed diversi sulla
+    configurazione selezionata).
+13. ✅ **Freeze parziale HP AE → AAE?** Sì. HP AE-derivati (`W`, `latent_dim`,
+    `encoder_channels`) vengono ereditati dall'AE senza ri-validazione. Solo
+    2 HP AAE-specifici validati ex novo. Recovery condizionale se
+    `PR-AUC_AAE < PR-AUC_AE - 0.05`: 10-15 run AAE con tutti gli HP AE
+    liberi per identificare interazioni avverse (vedi §4.8.7).
 
 ---
 
