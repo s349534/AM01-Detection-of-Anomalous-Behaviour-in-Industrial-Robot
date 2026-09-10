@@ -81,9 +81,57 @@ def run_phase_preprocess(config: dict) -> None:
 
 
 def run_phase_train(config: dict) -> None:
-    """Fase 3–4 placeholder (AE / AAE training)."""
-    print("\n[Not yet implemented] Fase 3: Train baseline Autoencoder")
-    print("[Not yet implemented] Fase 4: Train Adversarial Autoencoder")
+    """Run Fase 3 — Train baseline SequenceAutoencoder."""
+    from src.data.dataset import build_datasets
+    from src.models.autoencoder import SequenceAutoencoder, fit_autoencoder
+    from src.utils.config import get_param
+
+    print("\n=== Fase 3: Train Baseline SequenceAutoencoder ===")
+    processed_dir = Path(config["paths"]["data_processed"])
+    if not (processed_dir / "train.npy").exists():
+        print(f"Processed data not found at {processed_dir}. Running preprocessing first...")
+        from src.data.preprocessing import run_preprocessing
+        run_preprocessing(config)
+
+    window_size = int(get_param(config, "data.window_size", 16))
+    window_stride = int(get_param(config, "data.window_stride", 1))
+    batch_size = int(get_param(config, "training.batch_size", 256))
+    epochs = int(get_param(config, "training.epochs", 100))
+    lr = float(get_param(config, "training.learning_rate", 1e-3))
+    weight_decay = float(get_param(config, "training.weight_decay", 1e-4))
+    patience = int(get_param(config, "training.early_stopping.patience", 10))
+    min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
+
+    print(f"Loading datasets from {processed_dir} (W={window_size}, batch_size={batch_size})...")
+    loaders = build_datasets(
+        processed_dir=processed_dir,
+        window_size=window_size,
+        stride=window_stride,
+        batch_size=batch_size,
+        num_workers=0,
+    )
+
+    model = SequenceAutoencoder.from_config(config)
+    checkpoint_path = Path("reports/checkpoints/ae_baseline.pth")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Training on device: {device}")
+
+    history = fit_autoencoder(
+        model=model,
+        train_loader=loaders["train"],
+        val_loader=loaders["val"],
+        epochs=epochs,
+        learning_rate=lr,
+        weight_decay=weight_decay,
+        patience=patience,
+        min_delta=min_delta,
+        checkpoint_path=checkpoint_path,
+        device=device,
+    )
+    print(f"Baseline Autoencoder training complete. Checkpoint: {checkpoint_path}")
+    print("[Pending] Fase 4: Train Adversarial Autoencoder")
+
 
 
 def run_phase_evaluate(config: dict) -> None:

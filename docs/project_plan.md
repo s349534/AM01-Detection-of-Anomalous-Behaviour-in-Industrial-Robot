@@ -565,7 +565,8 @@ celle, va spostata in un modulo `.py`.
 - [x] Verifica locale: pipeline end-to-end ✅, pytest 33/33 ✅
 
 ### Fase 3 — Baseline AE (sequence-aware)
-- [ ] `src/models/autoencoder.py` (Encoder 1D-Conv + Decoder speculare + AE)
+- [x] `src/models/autoencoder.py` (Encoder 1D-Conv + Decoder speculare + AE)
+- [x] Unit test `tests/test_models.py` (architettura, shape, error score, backprop)
 - [ ] Training loop in notebook 03
 - [ ] Early stopping su validation
 - [ ] Salvataggio checkpoint
@@ -722,3 +723,20 @@ celle, va spostata in un modulo `.py`.
 **Verifica:** pytest 33/33 ✅; pipeline end-to-end ~1s.
 
 **Prossima fase:** Fase 3 — baseline Autoencoder (1D-Conv encoder + decoder speculare).
+
+### Sessione 3 — Fase 3: Baseline Autoencoder 1D-CNN (7set2026)
+
+**Processo (ordine di lavoro):**
+1. **`src/models/autoencoder.py` implementato**:
+   - `Conv1dEncoder`: Conv1d(82→128, k=5) + MaxPool1d(2) + Conv1d(128→64, k=3) + AdaptiveAvgPool1d(1) + Linear(64→latent_dim=16).
+   - `Conv1dDecoder`: Linear(16→64*(W//2)) + ConvTranspose1d(64→128, k=4, s=2) + Conv1d(128→82, k=3).
+   - `SequenceAutoencoder`: orchestratore con supporto per entrambi i layout `(B, input_dim, W)` e `(B, W, input_dim)`.
+   - `compute_reconstruction_error`: calcolo errore per-sample (anomaly score), per-feature o scalare globale con metrica MSE o MAE.
+   - `EarlyStopping`: gestione checkpointing e ripristino dei migliori pesi su validation loss.
+   - `fit_autoencoder`: loop di training modulare con Adam optimizer.
+2. **`tests/test_models.py`**: test suite completa per encoder, decoder, orchestratore, calcolo errore, backprop gradienti e test smoke di training.
+3. **`src/main.py`**: collegata la fase `--phase train` con `build_datasets` e `fit_autoencoder`.
+4. **Symlink dati**: collegato `data/raw/KukaVelocityDataset` a `../../KukaVelocityDataset/`.
+
+**Prossima fase:** Esecuzione training su notebook 03 o cluster HPC Legion e analisi delle ricostruzioni.
+
