@@ -316,31 +316,43 @@ cmd_batch() {
     echo ""
 
     # ── Stream log live until job completes ─────────────────────────────────
-    # The SLURM template writes to logs/am01_train_<JID>.log (unified stdout+stderr).
+    # The SLURM template writes to logs/am01_<jobname>_<JID>.log (unified stdout+stderr).
+    # Job names vary: am01_train, am01_ae_search, am01_ae_train — use glob to match.
     # Ctrl-C detaches — the job continues on SLURM.
     echo "=== Live log (Ctrl-C to detach, job continues) ==="
-    echo "  tail -f ~/jobs/logs/am01_train_${jid}.log"
+    echo "  tail -f ~/jobs/logs/am01_*_${jid}.log"
     echo ""
     ssh_run "$(ssh_target)" "
         set +e
-        LOG=\"~/jobs/logs/am01_train_${jid}.log\"
+        LOG=\"~/jobs/logs/am01_*_${jid}.log\"
         # Wait for log file to appear (job may be PENDING)
         for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-            [[ -f \$LOG ]] && break
+            eval \"log_file=\$(ls \$LOG 2>/dev/null | head -1)\"
+            [[ -n \"\$log_file\" ]] && break
             sleep 5
         done
-        # Stream live
-        tail -n +1 -f \$LOG 2>/dev/null &
-        TAIL_PID=\$!
-        # Poll every 15s until the job leaves the queue
-        while squeue -j ${jid} -h -o '%T' 2>/dev/null | grep -q .; do
-            sleep 15
-        done
-        kill \$TAIL_PID 2>/dev/null || true
-        wait \$TAIL_PID 2>/dev/null || true
-        echo ''
-        echo '=== Job ${jid} completed ==='
-        tail -8 \$LOG 2>/dev/null || true
+        log_file=\$(ls \$LOG 2>/dev/null | head -1)
+        if [[ -z \"\$log_file\" ]]; then
+            echo \"WARNING: Log file not found after 60s. Checking sinfo...\"
+            sinfo -p \${SLURM_PARTITION:-gpu_a40} 2>/dev/null || true
+        fi
+        # Stream live (use resolved log_file, not the glob)
+        if [[ -n \"\$log_file\" ]]; then
+            tail -n +1 -f \"\$log_file\" 2>/dev/null &
+            TAIL_PID=\$!
+            # Poll every 15s until the job leaves the queue
+            while squeue -j ${jid} -h -o '%T' 2>/dev/null | grep -q .; do
+                sleep 15
+            done
+            kill \$TAIL_PID 2>/dev/null || true
+            wait \$TAIL_PID 2>/dev/null || true
+            echo ''
+            echo '=== Job ${jid} completed ==='
+            tail -8 \"\$log_file\" 2>/dev/null || true
+        else
+            echo ''
+            echo '=== Job ${jid} completed (no log file found) ==='
+        fi
     "
 
     # ── Auto-download results ───────────────────────────────────────────────

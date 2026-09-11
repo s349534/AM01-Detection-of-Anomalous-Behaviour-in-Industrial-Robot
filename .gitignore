@@ -31,7 +31,6 @@ env/
 
 # Data (large files - should be tracked with DVC or similar)
 *.npy
-*.csv
 # data/raw/*
 # !data/raw/.gitkeep
 

@@ -1,0 +1,5 @@
+run_id,W,latent_dim,encoder_channels,best_val_pr_auc,best_val_f1,best_epoch,train_time_sec,seed
+1,24,16,"[64, 32]",0.374485,0.011268,2,41.61,43
+2,32,16,"[128, 64]",0.459003,0.013886,2,64.26,44
+run_id,W,latent_dim,encoder_channels,best_val_pr_auc,best_val_f1,best_epoch,train_time_sec,seed
+1,24,16,"[64, 32]",0.39696,0.01188,5,121.95,43
