@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 #
 # setup_env.sh — One-time environment setup on PolitO HPC Legion
 #

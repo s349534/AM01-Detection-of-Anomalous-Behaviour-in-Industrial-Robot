@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 #
 # hpc_connect.sh — Automated SSH connection and command execution for PolitO HPC Legion
 #
@@ -346,12 +346,30 @@ cmd_batch() {
     # ── Auto-download results ───────────────────────────────────────────────
     echo ""
     echo "=== Fetching results to local ==="
-    mkdir -p ./data/processed ./logs
+    mkdir -p ./data/processed ./reports/tables ./reports/figures ./logs
 
     if command -v rsync >/dev/null 2>&1; then
         rsync -av --progress \
             "$(ssh_target):~/am01_project/data/processed/" \
             ./data/processed/ 2>/dev/null || true
+
+        # Download reports/ (CSV + plots) — populated by AE search / training jobs
+        rsync -av --progress --ignore-existing \
+            "$(ssh_target):~/am01_project/reports/tables/" \
+            ./reports/tables/ 2>/dev/null || true
+        rsync -av --progress --ignore-existing \
+            "$(ssh_target):~/am01_project/reports/figures/" \
+            ./reports/figures/ 2>/dev/null || true
+        rsync -av --progress --ignore-existing \
+            "$(ssh_target):~/am01_project/reports/checkpoints/" \
+            ./reports/checkpoints/ 2>/dev/null || true || true
+
+        # Download validated params (produced by analyze_results)
+        if [[ -f "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" ]]; then
+            scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
+                ./config/params_validated_ae.yaml 2>/dev/null || true
+            echo "Validated params → ./config/params_validated_ae.yaml"
+        fi
     else
         # Fallback: scp individual files
         for f in train.npy val.npy test_normal.npy test_anomaly.npy \
@@ -359,18 +377,26 @@ cmd_batch() {
             scp "$(ssh_target):~/am01_project/data/processed/${f}" \
                 ./data/processed/ 2>/dev/null || true
         done
+        # CSV results
+        for f in validation_results_ae.csv ae_final_metrics.csv; do
+            scp "$(ssh_target):~/am01_project/reports/tables/${f}" \
+                ./reports/tables/ 2>/dev/null || true
+        done
+        # Validated params
+        scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
+            ./config/params_validated_ae.yaml 2>/dev/null || true
     fi
 
     # Download latest log (fetched to ~/am01_project/logs/ by SLURM post-run rsync)
     local latest_log
-    latest_log=$(ssh_run "$(ssh_target)" "ls -t ~/am01_project/logs/am01_train_*.log 2>/dev/null | head -1")
+    latest_log=$(ssh_run "$(ssh_target)" "ls -t ~/am01_project/logs/am01_*.log 2>/dev/null | head -1")
     if [[ -n "${latest_log}" ]]; then
         scp "$(ssh_target):${latest_log}" ./logs/ 2>/dev/null || true
         echo "Log downloaded → ./logs/$(basename "${latest_log}")"
     fi
 
     echo ""
-    echo "Done.  Results: ./data/processed/   Log: ./logs/"
+    echo "Done.  Data: ./data/processed/   Reports: ./reports/   Config: ./config/params_validated_ae.yaml   Log: ./logs/"
 }
 
 cmd_help() {

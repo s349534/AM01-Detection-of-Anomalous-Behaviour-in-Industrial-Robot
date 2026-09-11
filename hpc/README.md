@@ -161,4 +161,36 @@ Se invece preferisci il controllo manuale:
 | --- | --- |
 | `hpc_connect.sh` | Dispatcher SSH/SLURM (upload, deploy, submit, batch, interactive, exec) |
 | `setup_env.sh` | Installa `uv`, crea il venv con `uv sync --frozen` (Python 3.13), registra kernel Jupyter `am01-hpc` (run in automatico da `deploy`) |
-| `slurm_job_template.sh` | Template di job batch SLURM: rsync → scratch, `uv sync`, torch/CUDA check, lancia `src/main.py` |
+| `slurm_job_template.sh` | Template di job batch SLURM: rsync → scratch, `uv sync`, torch/CUDA check, lancia `src/main.py` (inference) |
+| `slurm_ae_search.sh` | Template SLURM per **Fase 3.1**: validation search 20 iterazioni → `validation_results_ae.csv` + `params_validated_ae.yaml` + plots |
+| `slurm_ae_train.sh` | Template SLURM per **Fase 3.2**: training finale 3 seed → `ae_baseline.pth` + `ae_final_metrics.csv` |
+
+## Esecuzione della validation su HPC
+
+```bash
+cd hpc
+
+# 1. Verifica chiave SSH (prerequisito)
+./hpc_connect.sh keycheck
+
+# 2. Deploy + submit della ricerca validazione (20 iterazioni, 50 epochs max)
+#    (usa GPU per velocizzare — ogni run CPU dura ~100s, con GPU ~30s)
+N_ITER=20 MAX_VAL_EPOCHS=50 ./hpc_connect.sh batch slurm_ae_search.sh
+
+# 3. Al termine del job, trovi localmente:
+#    ./reports/tables/validation_results_ae.csv   (20 righe)
+#    ./reports/figures/sensitivity_*.png          (3 plot)
+#    ./config/params_validated_ae.yaml            (HP migliori)
+#    ./logs/am01_ae_search_<JID>.log              (log completo)
+```
+
+## Esecuzione del training finale su HPC
+
+```bash
+# Dopo che params_validated_ae.yaml è stato scaricato localmente:
+SEEDS="42 123 7" ./hpc_connect.sh batch slurm_ae_train.sh
+
+# Risultati attesi:
+# ./reports/checkpoints/ae_baseline.pth
+# ./reports/tables/ae_final_metrics.csv
+```

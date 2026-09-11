@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 #
 # slurm_job_template.sh — SLURM batch job template for AM01 on PolitO HPC Legion
 #
