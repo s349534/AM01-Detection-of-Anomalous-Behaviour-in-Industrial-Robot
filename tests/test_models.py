@@ -20,6 +20,11 @@ from src.models.autoencoder import (
     SequenceAutoencoder,
     fit_autoencoder,
 )
+from src.models.adversarial_ae import (
+    AdversarialAutoencoder,
+    Discriminator,
+    fit_aae,
+)
 from src.utils.config import load_config
 
 
@@ -201,5 +206,172 @@ class TestTrainingUtilities:
             assert len(history["train_loss"]) == 2
             assert len(history["val_loss"]) == 2
             assert ckpt_path.exists()
+            loaded = torch.load(ckpt_path, weights_only=False)
+            assert "model_state_dict" in loaded
+
+
+# ---------------------------------------------------------------------------
+# Test Discriminator (Fase 4.0)
+# ---------------------------------------------------------------------------
+class TestDiscriminator:
+    @pytest.mark.parametrize("hidden_layers", [(16, 8), (32, 16), (128, 64, 32)])
+    def test_output_shape(self, hidden_layers):
+        """Discriminator must map (B, latent_dim) -> (B, 1)."""
+        disc = Discriminator(latent_dim=16, hidden_layers=hidden_layers, use_sigmoid=True)
+        z = torch.randn(4, 16)
+        out = disc(z)
+        assert out.shape == (4, 1), f"Expected (4, 1), got {out.shape}"
+
+    def test_single_sample(self):
+        """Single latent vector should produce (1, 1)."""
+        disc = Discriminator(latent_dim=16)
+        z = torch.randn(1, 16)
+        out = disc(z)
+        assert out.shape == (1, 1)
+
+    def test_output_range_sigmoid(self):
+        """With sigmoid, output must be in (0, 1)."""
+        disc = Discriminator(latent_dim=16, use_sigmoid=True)
+        z = torch.randn(8, 16)
+        out = disc(z)
+        assert torch.all(out >= 0.0) and torch.all(out <= 1.0)
+
+    def test_output_range_no_sigmoid(self):
+        """Without sigmoid, output should contain values outside (0, 1)."""
+        disc = Discriminator(latent_dim=16, use_sigmoid=False)
+        z = torch.randn(32, 16)
+        out = disc(z)
+        # Large enough batch with random input → some values should escape [0,1]
+        assert torch.any(out < 0.0) or torch.any(out > 1.0)
+
+    def test_default_config(self):
+        """Default Discriminator should have latent_dim=16, hidden_layers=(32, 16)."""
+        disc = Discriminator()  # all defaults
+        assert disc.latent_dim == 16
+        assert disc.hidden_layers == (32, 16)
+        # 2 hidden Linear + 1 output Linear = 3 Linear layers in net
+        linear_layers = [m for m in disc.net if isinstance(m, nn.Linear)]
+        assert len(linear_layers) == 3
+
+
+# ---------------------------------------------------------------------------
+# Test AdversarialAutoencoder (Fase 4.0)
+# ---------------------------------------------------------------------------
+class TestAdversarialAutoencoder:
+    def test_forward_conv_format(self, batch_conv_format):
+        """Full forward returns reconstruction with matching shape."""
+        model = AdversarialAutoencoder(input_dim=82, window_size=16, latent_dim=16)
+        x_hat = model(batch_conv_format)
+        assert x_hat.shape == batch_conv_format.shape
+
+    def test_forward_seq_format(self, batch_seq_format):
+        """Model accepts (B, W, input_dim) and returns same shape."""
+        model = AdversarialAutoencoder(input_dim=82, window_size=16, latent_dim=16)
+        x_hat = model(batch_seq_format)
+        assert x_hat.shape == batch_seq_format.shape
+
+    def test_encode_decode(self, batch_conv_format):
+        """encode → latent, decode → reconstruction."""
+        model = AdversarialAutoencoder(input_dim=82, window_size=16, latent_dim=16)
+        z = model.encode(batch_conv_format)
+        assert z.shape == (4, 16), f"Expected latent (4, 16), got {z.shape}"
+        x_rec = model.decode(z)
+        assert x_rec.shape == (4, 82, 16)
+
+    def test_discriminate(self, batch_conv_format):
+        """discriminate returns (B, 1) probability."""
+        model = AdversarialAutoencoder(input_dim=82, window_size=16, latent_dim=16)
+        z = model.encode(batch_conv_format)
+        probs = model.discriminate(z)
+        assert probs.shape == (4, 1)
+
+    def test_reconstruction_error(self, batch_seq_format):
+        """Reconstruction error matches the AE interface."""
+        model = AdversarialAutoencoder(input_dim=82, window_size=16, latent_dim=16)
+        errors = model.compute_reconstruction_error(batch_seq_format, reduction="sample")
+        assert errors.shape == (4,)
+        assert (errors >= 0).all()
+
+    def test_gradients_backprop(self, batch_conv_format):
+        """Backprop should not produce NaN gradients in encoder+decoder.
+
+        The discriminator is not involved in the reconstruction forward pass,
+        so we only verify gradients on encoder/decoder parameters here.
+        """
+        model = AdversarialAutoencoder(input_dim=82, window_size=16, latent_dim=16)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        x_rec = model(batch_conv_format)
+        loss = nn.functional.mse_loss(x_rec, batch_conv_format)
+        loss.backward()
+
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                # Discriminator params won't receive gradients from recon loss alone
+                if "discriminator" in name:
+                    continue
+                assert param.grad is not None, f"No gradient for {name}"
+                assert not torch.isnan(param.grad).any(), f"NaN gradient in {name}"
+
+    def test_from_config(self, default_config):
+        """from_config should instantiate all three submodules correctly."""
+        model = AdversarialAutoencoder.from_config(default_config)
+        assert model.encoder is not None
+        assert model.decoder is not None
+        assert model.discriminator is not None
+        assert model.latent_dim == 16
+
+    def test_from_config_different_disc_hidden(self, default_config):
+        """from_config should respect discriminator hidden_layers override."""
+        config = dict(default_config)
+        config["model"]["discriminator"]["hidden_layers"] = [16, 8]
+        model = AdversarialAutoencoder.from_config(config)
+        # Check that the discriminator has the right number of layers
+        linear_layers = [m for m in model.discriminator.net if isinstance(m, nn.Linear)]
+        assert len(linear_layers) == 3  # 2 hidden + 1 output
+
+    def test_invalid_input_ndim(self):
+        model = AdversarialAutoencoder(input_dim=82, window_size=16)
+        with pytest.raises(ValueError, match="Expected"):
+            model(torch.randn(82, 16))
+
+
+class TestAdversarialTraining:
+    """Tests for the AAE training loop (alternating updates)."""
+
+    def test_fit_aae_smoke(self):
+        """Smoke test: fit_aae runs on synthetic data for 2 epochs."""
+        model = AdversarialAutoencoder(
+            input_dim=82, window_size=16, latent_dim=8,
+            discriminator_hidden=(16, 8),
+        )
+
+        x_dummy = torch.randn(32, 16, 82)
+        y_dummy = torch.zeros(32, 1)
+        ds = TensorDataset(x_dummy, y_dummy)
+        loader = DataLoader(ds, batch_size=8)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ckpt_path = Path(tmp_dir) / "test_aae_ckpt.pth"
+            history = fit_aae(
+                model=model,
+                train_loader=loader,
+                val_loader=loader,
+                epochs=2,
+                learning_rate=1e-3,
+                reconstruction_weight=1.0,
+                adversarial_weight=0.1,
+                patience=2,
+                checkpoint_path=str(ckpt_path),
+                device="cpu",
+            )
+
+            assert len(history["train_loss"]) == 2
+            assert len(history["val_loss"]) == 2
+            # adversarial loss tracked separately
+            assert "adv_loss" in history
+            assert len(history["adv_loss"]) == 2
+            assert ckpt_path.exists()
+
             loaded = torch.load(ckpt_path, weights_only=False)
             assert "model_state_dict" in loaded

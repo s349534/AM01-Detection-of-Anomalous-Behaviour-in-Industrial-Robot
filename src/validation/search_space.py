@@ -77,17 +77,28 @@ def merge_search_sample(
 
 
 def get_search_space_aae() -> dict[str, Any]:
-    """AAE-specific hyperparameter search space (§4.8.3).
+    """Search space for adversarial autoencoder validation (§4.8.3 + §4.1).
 
-    Only the 2 AAE-specific HPs are searched; all AE-derived HPs are fixed
-    to ``HP_AE_best``.  These are produced after Fase 3.1 completes.
+    AE-derived HPs (``W``, ``latent_dim``, ``encoder_channels``) are **fixed**
+    to ``HP_AE_best`` and not re-validated.  Only AAE-specific HPs are searched:
 
-    Returns
-    -------
-    dict
-        Search space for ``reconstruction_weight`` and ``adversarial_weight``.
+    1. ``training.reconstruction_weight`` — MSE loss multiplier
+    2. ``training.adversarial_weight``    — BCE loss multiplier
+    3. ``model.discriminator.hidden_layers`` — discriminator capacity (2 archs)
+
+    Grid = 5 × 6 × 2 = 60 combos; 20-30 sampled per validation run.
+
+    Notes
+    -----
+    - Discriminator architecture has 2 options (not 3) to mirror the AE
+      ``encoder.conv_channels`` search space (2 options: ``[64,32]`` /
+      ``[128,64]``).  The "large" config ``[64,32]`` is excluded because for
+      ``latent_dim=16`` it is ~4× latent size — overkill for a binary prior
+      matching task.  The default ``[32,16]`` is the current ``params.yaml``
+      value.
     """
     return {
         "training.reconstruction_weight": [0.5, 0.7, 1.0, 1.4, 2.0],
         "training.adversarial_weight": [0.01, 0.05, 0.1, 0.15, 0.3, 0.5],
+        "model.discriminator.hidden_layers": [[16, 8], [32, 16]],
     }
