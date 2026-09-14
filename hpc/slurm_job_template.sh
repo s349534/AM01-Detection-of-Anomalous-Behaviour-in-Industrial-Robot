@@ -85,7 +85,6 @@ if [[ -d "${HOME}/am01_project" ]]; then
         --exclude='.git/' \
         --exclude='__pycache__/' \
         --exclude='.ipynb_checkpoints/' \
-        --exclude='data/raw/' \
         --exclude='*.pth' --exclude='*.pt' --exclude='*.ckpt' \
         --exclude='outputs/' --exclude='reports/figures/' \
         "${HOME}/am01_project/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/"
@@ -94,6 +93,10 @@ fi
 
 # Activate uv environment — rebuild the venv on scratch from the frozen lockfile.
 # `uv run` is network/credential-free once the shared cache is populated.
+# Clear any stale VIRTUAL_ENV inherited from a remote .bashrc (setup_env.sh
+# auto-activates ~/am01_project/.venv, which is wrong on scratch)
+unset VIRTUAL_ENV 2>/dev/null || true
+
 if command -v uv &>/dev/null; then
     echo "--- Syncing frozen deps on scratch ---"
     uv sync --frozen --quiet
@@ -105,6 +108,12 @@ print(f'CUDA available: {torch.cuda.is_available()}')
 if torch.cuda.is_available():
     print(f'GPU: {torch.cuda.get_device_name(0)}')
 "
+fi
+
+# ── Preprocess if data/processed/ is missing ──────────────────────────────────
+if [[ ! -f "data/processed/train.npy" ]]; then
+    echo "=== data/processed/ missing — running preprocessing from data/raw/ ==="
+    uv run python -m src.data.preprocessing
 fi
 
 # ── Run your training script ────────────────────────────────────────────────
@@ -120,20 +129,20 @@ echo "Job completed successfully."
 RESULTS_DIR="${SCRATCH_DIR}/${SCRATCH_PROJECT}"
 HOME_PROJECT="${HOME}/am01_project"
 
-# data/processed/*.npy, *.pkl, *.json
+# data/processed/*.npy, *.pkl, *.json (no --ignore-existing: overwrite stale)
 mkdir -p "${HOME_PROJECT}/data/processed"
-rsync -a --ignore-existing \
+rsync -a \
     --include='*.npy' --include='*.pkl' --include='*.json' --exclude='*' \
     "${RESULTS_DIR}/data/processed/" "${HOME_PROJECT}/data/processed/" 2>/dev/null || true
 
 # data/models/*.pth (se esistono)
 mkdir -p "${HOME_PROJECT}/data/models"
-rsync -a --ignore-existing \
+rsync -a \
     --include='*.pth' --include='*.pt' --exclude='*' \
     "${RESULTS_DIR}/data/models/" "${HOME_PROJECT}/data/models/" 2>/dev/null || true
 
-# logs/am01_train_*.log
+# Log — SLURM writes to ~/jobs/logs/ (relative to sbatch submission dir), not to scratch
 mkdir -p "${HOME_PROJECT}/logs"
-cp "${RESULTS_DIR}/logs"/am01_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+cp ~/jobs/logs/am01_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
 
 echo "Results fetched to ${HOME_PROJECT}/data/processed/ and ${HOME_PROJECT}/logs/"

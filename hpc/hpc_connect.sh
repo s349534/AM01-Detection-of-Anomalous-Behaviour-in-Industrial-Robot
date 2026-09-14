@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 #
 # hpc_connect.sh — Automated SSH connection and command execution for PolitO HPC Legion
 #
@@ -39,17 +39,19 @@ HPC_HOST="${HPC_HOST:-polito-hpc}"
 PROJECT_DIR_REMOTE="${PROJECT_DIR_REMOTE:-\$HOME/am01_project}"
 SSH_OPTS="-o StrictHostKeyChecking=yes -o ConnectTimeout=10"
 # Things never to upload to the HPC (large / secret / local-only)
+# NOTE: data/raw/ IS included — the preprocessing step on the compute node needs
+#       the Kuka .npy files.  rsync is incremental so they are only transferred once.
 RSYNC_EXCLUDES=(
     --exclude='.git/'
     --exclude='.venv/'
     --exclude='__pycache__/'
     --exclude='.ipynb_checkpoints/'
-    --exclude='data/raw/'
     --exclude='*.pth'
     --exclude='*.pt'
     --exclude='*.ckpt'
     --exclude='outputs/'
     --exclude='reports/figures/'
+    --exclude='reports/tables/ae_final_metrics.csv'
 )
 
 # ── Resolve paths relative to this script & project root (cwd-independent)
@@ -296,17 +298,33 @@ cmd_batch() {
 
     echo ""
 
+    # ── Resolve project root ────────────────────────────────────────────────
+    # cd to PROJECT_ROOT for consistency (fetch uses ${PROJECT_ROOT} abs paths)
+    if [[ ! -f "pyproject.toml" ]]; then
+        cd "${PROJECT_ROOT}" || return 1
+    fi
     # ── Upload SLURM script ─────────────────────────────────────────────────
-    local basename_script
+    local basename_script abs_script
     basename_script=$(basename "${script}")
+    abs_script="$(cd "$(dirname "${script}")" 2>/dev/null && pwd)/$(basename "${script}")"
+    [[ -f "${abs_script}" ]] || abs_script="${script}"
     ssh_run "$(ssh_target)" "mkdir -p ~/jobs/logs"
-    scp "${script}" "$(ssh_target):~/jobs/${basename_script}"
+    scp "${abs_script}" "$(ssh_target):~/jobs/${basename_script}"
     echo "Uploaded ${basename_script} → ~/jobs/"
 
     # ── Submit and capture job ID ───────────────────────────────────────────
     local jid
-    jid=$(ssh_run "$(ssh_target)" "cd ~/jobs && sbatch ${basename_script}" 2>&1 \
+    # Propagate env vars to the SLURM job
+    local sbatch_env=""
+    for _v in N_ITER MAX_VAL_EPOCHS SEEDS MAX_EPOCHS; do
+        if [[ -n "${!_v:-}" ]]; then
+            sbatch_env="${sbatch_env} ${_v}='${!_v}'"
+        fi
+    done
+    set +e
+    jid=$(ssh_run "$(ssh_target)" "cd ~/jobs && env ${sbatch_env} sbatch ${basename_script}" 2>&1 \
           | sed -n 's/.*Submitted batch job \([0-9]*\).*/\1/p')
+    set -e
     if [[ -z "${jid:-}" ]]; then
         echo "ERROR: could not extract job ID from sbatch output."
         echo "Try manually: ssh $(ssh_target) 'cd ~/jobs && sbatch ${basename_script}'"
@@ -322,93 +340,136 @@ cmd_batch() {
     echo "=== Live log (Ctrl-C to detach, job continues) ==="
     echo "  tail -f ~/jobs/logs/am01_*_${jid}.log"
     echo ""
-    ssh_run "$(ssh_target)" "
-        set +e
-        LOG=\"~/jobs/logs/am01_*_${jid}.log\"
-        # Wait for log file to appear (job may be PENDING)
-        for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-            eval \"log_file=\$(ls \$LOG 2>/dev/null | head -1)\"
-            [[ -n \"\$log_file\" ]] && break
-            sleep 5
-        done
-        log_file=\$(ls \$LOG 2>/dev/null | head -1)
-        if [[ -z \"\$log_file\" ]]; then
-            echo \"WARNING: Log file not found after 60s. Checking sinfo...\"
-            sinfo -p \${SLURM_PARTITION:-gpu_a40} 2>/dev/null || true
-        fi
-        # Stream live (use resolved log_file, not the glob)
-        if [[ -n \"\$log_file\" ]]; then
-            tail -n +1 -f \"\$log_file\" 2>/dev/null &
-            TAIL_PID=\$!
-            # Poll every 15s until the job leaves the queue
-            while squeue -j ${jid} -h -o '%T' 2>/dev/null | grep -q .; do
-                sleep 15
-            done
-            kill \$TAIL_PID 2>/dev/null || true
-            wait \$TAIL_PID 2>/dev/null || true
-            echo ''
-            echo '=== Job ${jid} completed ==='
-            tail -8 \"\$log_file\" 2>/dev/null || true
-        else
-            echo ''
-            echo '=== Job ${jid} completed (no log file found) ==='
-        fi
-    "
+    # Run log streaming on HPC via a single ssh_run invocation.
+    # Use a temp script to avoid fragile quoting of variables inside a nested string.
+    local _stream_script="/tmp/am01_stream_${jid}.sh"
+    cat > "${_stream_script}.base" <<'EOFSRIPT'
+#!/bin/bash
+set +e
+JID="$1"
+LOG_PATTERN="~/jobs/logs/am01_*_${JID}.log"
+# Wait for log file to appear (job may be PENDING)
+log_file=""
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    log_file=$(ls ~/jobs/logs/am01_*_${JID}.log 2>/dev/null | head -1)
+    [[ -n "$log_file" ]] && break
+    sleep 5
+done
+if [[ -z "$log_file" ]]; then
+    echo "WARNING: Log file not found after 60s. Checking sinfo..."
+    sinfo -p ${SLURM_PARTITION:-gpu_a40} 2>/dev/null || true
+fi
+# Stream live (use resolved log_file, not the glob)
+if [[ -n "$log_file" ]]; then
+    tail -n +1 -f "$log_file" 2>/dev/null &
+    TAIL_PID=$!
+    # Poll every 15s until the job leaves the queue
+    while squeue -j ${JID} -h -o '%T' 2>/dev/null | grep -q .; do
+        sleep 15
+    done
+    kill $TAIL_PID 2>/dev/null || true
+    wait $TAIL_PID 2>/dev/null || true
+    echo ''
+    echo "=== Job ${JID} completed ==="
+    tail -8 "$log_file" 2>/dev/null || true
+else
+    # Log not found within 60s -- job likely PENDING/queued on SLURM.
+    # Wait for job to finish BEFORE fetching so we do not fetch
+    # stale results from a previous run.
+    echo "WARNING: Log not found within 60s — job ${JID} is likely PENDING (queued on SLURM)."
+    while squeue -j ${JID} -h -o '%T' 2>/dev/null | grep -q .; do
+        sleep 30
+    done
+    echo "Job ${JID} completed."
+    # Re-check for log now that job has finished
+    log_file=$(ls ~/jobs/logs/am01_*_${JID}.log 2>/dev/null | head -1)
+    if [[ -n "$log_file" ]]; then
+        echo ''
+        echo "=== Job ${JID} completed ==="
+        tail -n 80 "$log_file" 2>/dev/null || true
+    else
+        echo ''
+        echo '=== Job ${JID} completed (no log file found) ==='
+    fi
+fi
+EOFSRIPT
+    # JID is passed as $1 to the stream script (no sed substitution needed)
+    cp "${_stream_script}.base" "${_stream_script}"
+    chmod +x "${_stream_script}" 2>/dev/null || true
+    # Upload and execute on HPC (run in foreground so Ctrl-C detaches cleanly)
+    scp "${_stream_script}" "$(ssh_target):~/am01_stream_${jid}.sh" 2>/dev/null || true
+    ssh_run "$(ssh_target)" "bash ~/am01_stream_${jid}.sh ${jid}"
 
     # ── Auto-download results ───────────────────────────────────────────────
     echo ""
     echo "=== Fetching results to local ==="
-    mkdir -p ./data/processed ./reports/tables ./reports/figures ./logs
+    mkdir -p "${PROJECT_ROOT}/data/processed" "${PROJECT_ROOT}/reports/tables" \
+             "${PROJECT_ROOT}/reports/figures" "${PROJECT_ROOT}/reports/checkpoints" \
+             "${PROJECT_ROOT}/logs" "${PROJECT_ROOT}/config"
+
+    # Always clear training-only artefacts first so that stale local copies do
+    # not survive a validation-only run (where these files are NOT produced).
+    # If the SLURM job DID produce them, they will be re-downloaded below.
+    rm -f "${PROJECT_ROOT}/reports/tables/ae_final_metrics.csv" \
+          "${PROJECT_ROOT}/reports/tables/aae_final_metrics.csv" \
+          "${PROJECT_ROOT}/reports/checkpoints/ae_baseline.pth" \
+          "${PROJECT_ROOT}/reports/checkpoints/aae_final.pth" 2>/dev/null || true
 
     if command -v rsync >/dev/null 2>&1; then
         rsync -av --progress \
             "$(ssh_target):~/am01_project/data/processed/" \
-            ./data/processed/ 2>/dev/null || true
+            "${PROJECT_ROOT}/data/processed/" 2>/dev/null || true
 
         # Download reports/ (CSV + plots) — populated by AE search / training jobs
-        rsync -av --progress --ignore-existing \
+        rsync -av --progress --delete \
             "$(ssh_target):~/am01_project/reports/tables/" \
-            ./reports/tables/ 2>/dev/null || true
-        rsync -av --progress --ignore-existing \
+            "${PROJECT_ROOT}/reports/tables/" 2>/dev/null || true
+        rsync -av --progress --delete \
             "$(ssh_target):~/am01_project/reports/figures/" \
-            ./reports/figures/ 2>/dev/null || true
-        rsync -av --progress --ignore-existing \
+            "${PROJECT_ROOT}/reports/figures/" 2>/dev/null || true
+        rsync -av --progress --delete \
             "$(ssh_target):~/am01_project/reports/checkpoints/" \
-            ./reports/checkpoints/ 2>/dev/null || true || true
+            "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null || true
 
-        # Download validated params (produced by analyze_results)
-        if [[ -f "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" ]]; then
-            scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
-                ./config/params_validated_ae.yaml 2>/dev/null || true
-            echo "Validated params → ./config/params_validated_ae.yaml"
-        fi
+        # Download validated params (produced by analyze_results on the remote)
+        scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
+            "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null \
+            && echo "Validated params → ${PROJECT_ROOT}/config/params_validated_ae.yaml" \
+            || echo "NOTE: params_validated_ae.yaml non trovato sul remoto (search non ancora eseguita?)"
     else
-        # Fallback: scp individual files
+        # Fallback: scp individual files (no rsync → no --delete, so we must
+        # proactively remove stale files above and overwrite unconditionally)
         for f in train.npy val.npy test_normal.npy test_anomaly.npy \
-                 scaler.pkl selected_columns.npy preprocessing_config.json; do
+                 scaler.pkl selected_columns.npy; do
             scp "$(ssh_target):~/am01_project/data/processed/${f}" \
-                ./data/processed/ 2>/dev/null || true
+                "${PROJECT_ROOT}/data/processed/" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/data/processed/${f}" || true
         done
-        # CSV results
-        for f in validation_results_ae.csv ae_final_metrics.csv; do
+        # CSV results — fetch whatever exists on the remote
+        for f in validation_results_ae.csv ae_final_metrics.csv \
+                 validation_results_aae.csv aae_final_metrics.csv; do
             scp "$(ssh_target):~/am01_project/reports/tables/${f}" \
-                ./reports/tables/ 2>/dev/null || true
+                "${PROJECT_ROOT}/reports/tables/" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/reports/tables/${f}" || true
+        done
+        # Checkpoints — the scp fallback previously omitted these!
+        for f in ae_baseline.pth aae_final.pth; do
+            scp "$(ssh_target):~/am01_project/reports/checkpoints/${f}" \
+                "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/reports/checkpoints/${f}" || true
         done
         # Validated params
         scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
-            ./config/params_validated_ae.yaml 2>/dev/null || true
+            "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/config/params_validated_ae.yaml" || echo "  (params not found or failed)"
     fi
 
     # Download latest log (fetched to ~/am01_project/logs/ by SLURM post-run rsync)
     local latest_log
     latest_log=$(ssh_run "$(ssh_target)" "ls -t ~/am01_project/logs/am01_*.log 2>/dev/null | head -1")
     if [[ -n "${latest_log}" ]]; then
-        scp "$(ssh_target):${latest_log}" ./logs/ 2>/dev/null || true
-        echo "Log downloaded → ./logs/$(basename "${latest_log}")"
+        scp "$(ssh_target):${latest_log}" "${PROJECT_ROOT}/logs/" 2>/dev/null || true
+        echo "Log downloaded → ${PROJECT_ROOT}/logs/$(basename "${latest_log}")"
     fi
 
     echo ""
-    echo "Done.  Data: ./data/processed/   Reports: ./reports/   Config: ./config/params_validated_ae.yaml   Log: ./logs/"
+    echo "Done.  Data: ${PROJECT_ROOT}/data/processed/   Reports: ${PROJECT_ROOT}/reports/   Config: ${PROJECT_ROOT}/config/params_validated_ae.yaml   Log: ${PROJECT_ROOT}/logs/"
 }
 
 cmd_help() {

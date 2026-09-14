@@ -46,6 +46,10 @@ env/
 *.swo
 *~
 
+# HPC local mirrors (results/data only in project root)
+hpc/reports/
+hpc/data/
+
 # OS
 .DS_Store
 Thumbs.db

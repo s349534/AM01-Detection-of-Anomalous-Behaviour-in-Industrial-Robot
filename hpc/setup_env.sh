@@ -109,8 +109,9 @@ echo ""
 if [[ ! -d "${PROJECT_DIR}/data/raw" ]]; then
     echo ""
     echo "WARNING: data/raw/ not found on cluster."
-    echo "  Preprocesing will fail without the Kuka .npy files."
-    echo "  Upload once:  ./hpc_connect.sh upload data/raw/ ~/am01_project/data/raw/"
+    echo "  Preprocessing will fail without the Kuka .npy files."
+    echo "  They are included in deploy. If absent, upload once:"
+    echo "  ./hpc_connect.sh upload data/raw/ ~/am01_project/data/raw/"
 else
     echo "data/raw/ present — preprocessing can run."
 fi

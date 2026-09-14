@@ -44,24 +44,39 @@ if [[ -d "${HOME}/am01_project" ]]; then
         --exclude='.git/' \
         --exclude='__pycache__/' \
         --exclude='.ipynb_checkpoints/' \
-        --exclude='data/raw/' \
         --exclude='*.pth' --exclude='*.pt' --exclude='*.ckpt' \
         "${HOME}/am01_project/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/"
     echo "Synced project to scratch."
 fi
 
 # ── Activate uv environment ─────────────────────────────────────────────────
+# Clear any stale VIRTUAL_ENV inherited from a remote .bashrc (setup_env.sh
+# auto-activates ~/am01_project/.venv, which is wrong on scratch)
+unset VIRTUAL_ENV 2>/dev/null || true
+
 if command -v uv &>/dev/null; then
     echo "--- Syncing frozen deps on scratch ---"
     uv sync --frozen --quiet
 fi
 
 # ── Phase 3.2: Final AE training with validated HPs (3 seeds) ───────────────
-echo "=== Phase 3.2: Final AE training (3 seeds) ==="
+# Preprocess if data/processed/ is missing (first run on a fresh scratch sync)
+if [[ ! -f "data/processed/train.npy" ]]; then
+    echo "=== data/processed/ missing — running preprocessing from data/raw/ ==="
+    uv run python -m src.data.preprocessing
+fi
+
+echo "=== Phase 3.2: Final AE training (seeds=${SEEDS}) ==="
 SEEDS="${SEEDS:-42 123 7}"
-uv run python -m src.models.train_ae \
+MAX_EPOCHS="${MAX_EPOCHS:-}"
+
+TRAIN_CMD="uv run python -m src.models.train_ae \
     --config config/params_validated_ae.yaml \
-    --seeds ${SEEDS}
+    --seeds ${SEEDS}"
+if [[ -n "${MAX_EPOCHS}" ]]; then
+    TRAIN_CMD="${TRAIN_CMD} --max-epochs ${MAX_EPOCHS}"
+fi
+eval "${TRAIN_CMD}"
 
 # ── Verify outputs ──────────────────────────────────────────────────────────
 echo "=== Outputs ==="
@@ -73,12 +88,14 @@ HOME_PROJECT="${HOME}/am01_project"
 
 mkdir -p "${HOME_PROJECT}/reports/checkpoints" "${HOME_PROJECT}/reports/tables" "${HOME_PROJECT}/logs"
 
-rsync -a --progress --ignore-existing \
+# No --ignore-existing: new results must overwrite stale ones
+rsync -a \
     "${RESULTS_DIR}/reports/checkpoints/" "${HOME_PROJECT}/reports/checkpoints/" 2>/dev/null || true
-rsync -a --progress --ignore-existing \
+rsync -a \
     "${RESULTS_DIR}/reports/tables/" "${HOME_PROJECT}/reports/tables/" 2>/dev/null || true
 
-cp "${RESULTS_DIR}/logs"/am01_ae_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+# Log — SLURM writes to ~/jobs/logs/ (relative to sbatch submission dir), not to scratch
+cp ~/jobs/logs/am01_ae_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
 
 echo "=== Results fetched to ${HOME_PROJECT}/reports/ ==="
 echo "Job completed."

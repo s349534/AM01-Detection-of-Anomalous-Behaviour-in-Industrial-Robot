@@ -61,8 +61,8 @@ cd hpc
 | --- | --- | --- |
 | `./hpc_connect.sh keycheck` | Verifica che l'auth a chiave funzioni (senza aprire sessione) | Prima di ogni sessione / se l'auth dà errore |
 | `./hpc_connect.sh check` | Mostra user, host, `$SCRATCH`, partizioni disponibili | Diagnostica iniziale |
-| `./hpc_connect.sh deploy` | ① `rsync` del progetto su `~/am01_project` (esclude `.venv`, `.git`, `data/raw`, checkpoint); ② `uv sync --frozen` (Python 3.13 richiesto da `.python-version`), registra kernel Jupyter `am01-hpc` | **Prima volta** e dopo ogni cambiamento di dipendenze (`pyproject.toml`/`uv.lock`) |
-| `./hpc_connect.sh batch slurm_job_template.sh` | `deploy` + `sbatch` + **stream log live** (`tail -f`) + **auto-fetch risultati**. Uno-shot completo: upload → build → submit → vedi output in tempo reale → a fine job scarica `data/processed/*.npy` `.pkl` e il log localmente | **Start uno-shot**: vai dal repository vuoto al risultato in locale |
+| `./hpc_connect.sh deploy` | ① `rsync` del progetto su `~/am01_project` (incluso `data/raw/`; esclude `.venv`, `.git`, checkpoint); ② `uv sync --frozen` (Python 3.13 richiesto da `.python-version`), registra kernel Jupyter `am01-hpc` | **Prima volta** e dopo ogni cambiamento di dipendenze (`pyproject.toml`/`uv.lock`). `data/raw/` è caricato una volta sola; deploy successivi usano rsync incrementale. |
+| `./hpc_connect.sh batch slurm_job_template.sh` | `deploy` + `sbatch` + **stream log live** (`tail -f`) + **auto-fetch risultati**. Uno-shot completo: upload → build → submit → vedi output in tempo reale → a fine job scarica `reports/`, `data/processed/`, `config/` e il log **nella root del progetto** (non in `hpc/`) | **Start uno-shot**: vai dal repository vuoto al risultato in locale. <br> `batch` fa `cd` automatico alla root del progetto (dove sta `pyproject.toml`) prima di scaricare, anche se lanciato da `hpc/`. |
 | `./hpc_connect.sh submit slurm_job_template.sh` | Carica il template in `~/jobs/` + `sbatch` (ritorna subino) | Se il progetto è **già** deployato e vuoi rilanciare solo il job |
 | `./hpc_connect.sh interactive gpu_a40 04:00:00` | `srun --pty` su un nodo compute con GPU | Sviluppo interattivo — **solo da qui hai `$SCRATCH`** |
 | `./hpc_connect.sh exec "comando"` | Esegue `comando` una volta sola sul login node | Comandi ad hoc (es. `ls`, `cat <log>`, `nvidia-smi`) |
@@ -131,13 +131,16 @@ Se invece preferisci il controllo manuale:
 ## 4. Dove finiscono i file
 
 - **Log**: `sbatch` scrive stdout+stderr (uniti dal `#SBATCH --output=logs/...`) in
-  **`~/jobs/logs/am01_train_<JID>.log`** **sul login node**. Il comando `submit`
+  **`~/jobs/logs/am01_<phase>_<JID>.log`** **sul login node**. Il comando `submit`
   crea `~/jobs/logs/` automaticamente (SLURM **non** crea le directory `#SBATCH`).
-- **Risultati** (`data/processed/*.npy`, `*.pkl`, `*.log`): il template SLURM esegue
-  un **post-run rsync** da `$SCRATCH_DIR/am01/` → `$HOME/am01_project/` così sono
-  disponibili anche da login node.
-- **`batch`** scarica automaticamente `data/processed/` + il log più recente in
-  `./data/processed/` e `./logs/` della tua macchina locale alla fine del job.
+  Il log va in `~/jobs/logs/` — NON in scratch (questo era la causa del bug "no log file found").
+- **Code**: sincronizzato da `~/am01_project/` a `$SCRATCH/am01/` su compute node
+  all'inizio del job (esclude `.venv`, `.git`, `__pycache__`, checkpoints `.pth`).
+- **Dati raw**: caricati una volta in `~/am01_project/data/raw/` via `deploy` (ora incluso nel rsync).
+- **Dati processati**: generati su compute node in `data/processed/` da preprocessing
+  automatico, poi sincronizzati a `~/am01_project/data/processed/` con post-run rsync.
+- **`batch`** scarica automaticamente `data/processed/`, `reports/`, `config/`, e il
+  log più recente in locale (`./data/processed/`, `./reports/`, `./config/`, `./logs/`).
 
 ---
 
@@ -150,7 +153,10 @@ Se invece preferisci il controllo manuale:
 | `slurm_script: line N: SCRATCH: unbound variable` | Template obsoleto: usa sempre `hpc/slurm_job_template.sh` aggiornato (ora usa `SCRATCH_DIR="${SCRATCH:-${HOME}/scratch}"`) |
 | `CUDA available: False` su GPU | La wheel di torch è troppo nuova per il driver del nodo: usa `torch>=2.7,<2.8` in `pyproject.toml` (cu126, compatibile con driver 570.x). Verifica con `nvidia-smi` (deve mostrare l'A40) |
 | Job in coda (`PENDING`) molto tempo | Partizione affollata — riduci `--time` nel template o passa a `cpu_sapphire_ext` per un test rapido |
-| Nessun file di log dopo `sbatch` | `~/jobs/logs/` non esiste → `submit` lo crea; se usi `sbatch` manuale: `mkdir -p ~/jobs/logs` prima |
+| **Nessun file di log dopo `sbatch`** | `~/jobs/logs/` non esiste → `submit` lo crea; se usi `sbatch` manuale: `mkdir -p ~/jobs/logs` prima. **Attenzione**: il log va in `~/jobs/logs/`, NON in scratch. Se il job termina con "no log file found", controlla `ls ~/jobs/logs/am01_*_<JID>.log` |
+| **50 epoche ma CSV mostra 2 epoche** | `run_search_ae.py` aveva `resume=True` di default → saltava run_id esistenti. Fix: usa `--no-resume` (default ora `False`). Rimuovi il CSV vecchio da `reports/tables/` prima di rilanciare. |
+| **Risultati non aggiornati** | Gli script SLURM usavano `--ignore-existing` su rsync. Fix applicato: rsync sovrascrive sempre. Se i risultati sembrano vecchi, forza `--no-resume`. |
+| `scp: stat local "slurm_ae_search.sh": No such file` | `cmd_batch` fa `cd` alla root del progetto prima del fetch; un path relativo come `hpc/slurm_ae_search.sh` non si risolve più. **Fix applicato**: `cmd_batch` risolve l'path assoluto dello script prima di `scp`. |
 | `rsync: command not found` | `hpc_connect.sh` usa automaticamente un fallback `tar|ssh` che onora gli stessi `--exclude` |
 
 ---
@@ -159,38 +165,69 @@ Se invece preferisci il controllo manuale:
 
 | File | Ruolo |
 | --- | --- |
-| `hpc_connect.sh` | Dispatcher SSH/SLURM (upload, deploy, submit, batch, interactive, exec) |
+| `hpc_connect.sh` | Dispatcher SSH/SLURM (upload, deploy, submit, batch, interactive, exec). Include `data/raw/` nel deploy rsync. |
 | `setup_env.sh` | Installa `uv`, crea il venv con `uv sync --frozen` (Python 3.13), registra kernel Jupyter `am01-hpc` (run in automatico da `deploy`) |
-| `slurm_job_template.sh` | Template di job batch SLURM: rsync → scratch, `uv sync`, torch/CUDA check, lancia `src/main.py` (inference) |
-| `slurm_ae_search.sh` | Template SLURM per **Fase 3.1**: validation search 20 iterazioni → `validation_results_ae.csv` + `params_validated_ae.yaml` + plots |
-| `slurm_ae_train.sh` | Template SLURM per **Fase 3.2**: training finale 3 seed → `ae_baseline.pth` + `ae_final_metrics.csv` |
+| `slurm_job_template.sh` | Template generico SLURM: rsync → scratch, `uv sync`, torch/CUDA check, preprocessing trigger, lancia `src/main.py` |
+| `slurm_ae_search.sh` | **Fase 3.1**: validation search (`run_search_ae.py --no-resume`) → `validation_results_ae.csv` + `params_validated_ae.yaml` + 3 plots. Preprocessing automatico su compute node. |
+| `slurm_ae_train.sh` | **Fase 3.2**: training finale 3 seed (`train_ae.py`) → `ae_baseline.pth` + `ae_final_metrics.csv`. Preprocessing saltato se `data/processed/` esiste. |
 
-## Esecuzione della validation su HPC
+## 7. Workflow completo — da zero a risultati
 
 ```bash
 cd hpc
 
-# 1. Verifica chiave SSH (prerequisito)
+# 0. Prerequisiti (usa GPU A40)
 ./hpc_connect.sh keycheck
 
-# 2. Deploy + submit della ricerca validazione (20 iterazioni, 50 epochs max)
-#    (usa GPU per velocizzare — ogni run CPU dura ~100s, con GPU ~30s)
+# 1. Deploy (una volta): upload codice + data/raw + uv sync + kernel Jupyter
+./hpc_connect.sh deploy
+
+# 2. Validazione HP (Fase 3.1): 20 iterazioni × 50 epoche
 N_ITER=20 MAX_VAL_EPOCHS=50 ./hpc_connect.sh batch slurm_ae_search.sh
 
-# 3. Al termine del job, trovi localmente:
-#    ./reports/tables/validation_results_ae.csv   (20 righe)
-#    ./reports/figures/sensitivity_*.png          (3 plot)
-#    ./config/params_validated_ae.yaml            (HP migliori)
-#    ./logs/am01_ae_search_<JID>.log              (log completo)
-```
+# 3. Al termine, verifica localmente:
+ls reports/tables/validation_results_ae.csv
+ls reports/figures/sensitivity_ae_*.png
+ls config/params_validated_ae.yaml
+ls logs/am01_ae_search_*.log
 
-## Esecuzione del training finale su HPC
-
-```bash
-# Dopo che params_validated_ae.yaml è stato scaricato localmente:
+# 4. Training finale (Fase 3.2): 3 seed
 SEEDS="42 123 7" ./hpc_connect.sh batch slurm_ae_train.sh
 
-# Risultati attesi:
-# ./reports/checkpoints/ae_baseline.pth
-# ./reports/tables/ae_final_metrics.csv
+# 5. Risultati finali:
+ls reports/checkpoints/ae_baseline.pth
+ls reports/tables/ae_final_metrics.csv
+```
+
+### Cosa fa `batch`
+
+`cmd_batch` esegue un flusso completo:
+1. **Deploy**: rsync del progetto (ora con `data/raw/`) + `uv sync --frozen`
+2. **Upload script**: copia lo script SLURM in `~/jobs/`
+3. **sbatch**: sottomette il job, ottiene JID
+4. **Stream log**: `tail -f ~/jobs/logs/am01_*_<JID>.log` in tempo reale (Ctrl-C per staccare; il job continua)
+5. **Auto-fetch**: al termine, rsync di `reports/`, `config/`, `data/processed/` da `~/am01_project/` → locale
+
+### Preprocessing automatico
+
+Gli script SLURM (`slurm_ae_search.sh`, `slurm_ae_train.sh`, `slurm_job_template.sh`)
+verificano se `data/processed/train.npy` esiste. Se manca, lanciano:
+```bash
+uv run python -m src.data.preprocessing
+```
+Questo evita di dover caricare manualmente i dati processati — basta avere
+`data/raw/` su HPC (incluso nel `deploy`).
+
+### Variabili d'ambiente personalizzabili
+
+| Variabile | Default | Descrizione |
+|---|---|---|
+| `N_ITER` | 20 | Numero di iterazioni random search (solo `slurm_ae_search.sh`) |
+| `MAX_VAL_EPOCHS` | 50 | Epoche massime per ogni run di validazione |
+| `SEEDS` | "42 123 7" | Seed per training finale (solo `slurm_ae_train.sh`) |
+| `SCRATCH_PROJECT` | am01 | Nome della directory su scratch |
+
+```bash
+# Esempio: search veloce 5 iterazioni, 10 epoche, CPU
+N_ITER=5 MAX_VAL_EPOCHS=10 ./hpc_connect.sh batch hpc/slurm_ae_search.sh
 ```

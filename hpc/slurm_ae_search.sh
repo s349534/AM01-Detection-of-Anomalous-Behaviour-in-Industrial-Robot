@@ -49,14 +49,18 @@ if [[ -d "${HOME}/am01_project" ]]; then
         --exclude='.git/' \
         --exclude='__pycache__/' \
         --exclude='.ipynb_checkpoints/' \
-        --exclude='data/raw/' \
         --exclude='*.pth' --exclude='*.pt' --exclude='*.ckpt' \
         --exclude='outputs/' --exclude='reports/figures/' \
+        --exclude='reports/tables/ae_final_metrics.csv' \
         "${HOME}/am01_project/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/"
     echo "Synced project to scratch."
 fi
 
 # ── Activate uv environment ─────────────────────────────────────────────────
+# Clear any stale VIRTUAL_ENV inherited from a remote .bashrc (setup_env.sh
+# auto-activates ~/am01_project/.venv, which is wrong on scratch)
+unset VIRTUAL_ENV 2>/dev/null || true
+
 if command -v uv &>/dev/null; then
     echo "--- Syncing frozen deps on scratch ---"
     uv sync --frozen --quiet
@@ -71,11 +75,18 @@ if torch.cuda.is_available():
 fi
 
 # ── Phase 3.1: Validation search (§4.8.6) ───────────────────────────────────
+# Preprocess if data/processed/ is missing (first run on a fresh scratch sync)
+if [[ ! -f "data/processed/train.npy" ]]; then
+    echo "=== data/processed/ missing — running preprocessing from data/raw/ ==="
+    uv run python -m src.data.preprocessing
+fi
+
 echo "=== Phase 3.1: AE validation search (${N_ITER} iterations, max ${MAX_VAL_EPOCHS} epochs) ==="
 uv run python -m src.validation.run_search_ae \
     --n-iter "${N_ITER}" \
     --seed 42 \
-    --max-val-epochs "${MAX_VAL_EPOCHS}"
+    --max-val-epochs "${MAX_VAL_EPOCHS}" \
+    --no-resume
 
 # ── Phase 3.1b: Analyze results → params_validated_ae.yaml + plots (§4.8.8) ─
 echo "=== Phase 3.1b: Analyzing results ==="
@@ -92,19 +103,29 @@ HOME_PROJECT="${HOME}/am01_project"
 mkdir -p "${HOME_PROJECT}/reports/tables" "${HOME_PROJECT}/reports/figures" "${HOME_PROJECT}/config"
 mkdir -p "${HOME_PROJECT}/logs"
 
-# CSV + YAML + plots
-rsync -a --include='validation_results_ae.csv' --include='ae_final_metrics.csv' \
-          --include='params_validated_ae.yaml' \
-          --include='sensitivity_*.png' --include='*.png' \
-          --include='*' --exclude='*' \
-    "${RESULTS_DIR}/reports/" "${HOME_PROJECT}/reports/" 2>/dev/null || true
+# Remove stale training residue from previous runs.
+# Validation phase does NOT produce ae_final_metrics.csv — clear it from BOTH
+# scratch (so it doesn't sync back to home) and home (the source of truth for
+# the local download).
+rm -f "${RESULTS_DIR}/reports/tables/ae_final_metrics.csv" \
+      "${HOME_PROJECT}/reports/tables/ae_final_metrics.csv" 2>/dev/null || true
 
-rsync -a --include='params_validated_ae.yaml' \
-          --include='*.yaml' --include='*' --exclude='*' \
+# CSV + YAML + plots --delete: remove stale files not present in this run's output.
+rsync -a --delete \
+    "${RESULTS_DIR}/reports/tables/" "${HOME_PROJECT}/reports/tables/" 2>/dev/null || true
+rsync -a --delete \
+    "${RESULTS_DIR}/reports/figures/" "${HOME_PROJECT}/reports/figures/" 2>/dev/null || true
+
+# params_validated_ae.yaml (produced by analyze_results)
+rsync -a \
     "${RESULTS_DIR}/config/" "${HOME_PROJECT}/config/" 2>/dev/null || true
 
-# Log
-cp "${RESULTS_DIR}/logs"/am01_ae_search_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+# data/processed/ — sync from scratch to home so cmd_batch can download
+rsync -a --include='*.npy' --include='*.pkl' --include='*.json' --exclude='*' \
+    "${RESULTS_DIR}/data/processed/" "${HOME_PROJECT}/data/processed/" 2>/dev/null || true
+
+# Log — SLURM writes to ~/jobs/logs/ (relative to sbatch submission dir), not to scratch
+cp ~/jobs/logs/am01_ae_search_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
 
 echo "=== Results fetched to ${HOME_PROJECT}/reports/ and ${HOME_PROJECT}/config/ ==="
 echo "Job completed."
