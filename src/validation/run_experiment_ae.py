@@ -155,7 +155,7 @@ def train_and_evaluate_ae(
     max_val_epochs: int | None = None,
     threshold_percentile: float = 99.0,
     device: str | torch.device | None = None,
-    patience: int = 5,
+    patience: int | None = None,
 ) -> dict[str, Any]:
     """Train a single AE configuration and evaluate on validation + test.
 
@@ -178,8 +178,9 @@ def train_and_evaluate_ae(
         Default 99 → ~1% FPR on normal data.
     device : str | torch.device | None
         Device to train/evaluate on. ``None`` → auto-detect.
-    patience : int
-        Early Stopping patience for validation runs (shorter than final training).
+    patience : int or None
+        Early Stopping patience for validation runs. If None, reads from
+        ``config["training"]["early_stopping"]["patience"]`` (default 10).
 
     Returns
     -------
@@ -214,6 +215,10 @@ def train_and_evaluate_ae(
     epochs = max_val_epochs or int(get_param(config, "training.epochs", DEFAULT_VAL_EPOCHS))
     lr = float(get_param(config, "training.learning_rate", 1e-3))
     weight_decay = float(get_param(config, "training.weight_decay", 0.0))
+    patience = patience if patience is not None else int(
+        get_param(config, "training.early_stopping.patience", 10)
+    )
+    min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
     processed_dir = Path(get_param(config, "paths.data_processed", "data/processed/"))
 
     logger.info(
@@ -243,12 +248,13 @@ def train_and_evaluate_ae(
         learning_rate=lr,
         weight_decay=weight_decay,
         patience=patience,
+        min_delta=min_delta,
         checkpoint_path=str(ckpt_path),
         device=dev,
     )
 
     train_time_sec = time.time() - start_time
-    best_epoch = len(history["val_loss"]) if history else 0
+    best_epoch = history.get("best_epoch", 0) if history else 0
 
     # --- Calibrate threshold on validation (normal only) ---
     val_errors, _ = _compute_reconstruction_errors(model, val_loader, dev, metric="mse")

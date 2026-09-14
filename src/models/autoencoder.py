@@ -450,14 +450,16 @@ class EarlyStopping:
         self.counter = 0
         self.best_score: float | None = None
         self.best_state: dict[str, Any] | None = None
+        self.best_epoch: int = 0
         self.early_stop = False
 
-    def __call__(self, val_loss: float, model: nn.Module) -> bool:
+    def __call__(self, val_loss: float, model: nn.Module, epoch: int = 0) -> bool:
         score = -val_loss if self.mode == "min" else val_loss
 
         if self.best_score is None:
             self.best_score = score
             self.best_state = copy.deepcopy(model.state_dict())
+            self.best_epoch = epoch
             return False
 
         if score < self.best_score + self.min_delta:
@@ -468,6 +470,7 @@ class EarlyStopping:
         else:
             self.best_score = score
             self.best_state = copy.deepcopy(model.state_dict())
+            self.best_epoch = epoch
             self.counter = 0
 
         return False
@@ -582,8 +585,9 @@ def fit_autoencoder(
 
     Returns
     -------
-    dict[str, list[float]]
-        History dictionary containing "train_loss" and "val_loss" per epoch.
+    dict
+        History with keys "train_loss" (list[float]), "val_loss" (list[float]),
+        and "best_epoch" (int — the epoch with the best validation loss).
     """
     dev = torch.device(device)
     model.to(dev)
@@ -596,7 +600,7 @@ def fit_autoencoder(
     )
     early_stopping = EarlyStopping(patience=patience, min_delta=min_delta)
 
-    history: dict[str, list[float]] = {"train_loss": [], "val_loss": []}
+    history: dict[str, Any] = {"train_loss": [], "val_loss": [], "best_epoch": 0}
 
     logger.info("Starting SequenceAutoencoder training on %s (%d epochs)", dev, epochs)
 
@@ -613,12 +617,15 @@ def fit_autoencoder(
                 epoch, epochs, train_loss, val_loss,
             )
 
-        if early_stopping(val_loss, model):
+        if early_stopping(val_loss, model, epoch):
             logger.info(
                 "Early stopping triggered at epoch %d (best val loss: %.6f)",
                 epoch, -early_stopping.best_score if early_stopping.best_score else 0.0,
             )
             break
+
+    # Record the actual best epoch (tracked by EarlyStopping)
+    history["best_epoch"] = early_stopping.best_epoch
 
     # Restore best checkpoint weights
     early_stopping.restore_best_weights(model)

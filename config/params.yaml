@@ -44,9 +44,9 @@ training:
   # test_split = 1.0 - train_split - val_split = 0.2 (20% KukaNormal → test_normal)
 
 data:
-  normal_data_path: "data/raw/KukaVelocityDataset/KukaNormal.npy"
-  slow_data_path: "data/raw/KukaVelocityDataset/KukaSlow.npy"
-  column_names_path: "data/raw/KukaVelocityDataset/KukaColumnNames.npy"
+  normal_data_path: "data/raw/KukaNormal.npy"
+  slow_data_path: "data/raw/KukaSlow.npy"
+  column_names_path: "data/raw/KukaColumnNames.npy"
 
   # Sequence-aware: each sample = window of W consecutive timesteps
   window_size: 16          # number of timesteps per window (see §4.1.1)

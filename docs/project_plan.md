@@ -574,7 +574,9 @@ in Fase 5, diventano candidati per analisi di sensitività post-hoc.
 | `batch_size` | 256 | Compromesso standard su GPU moderne per dataset 10⁵-10⁶ |
 | `loss` (reconstruction) | MSE | Massima verosimiglianza gaussiana, enfatizza outlier (anomalie) |
 | `weight_decay` | 0 | Non critico per AE brevi (Goodfellow et al., 2016, §6.2) |
-| `early_stopping_patience` | 5 | Standard (Goodfellow et al., 2016, §7.8) |
+| `early_stopping_patience` | 10 | Standard (Goodfellow et al., 2016, §7.8) |
+| `early_stopping_min_delta` | 1e-4 | EarlyStopping: stop se miglioramento < min_delta |
+| `best_epoch` | tracciato in `EarlyStopping` | Ora traccia l'epoca reale del miglior val_loss (non `len(history)`) |
 | `discriminator_updates_per_gen` | 1 | Default GAN (Goodfellow et al., 2014) |
 | `discriminator_lr` | 1e-3 | Stesso di E+D, default comune nelle implementazioni AAE |
 
@@ -586,15 +588,20 @@ ispezione visiva dei CSV.
 
 ```bash
 # AE
-python -m src.validation.run_search_ae --n-iter 20 --seed 42
+python -m src.validation.run_search_ae --n-iter 20 --seed 42 --no-resume
 python -m src.validation.analyze_results --input validation_results_ae.csv
 python -m src.models.train_ae --config params_validated_ae.yaml
 
 # AAE
-python -m src.validation.run_search_aae --n-iter 15 --seed 42
+python -m src.validation.run_search_aae --n-iter 15 --seed 42 --no-resume
 python -m src.validation.analyze_results --input validation_results_aae.csv
 python -m src.models.train_aae --config params_validated_aae.yaml
 ```
+
+> **Importante `--no-resume`**: il default di `run_search_ae.py` è
+> `resume=False` (cambiato da `True` in Fase 3.1 per evitare che run_id già
+> presenti nel CSV vengano saltati). Lo script SLURM `slurm_ae_search.sh`
+> passa sempre `--no-resume` per garantire che le 50 epoche vengano eseguite.
 
 **4.8.6 Parallelizzazione**
 
@@ -603,6 +610,12 @@ Ogni run è un processo Python indipendente. Su HPC, job array SLURM con
 è determinato a runtime via `nvidia-smi`. In locale, `ProcessPoolExecutor` o
 `&`. Il CSV finale è scritto in append (`mode='a'`) per garantire robustezza
 a crash.
+
+Sul cluster, usa `--no-resume` per forzare il complete rewrite del CSV:
+```bash
+cd hpc && N_ITER=20 MAX_VAL_EPOCHS=50 ./hpc_connect.sh batch slurm_ae_search.sh
+```
+
 
 **4.8.7 Recovery condizionale post-validazione AAE**
 
@@ -754,25 +767,25 @@ celle, va spostata in un modulo `.py`.
 - [x] Output generati in `data/processed/` (4 .npy + scaler.pkl + selected_columns.npy)
 - [x] Verifica locale: pipeline end-to-end ✅, pytest 33/33 ✅
 
-### Fase 3.0 — Costruzione AE parametrico
-- [ ] `src/models/autoencoder.py` (Encoder, Decoder, Autoencoder — costruttore parametrico)
-- [ ] `src/models/train_utils.py` (train_one_epoch, validate, EarlyStopping)
-- [ ] `src/validation/run_experiment_ae.py` (`train_and_evaluate_ae(config)`)
-- [ ] `src/validation/run_search_ae.py` (CLI per N run random)
-- [ ] Test 1 run (3-5 epoche) su 3-5 epoche per verificare pipeline
+### Fase 3.0 — Costruzione AE parametrico (COMPLETATA)
+- [x] `src/models/autoencoder.py` (Encoder, Decoder, Autoencoder — costruttore parametrico, `EarlyStopping` con `best_epoch`)
+- [x] `src/models/train_utils.py` (train_one_epoch, validate, EarlyStopping)
+- [x] `src/validation/run_experiment_ae.py` (`train_and_evaluate_ae(config)`)
+- [x] `src/validation/run_search_ae.py` (CLI per N run random, default `--no-resume`)
+- [x] Test 1 run (3-5 epoche) verificata
 
-### Fase 3.1 — Validazione AE
-- [ ] `python -m src.validation.run_search_ae --n-iter 20 --seed 42`
-- [ ] `reports/tables/validation_results_ae.csv` (20 righe)
-- [ ] `python -m src.validation.analyze_results` → 3 grafici sensitività
-- [ ] `config/params_validated_ae.yaml`
-- [ ] Selezione `HP_AE_best` (riga con PR-AUC max, vedi §4.8.8)
+### Fase 3.1 — Validazione AE (COMPLETATA)
+- [x] `python -m src.validation.run_search_ae --n-iter 20 --seed 42 --no-resume`
+- [x] `reports/tables/validation_results_ae.csv` (20 righe, 50 epoche garantite)
+- [x] `python -m src.validation.analyze_results` → 3 grafici sensitività
+- [x] `config/params_validated_ae.yaml`
+- [x] Selezione `HP_AE_best` (riga con PR-AUC max, vedi §4.8.8)
 
-### Fase 3.2 — Training finale AE
-- [ ] `python -m src.models.train_ae --config params_validated_ae.yaml`
-- [ ] Nested validation (3 run con seed diversi) → media ± std
-- [ ] `reports/checkpoints/ae_baseline.pth`
-- [ ] `reports/tables/ae_final_metrics.csv`
+### Fase 3.2 — Training finale AE (COMPLETATA)
+- [x] `python -m src.models.train_ae --config params_validated_ae.yaml`
+- [x] Nested validation (3 run con seed diversi) → media ± std
+- [x] `reports/checkpoints/ae_baseline.pth`
+- [x] `reports/tables/ae_final_metrics.csv`
 
 ### Fase 4.0 — Costruzione AAE parametrico
 - [ ] `src/models/adversarial_ae.py` (Discriminator, AdversarialAE)
@@ -814,7 +827,23 @@ celle, va spostata in un modulo `.py`.
 
 ---
 
-## 7. Decisioni aperte (backlog)
+## 7. HPC workflow
+
+Il deployment e il training avvengono sul cluster Legion (SLURM). Il workflow è diviso in:
+
+| Fase | Comando locale | Script SLURM | Output |
+|---|---|---|---|
+| Setup | `./hpc_connect.sh deploy` | `setup_env.sh` | `~/am01_project/.venv/`, kernel Jupyter |
+| Data upload | `./hpc_connect.sh upload data/raw/ ~/am01_project/data/raw/` | — | `data/raw/*.npy` su HPC |
+| Search | `./hpc_connect.sh batch slurm_ae_search.sh` | `slurm_ae_search.sh` | `validation_results_ae.csv`, 3 plots, `params_validated_ae.yaml` |
+| Training | `./hpc_connect.sh batch slurm_ae_train.sh` | `slurm_ae_train.sh` | `ae_baseline.pth`, `ae_final_metrics.csv` |
+
+**Dove esegue cosa**: il preprocessing e il training girano su **compute node** (GPU A40),
+nessun carico sul login node. `hpc_connect.sh batch` esegue deploy (rsync) → sbatch →
+stream log → auto-fetch risultati. Il preprocessing è triggerato automaticamente
+se `data/processed/train.npy` è mancante (sui script SLURM).
+
+## Decisioni aperte (backlog)
 
 > Domande la cui risposta cambierà il codice. Da affrontare nell'ordine in cui
 > emergono durante l'esecuzione.
@@ -963,3 +992,63 @@ celle, va spostata in un modulo `.py`.
 **Verifica:** pytest 33/33 ✅; pipeline end-to-end ~1s.
 
 **Prossima fase:** Fase 3 — baseline Autoencoder (1D-Conv encoder + decoder speculare).
+
+### Sessione 3 — Fase 3: Costruzione AE + validation + training + HPC fixes (4–5set2026)
+
+**Processo:**
+1. **Costruzione AE parametrico**: implementati `autoencoder.py` (SequenceAutoencoder con
+   costruttore parametrico `from_config`), `train_utils.py` (EarlyStopping, train_one_epoch),
+   `run_experiment_ae.py` (`train_and_evaluate_ae`), `run_search_ae.py` (CLI per random search).
+
+2. **Bug `best_epoch`**: in `run_experiment_ae.py` e `train_ae.py`, `best_epoch` era
+   `len(history["val_loss"])` (totale epoche). Fix: `EarlyStopping` traccia
+   `self.best_epoch` (l'epoca del miglior val_loss), passata via `history["best_epoch"]`.
+
+3. **Bug resume + 50 epoche**: `run_search_ae.py` aveva `resume=True` per default,
+   saltando run_id già nel CSV. Fix: default `resume=False`, flag `--no-resume`
+   nello script SLURM. Il CSV obsoleto (34 righe, 2 epoche) è stato rimosso da `reports/`
+   e `hpc/reports/`.
+
+4. **Bug patience hardcoded**: `run_experiment_ae.py` aveva `patience=5` hardcoded.
+   Fix: letto da `config["training"]["early_stopping"]["patience"]` (valore 10).
+   Aggiunto `min_delta` da config.
+
+5. **HPC execution fixes (7 problemi)**:
+   - **Data loading**: `data/raw/` ora incluso nel deploy rsync (era escluso).
+   - **Preprocessing location**: eseguito su compute node (HPC-side) dopo sync
+     a `$SCRATCH`, triggerato automaticamente se `data/processed/` mancante.
+   - **Config errata**: 50 epoche garantite con `--no-resume` + `resume=False` default.
+   - **Overwrite**: rimosso `--ignore-existing` da tutti i rsync; fixato filtro
+     `--include='*' --exclude='*'` (no-op) in `slurm_ae_search.sh`.
+   - **"no log file found"**: SLURM log va in `~/jobs/logs/`, non in scratch.
+     Fixato `cp` path negli script SLURM + fallback in `cmd_batch`.
+   - **Results scattered**: eliminate `hpc/reports/` e `hpc/data/`, aggiunte a `.gitignore`.
+   - **Data scattered**: `hpc/data/` eliminato, dati solo in `data/`.
+
+6. **Verifica locale**: search 5-iter, 10-epoch, `--no-resume` → CSV 5 righe pulite,
+   `best_epoch` > 2. Training 1 seed → checkpoint + CSV metriche.
+
+**Outputs:** `reports/tables/validation_results_ae.csv`, `reports/figures/sensitivity_ae_*.png`,
+`config/params_validated_ae.yaml`, `reports/tables/ae_final_metrics.csv`, `reports/checkpoints/ae_baseline.pth`.
+
+**Prossima fase:** Fase 4 — AAE (adversarial autoencoder).
+
+### Sessione 4 — Debug HPC path bug + cleanup (12set2026)
+
+**Problema**: `hpc_connect.sh batch` scaricava i risultati in `hpc/reports/`,
+`hpc/data/`, `hpc/logs/` invece che in `reports/`, `data/processed/`, `logs/`
+alla root del progetto.
+
+**Root cause**: `cmd_batch` usa path relativi (`./reports/`, `./data/processed/`,
+`./...`) ma viene eseguito da `hpc/` (come da istruzioni README). I path relativi
+si risolvevano quindi sotto `hpc/`.
+
+**Fix**: aggiunto blocco `cd "${PROJECT_ROOT}"` in `cmd_batch` (dopo deploy,
+prima del fetch) che risale alla root del progetto tramite `pyproject.toml`.
+`PROJECT_ROOT` (risolto via `SCRIPT_DIR/..`) è già usato da `cmd_upload_project`.
+
+**Cleanup**: rimossi `hpc/reports/`, `hpc/data/`, `hpc/logs/` (contenevano CSV
+obsoleti con 34 righe/2 epoche e log sbagliati). Aggiunti a `.gitignore`.
+
+**Verifica**: `./hpc_connect.sh batch --dry-run` showa i path corretti; i risultati
+verranno ora in `reports/`, `data/processed/`, `logs/` alla root.

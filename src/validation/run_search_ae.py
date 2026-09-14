@@ -66,7 +66,7 @@ def run_search(
     config_path: str | Path | None = None,
     params_path: str | Path | None = None,
     max_val_epochs: int | None = None,
-    resume: bool = True,
+    resume: bool = False,
 ) -> Path:
     """Run the random search over AE hyperparameters.
 
@@ -105,6 +105,10 @@ def run_search(
     # --- Determine which run_ids already exist (for resume) ---
     existing_run_ids: set[int] = set()
     write_header = True
+    if not resume and output_csv.exists():
+        # --no-resume: start fresh, remove existing CSV
+        output_csv.unlink()
+        logger.info("Removed existing CSV (no-resume mode)")
     if resume and output_csv.exists() and output_csv.stat().st_size > 0:
         with open(output_csv, "r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -199,6 +203,11 @@ def parse_args() -> argparse.Namespace:
         "--no-resume", action="store_true",
         help="Do not resume from existing CSV (start fresh)",
     )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume from existing CSV (skip run_ids already present). "
+             "Default is no-resume (fresh start each time).",
+    )
     return parser.parse_args()
 
 
@@ -210,7 +219,7 @@ def main() -> None:
         n_iter=args.n_iter,
         seed=args.seed,
         max_val_epochs=args.max_val_epochs,
-        resume=not args.no_resume,
+        resume=args.resume,
     )
 
     elapsed = time.time() - start

@@ -285,7 +285,7 @@ def save_processed_data(
     config: dict[str, Any],
 ) -> None:
     """Save .npy arrays, scaler.pkl, and selected_columns.npy to data/processed/."""
-    output_dir = Path(config["paths"]["processed_data_dir"])
+    output_dir = Path(config["paths"]["data_processed"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Save .npy arrays ---

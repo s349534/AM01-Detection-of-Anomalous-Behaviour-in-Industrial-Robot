@@ -169,7 +169,7 @@ def train_single_seed(
         device=dev,
     )
     train_time_sec = time.time() - start_time
-    best_epoch = len(history["val_loss"]) if history else 0
+    best_epoch = history.get("best_epoch", 0) if history else 0
 
     # --- Calibrate threshold on validation (normal only) ---
     val_errors, _ = _compute_errors(model, val_loader, dev)
@@ -217,6 +217,7 @@ def run_final_training(
     config_path: str | Path,
     seeds: list[int] | None = None,
     device: str | torch.device | None = None,
+    max_epochs: int | None = None,
 ) -> None:
     """Run final AE training with nested validation across multiple seeds.
 
@@ -228,6 +229,8 @@ def run_final_training(
         Seeds for nested validation runs. Defaults to ``[42, 123, 7]``.
     device : str | torch.device | None
         Device to train on.
+    max_epochs : int or None
+        Override ``training.epochs`` from config (useful for quick smoke tests).
     """
     from src.utils.config import load_config
 
@@ -238,6 +241,10 @@ def run_final_training(
         config_path=Path("config/config.yaml"),
         params_path=Path(config_path) if isinstance(config_path, str) else config_path,
     )
+
+    if max_epochs is not None:
+        config["training"]["epochs"] = max_epochs
+        logger.info("Overriding training.epochs → %d (max-epochs)", max_epochs)
 
     reports_dir = Path(get_param(config, "paths.reports", "reports/"))
     ckpt_dir = reports_dir / "checkpoints"
@@ -334,6 +341,10 @@ def parse_args() -> argparse.Namespace:
         "--device", type=str, default=None,
         help="Device (cuda/cpu), auto-detect if not specified",
     )
+    parser.add_argument(
+        "--max-epochs", type=int, default=None,
+        help="Override training.epochs (useful for quick smoke tests on HPC)",
+    )
     return parser.parse_args()
 
 
@@ -353,6 +364,7 @@ def main() -> None:
         config_path=args.config,
         seeds=args.seeds,
         device=device,
+        max_epochs=args.max_epochs,
     )
 
 

@@ -59,10 +59,10 @@ training:
   train_split: 0.6
   val_split: 0.2
 data:
-  normal_data_path: data/raw/KukaVelocityDataset/KukaNormal.npy
-  slow_data_path: data/raw/KukaVelocityDataset/KukaSlow.npy
-  column_names_path: data/raw/KukaVelocityDataset/KukaColumnNames.npy
-  window_size: 16
+  normal_data_path: data/raw/KukaNormal.npy
+  slow_data_path: data/raw/KukaSlow.npy
+  column_names_path: data/raw/KukaColumnNames.npy
+  window_size: 32
   window_stride: 1
   drop_incomplete: true
   normalization: standard
