@@ -60,12 +60,13 @@ def _build_train_loader(
     processed_dir: Path,
     window_size: int,
     batch_size: int,
+    num_workers: int = 0,
 ) -> DataLoader:
     """Build a shuffled DataLoader for the training set (normal only)."""
     train_data = np.load(processed_dir / "train.npy")
     train_ds = KukaDataset(train_data, window_size=window_size, label=0)
     return DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=False
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=False
     )
 
 
@@ -73,12 +74,13 @@ def _build_val_loader(
     processed_dir: Path,
     window_size: int,
     batch_size: int,
+    num_workers: int = 0,
 ) -> DataLoader:
     """Build a DataLoader for the validation set (normal only)."""
     val_data = np.load(processed_dir / "val.npy")
     val_ds = KukaDataset(val_data, window_size=window_size, label=0)
     return DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=0, drop_last=False
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False
     )
 
 
@@ -86,6 +88,7 @@ def _build_test_loader(
     processed_dir: Path,
     window_size: int,
     batch_size: int,
+    num_workers: int = 0,
 ) -> DataLoader:
     """Build a DataLoader for the test set (normal + anomaly concatenated)."""
     test_normal_data = np.load(processed_dir / "test_normal.npy")
@@ -96,7 +99,7 @@ def _build_test_loader(
     test_ds = ConcatDataset([test_normal_ds, test_anomaly_ds])
 
     return DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False, num_workers=0, drop_last=False
+        test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False
     )
 
 
@@ -143,6 +146,14 @@ def _compute_reconstruction_errors(
             if y is not None:
                 all_labels.append(y.cpu().numpy().flatten())
 
+    if not all_errors:
+        raise ValueError(
+            f"No batches yielded from DataLoader — dataset may be empty. "
+            f"Check: window_size exceeds validation samples, "
+            f"or DataLoader num_workers > 0 causing multiprocessing issues. "
+            f"Dataset length: {len(dataloader.dataset)}"
+        )
+
     errors = np.concatenate(all_errors)
     labels = np.concatenate(all_labels) if all_labels else np.array([])
     return errors, labels
@@ -156,6 +167,7 @@ def train_and_evaluate_ae(
     threshold_percentile: float = 99.0,
     device: str | torch.device | None = None,
     patience: int | None = None,
+    num_workers: int = 0,
 ) -> dict[str, Any]:
     """Train a single AE configuration and evaluate on validation + test.
 
@@ -181,6 +193,8 @@ def train_and_evaluate_ae(
     patience : int or None
         Early Stopping patience for validation runs. If None, reads from
         ``config["training"]["early_stopping"]["patience"]`` (default 10).
+    num_workers : int
+        Number of DataLoader workers for parallel data loading. Default 0.
 
     Returns
     -------
@@ -219,6 +233,7 @@ def train_and_evaluate_ae(
         get_param(config, "training.early_stopping.patience", 10)
     )
     min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
+    num_workers = int(get_param(config, "training.num_workers", num_workers))
     processed_dir = Path(get_param(config, "paths.data_processed", "data/processed/"))
 
     logger.info(
@@ -227,9 +242,9 @@ def train_and_evaluate_ae(
     )
 
     # --- Build dataloaders ---
-    train_loader = _build_train_loader(processed_dir, window_size, batch_size)
-    val_loader = _build_val_loader(processed_dir, window_size, batch_size)
-    test_loader = _build_test_loader(processed_dir, window_size, batch_size)
+    train_loader = _build_train_loader(processed_dir, window_size, batch_size, num_workers)
+    val_loader = _build_val_loader(processed_dir, window_size, batch_size, num_workers)
+    test_loader = _build_test_loader(processed_dir, window_size, batch_size, num_workers)
 
     # --- Instantiate model ---
     model = SequenceAutoencoder.from_config(config)

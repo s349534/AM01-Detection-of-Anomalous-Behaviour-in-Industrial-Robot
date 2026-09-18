@@ -31,6 +31,7 @@ training:
   weight_decay: 0.0001
   beta1: 0.5
   beta2: 0.999
+  num_workers: 4  # DataLoader workers for parallel data loading
 
   adversarial_weight: 0.1
   reconstruction_weight: 1.0

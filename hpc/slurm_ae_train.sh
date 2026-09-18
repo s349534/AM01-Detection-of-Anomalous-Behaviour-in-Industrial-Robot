@@ -31,6 +31,11 @@ export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=0
 export SCRATCH_PROJECT="am01"
 
+echo "=== SLURM job started: $(date) ==="
+echo "Job ID: ${SLURM_JOB_ID:-unknown}"
+echo "SEEDS: ${SEEDS:-default}"
+echo "MAX_EPOCHS: ${MAX_EPOCHS:-default}"
+
 # ── Working directory on scratch ────────────────────────────────────────────
 SCRATCH_DIR="${SCRATCH:-${HOME}/scratch}"
 mkdir -p "${SCRATCH_DIR}/${SCRATCH_PROJECT}"
@@ -60,15 +65,71 @@ if command -v uv &>/dev/null; then
 fi
 
 # ── Phase 3.2: Final AE training with validated HPs (3 seeds) ───────────────
-# Preprocess if data/processed/ is missing (first run on a fresh scratch sync)
-if [[ ! -f "data/processed/train.npy" ]]; then
-    echo "=== data/processed/ missing — running preprocessing from data/raw/ ==="
+# Preprocess if data/processed/ is missing OR incomplete OR validation set too small
+NEED_PREPROCESS=0
+# List of ALL files that must exist after correct preprocessing
+REQUIRED_PROCESSED_FILES=(
+    "data/processed/train.npy"
+    "data/processed/val.npy"
+    "data/processed/test_normal.npy"
+    "data/processed/test_anomaly.npy"
+    "data/processed/scaler.pkl"
+    "data/processed/selected_columns.npy"
+)
+
+# Check if ALL required files exist
+ALL_EXIST=1
+for f in "${REQUIRED_PROCESSED_FILES[@]}"; do
+    if [[ ! -f "$f" ]]; then
+        echo "=== Missing processed file: $f — running preprocessing ==="
+        ALL_EXIST=0
+        NEED_PREPROCESS=1
+        break
+    fi
+done
+
+if [[ ${ALL_EXIST} -eq 1 ]]; then
+    # Check validation set size (need at least window_size+1 samples)
+    VAL_SAMPLES=$(uv run python -c 'import numpy as np, sys;
+try:
+    arr = np.load("data/processed/val.npy", mmap_mode="r")
+    print(arr.shape[0])
+except Exception:
+    print(0)
+' 2>/dev/null || echo 0)
+    if [[ ${VAL_SAMPLES:-0} -lt 33 ]]; then
+        echo "=== Validation set too small (${VAL_SAMPLES} samples, need >=33) — re-running preprocessing ==="
+        NEED_PREPROCESS=1
+    fi
+fi
+
+if [[ ${NEED_PREPROCESS} -eq 1 ]]; then
+    # Verify raw data exists and has expected size before attempting preprocessing
+    if [[ ! -f "data/raw/KukaNormal.npy" || ! -f "data/raw/KukaSlow.npy" || ! -f "data/raw/KukaColumnNames.npy" ]]; then
+        echo "ERROR: Raw data files missing in data/raw/!"
+        echo "  Required: KukaNormal.npy, KukaSlow.npy, KukaColumnNames.npy"
+        echo "  Run ./hpc_connect.sh deploy first to upload them, or upload manually:"
+        echo "  scp data/raw/*.npy polito-hpc:~/am01_project/data/raw/"
+        exit 1
+    fi
+    # Log raw data shapes for debugging
+    echo "=== Raw data verification ==="
+    uv run python -c 'import numpy as np
+normal = np.load("data/raw/KukaNormal.npy", mmap_mode="r")
+slow = np.load("data/raw/KukaSlow.npy", mmap_mode="r")
+cols = np.load("data/raw/KukaColumnNames.npy", allow_pickle=True)
+print(f"KukaNormal: {normal.shape}")
+print(f"KukaSlow: {slow.shape}")
+print(f"ColumnNames: {cols.shape}")
+'
     uv run python -m src.data.preprocessing
 fi
 
-echo "=== Phase 3.2: Final AE training (seeds=${SEEDS}) ==="
+# Resolve SEEDS default BEFORE first use (fixes "unbound variable" error)
 SEEDS="${SEEDS:-42 123 7}"
 MAX_EPOCHS="${MAX_EPOCHS:-}"
+
+echo "=== Phase 3.2: Final AE training (seeds=${SEEDS}) ==="
 
 TRAIN_CMD="uv run python -m src.models.train_ae \
     --config config/params_validated_ae.yaml \

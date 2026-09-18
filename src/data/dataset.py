@@ -79,6 +79,13 @@ class KukaDataset(Dataset):
             # Number of full windows that fit with the given stride.
             self.n_windows = (n_samples - window_size) // stride + 1
 
+        if self.n_windows == 0:
+            logger.warning(
+                "KukaDataset created with 0 windows: n_samples=%d < window_size=%d (stride=%d). "
+                "DataLoader will yield no batches.",
+                n_samples, window_size, stride
+            )
+
     def __len__(self) -> int:
         """Number of windows in this dataset."""
         return self.n_windows

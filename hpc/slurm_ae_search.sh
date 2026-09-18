@@ -2,21 +2,23 @@
 #
 # slurm_ae_search.sh — SLURM batch job for AE hyperparameter validation search (§4.8.5/§4.8.6)
 #
-# Runs the full random search over the vanilla Autoencoder, then analyzes results.
+# Runs the exhaustive search (all 50 combinations) or random subset over the vanilla Autoencoder, then analyzes results.
 # All artefacts (CSV + YAML + plots + log) are written to reports/ and synced back
 # to $HOME/am01_project/ so hpc_connect.sh batch can fetch them to your machine.
 #
 # Customize --n-iter and --max-val-epochs below, or pass via env:
-#   N_ITER=50 MAX_VAL_EPOCHS=50 ./hpc_connect.sh batch hpc/slurm_ae_search.sh
+#   MAX_VAL_EPOCHS=50 ./hpc_connect.sh batch hpc/slurm_ae_search.sh          # exhaustive (default)
+#   N_ITER=20 MAX_VAL_EPOCHS=50 ./hpc_connect.sh batch hpc/slurm_ae_search.sh # random subset
 # ==============================================================================
 
 # ── SLURM Directives ────────────────────────────────────────────────────────
 #SBATCH --job-name=am01_ae_search
 #SBATCH --partition=gpu_a40
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=8
+#SBATCH --ntasks-per-node=1          # 1 task = 1 processo Python (NO MPI)
+#SBATCH --cpus-per-task=6            # 6 core per quel task (1 main + 4 worker + 1 margine)
 #SBATCH --gpus=1
-#SBATCH --time=02:00:00
+#SBATCH --time=01:30:00              # 1.5h: basta per 50 run con num_workers=4
 #SBATCH --mem=64GB
 #SBATCH --output=logs/%x_%j.log
 #SBATCH --error=logs/%x_%j.log
@@ -33,8 +35,14 @@ export CUDA_VISIBLE_DEVICES=0
 export SCRATCH_PROJECT="am01"
 
 # Resolve N_ITER / MAX_VAL_EPOCHS from env (with defaults)
-N_ITER="${N_ITER:-20}"
+# N_ITER: if not set, runs exhaustive search (all combinations)
+N_ITER="${N_ITER:-}"
 MAX_VAL_EPOCHS="${MAX_VAL_EPOCHS:-50}"
+
+echo "=== SLURM job started: $(date) ==="
+echo "Job ID: ${SLURM_JOB_ID:-unknown}"
+echo "N_ITER: ${N_ITER:-exhaustive}"
+echo "MAX_VAL_EPOCHS: ${MAX_VAL_EPOCHS}"
 
 # ── Working directory on scratch ────────────────────────────────────────────
 SCRATCH_DIR="${SCRATCH:-${HOME}/scratch}"
@@ -75,18 +83,77 @@ if torch.cuda.is_available():
 fi
 
 # ── Phase 3.1: Validation search (§4.8.6) ───────────────────────────────────
-# Preprocess if data/processed/ is missing (first run on a fresh scratch sync)
-if [[ ! -f "data/processed/train.npy" ]]; then
-    echo "=== data/processed/ missing — running preprocessing from data/raw/ ==="
+# Preprocess if data/processed/ is missing OR incomplete OR validation set too small
+# for the search space (max window_size=32 requires at least 33 validation samples).
+NEED_PREPROCESS=0
+# List of ALL files that must exist after correct preprocessing
+REQUIRED_PROCESSED_FILES=(
+    "data/processed/train.npy"
+    "data/processed/val.npy"
+    "data/processed/test_normal.npy"
+    "data/processed/test_anomaly.npy"
+    "data/processed/scaler.pkl"
+    "data/processed/selected_columns.npy"
+)
+
+# Check if ALL required files exist
+ALL_EXIST=1
+for f in "${REQUIRED_PROCESSED_FILES[@]}"; do
+    if [[ ! -f "$f" ]]; then
+        echo "=== Missing processed file: $f — running preprocessing ==="
+        ALL_EXIST=0
+        NEED_PREPROCESS=1
+        break
+    fi
+done
+
+if [[ ${ALL_EXIST} -eq 1 ]]; then
+    # Check validation set size against max window_size in search space (32)
+    VAL_SAMPLES=$(uv run python -c 'import numpy as np, sys;
+try:
+    arr = np.load("data/processed/val.npy", mmap_mode="r")
+    print(arr.shape[0])
+except Exception:
+    print(0)
+' 2>/dev/null || echo 0)
+    if [[ ${VAL_SAMPLES:-0} -lt 33 ]]; then
+        echo "=== Validation set too small (${VAL_SAMPLES} samples, need >=33 for window_size=32) — re-running preprocessing ==="
+        NEED_PREPROCESS=1
+    fi
+fi
+
+if [[ ${NEED_PREPROCESS} -eq 1 ]]; then
+    # Verify raw data exists and has expected size before attempting preprocessing
+    if [[ ! -f "data/raw/KukaNormal.npy" || ! -f "data/raw/KukaSlow.npy" || ! -f "data/raw/KukaColumnNames.npy" ]]; then
+        echo "ERROR: Raw data files missing in data/raw/!"
+        echo "  Required: KukaNormal.npy, KukaSlow.npy, KukaColumnNames.npy"
+        echo "  Run ./hpc_connect.sh deploy first to upload them, or upload manually:"
+        echo "  scp data/raw/*.npy polito-hpc:~/am01_project/data/raw/"
+        exit 1
+    fi
+    # Log raw data shapes for debugging
+    echo "=== Raw data verification ==="
+    uv run python -c 'import numpy as np
+normal = np.load("data/raw/KukaNormal.npy", mmap_mode="r")
+slow = np.load("data/raw/KukaSlow.npy", mmap_mode="r")
+cols = np.load("data/raw/KukaColumnNames.npy", allow_pickle=True)
+print(f"KukaNormal: {normal.shape}")
+print(f"KukaSlow: {slow.shape}")
+print(f"ColumnNames: {cols.shape}")
+'
     uv run python -m src.data.preprocessing
 fi
 
-echo "=== Phase 3.1: AE validation search (${N_ITER} iterations, max ${MAX_VAL_EPOCHS} epochs) ==="
-uv run python -m src.validation.run_search_ae \
-    --n-iter "${N_ITER}" \
-    --seed 42 \
-    --max-val-epochs "${MAX_VAL_EPOCHS}" \
-    --no-resume
+# Build command args for run_search_ae
+SEARCH_ARGS=("--seed" "42" "--max-val-epochs" "${MAX_VAL_EPOCHS}" "--no-resume")
+if [[ -n "${N_ITER}" ]]; then
+    SEARCH_ARGS+=("--n-iter" "${N_ITER}")
+    echo "=== Phase 3.1: AE validation search (random ${N_ITER} iterations, max ${MAX_VAL_EPOCHS} epochs) ==="
+else
+    echo "=== Phase 3.1: AE validation search (EXHAUSTIVE - all combinations, max ${MAX_VAL_EPOCHS} epochs) ==="
+fi
+
+uv run python -m src.validation.run_search_ae "${SEARCH_ARGS[@]}"
 
 # ── Phase 3.1b: Analyze results → params_validated_ae.yaml + plots (§4.8.8) ─
 echo "=== Phase 3.1b: Analyzing results ==="

@@ -31,7 +31,9 @@
 set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────────────────
-HPC_USER="${HPC_USER:-mungolo}"
+# Priority: 1) env var (loaded from .env via `source .env`)
+#           2) empty default — forces explicit configuration per user
+HPC_USER="${HPC_USER:-}"
 HPC_HOST="${HPC_HOST:-polito-hpc}"
 # Use $HOME literal (NOT $HOME expanded locally, NOT ~/ which POSIX sh
 # inside ssh neutralises when single-quoted) so the REMOTE shell expands it
@@ -102,8 +104,8 @@ cmd_exec() {
 }
 
 cmd_interactive() {
-    local partition="${2:-gpu_a40}"
-    local time="${3:-04:00:00}"
+    local partition="${1:-gpu_a40}"
+    local time="${2:-04:00:00}"
     echo "Requesting interactive SLURM session..."
     echo "  Partition: ${partition}"
     echo "  Walltime:  ${time}"
@@ -461,11 +463,15 @@ EOFSRIPT
     fi
 
     # Download latest log (fetched to ~/am01_project/logs/ by SLURM post-run rsync)
+    # Also check ~/jobs/logs/ directly as fallback (for jobs that fail before post-run rsync)
+    # SPECIFICALLY look for the log of the job we just ran (using JID)
     local latest_log
-    latest_log=$(ssh_run "$(ssh_target)" "ls -t ~/am01_project/logs/am01_*.log 2>/dev/null | head -1")
+    latest_log=$(ssh_run "$(ssh_target)" "ls -t ~/jobs/logs/am01_*_${jid}.log ~/am01_project/logs/am01_*_${jid}.log 2>/dev/null | head -1")
     if [[ -n "${latest_log}" ]]; then
         scp "$(ssh_target):${latest_log}" "${PROJECT_ROOT}/logs/" 2>/dev/null || true
         echo "Log downloaded → ${PROJECT_ROOT}/logs/$(basename "${latest_log}")"
+    else
+        echo "WARNING: No log file found for job ${jid} on remote (checked ~/jobs/logs/ and ~/am01_project/logs/)"
     fi
 
     echo ""

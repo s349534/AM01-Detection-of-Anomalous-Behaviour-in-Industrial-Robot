@@ -24,11 +24,11 @@ model:
   input_dim: 82
   window_size: 32
   encoding_dim: 32
-  latent_dim: 16
+  latent_dim: 8
   encoder:
     conv_channels:
-    - 128
     - 64
+    - 32
     conv_kernels:
     - 5
     - 3
@@ -51,6 +51,7 @@ training:
   weight_decay: 0.0001
   beta1: 0.5
   beta2: 0.999
+  num_workers: 4
   adversarial_weight: 0.1
   reconstruction_weight: 1.0
   early_stopping:

@@ -1,7 +1,8 @@
 """CLI for random hyperparameter search over the vanilla AE (§4.8.6, §4.8.5).
 
 Usage:
-    python -m src.validation.run_search_ae --n-iter 20 --seed 42
+    python -m src.validation.run_search_ae --n-iter 20 --seed 42  # random subset
+    python -m src.validation.run_search_ae --max-val-epochs 50    # exhaustive (all combos)
 
 Produces:
     reports/tables/validation_results_ae.csv  (append mode, N rows)
@@ -17,7 +18,8 @@ import sys
 import time
 from pathlib import Path
 
-from sklearn.model_selection import ParameterSampler
+import numpy as np
+from sklearn.model_selection import ParameterGrid, ParameterSampler
 
 from src.utils.config import load_config
 from src.validation.run_experiment_ae import train_and_evaluate_ae
@@ -61,7 +63,7 @@ def write_result_row_csv(path: Path, row: dict, write_header: bool) -> None:
 
 
 def run_search(
-    n_iter: int = 20,
+    n_iter: int | None = None,
     seed: int = 42,
     config_path: str | Path | None = None,
     params_path: str | Path | None = None,
@@ -72,10 +74,11 @@ def run_search(
 
     Parameters
     ----------
-    n_iter : int
-        Number of random configurations to sample.
+    n_iter : int or None
+        Number of random configurations to sample. If None (default), runs
+        ALL combinations exhaustively using ParameterGrid.
     seed : int
-        Random seed for ParameterSampler.
+        Random seed for ParameterSampler (only used when n_iter is set).
     config_path : str | Path | None
         Path to config.yaml. Defaults to ``config/config.yaml``.
     params_path : str | Path | None
@@ -122,15 +125,34 @@ def run_search(
 
     # --- Build search space and sample ---
     search_space = get_search_space_ae()
-    sampler = ParameterSampler(search_space, n_iter=n_iter, random_state=seed)
-    samples = list(sampler)
+
+    if n_iter is None:
+        # Exhaustive mode: run all combinations deterministically
+        grid = ParameterGrid(search_space)
+        samples = list(grid)
+        mode_str = "exhaustive"
+    else:
+        # Random sampling mode
+        sampler = ParameterSampler(search_space, n_iter=n_iter, random_state=seed)
+        samples = list(sampler)
+        mode_str = f"random (n_iter={n_iter})"
 
     logger.info(
-        "Starting AE validation: %d iterations (seed=%d), %d unique configs",
-        len(samples), seed, len(samples),
+        "Starting AE validation: %d iterations (%s, seed=%d), %d unique configs",
+        len(samples), mode_str, seed, len(samples),
     )
 
     # --- Run experiments ---
+    # Pre-load validation data shape for window_size validation
+    processed_dir = Path(base_config.get("paths", {}).get("data_processed", "data/processed/"))
+    val_data_path = processed_dir / "val.npy"
+    val_samples = None
+    if val_data_path.exists():
+        val_samples = np.load(val_data_path, mmap_mode="r").shape[0]
+        logger.info("Validation set size: %d samples", val_samples)
+    else:
+        logger.warning("Validation data not found at %s — cannot validate window_size", val_data_path)
+
     for i, sample in enumerate(samples):
         run_id = i + 1
         if resume and run_id in existing_run_ids:
@@ -140,9 +162,32 @@ def run_search(
         # Merge sampled HP into config
         run_config = merge_search_sample(base_config, sample)
 
+        # --- Validate window_size against validation set size ---
+        window_size = int(run_config.get("model", {}).get("window_size", 16))
+        if val_samples is not None and window_size > val_samples:
+            logger.warning(
+                "Skipping run_id=%d: window_size=%d > val_samples=%d would produce empty validation set",
+                run_id, window_size, val_samples
+            )
+            # Write a failure row to maintain CSV continuity
+            fail_row = {
+                "run_id": run_id,
+                "W": window_size,
+                "latent_dim": run_config.get("model", {}).get("latent_dim", ""),
+                "encoder_channels": str(run_config.get("model", {}).get("encoder", {}).get("conv_channels", "")),
+                "best_val_pr_auc": -1.0,
+                "best_val_f1": -1.0,
+                "best_epoch": 0,
+                "train_time_sec": 0.0,
+                "seed": seed + run_id,
+            }
+            write_result_row_csv(output_csv, fail_row, write_header=write_header)
+            write_header = False
+            continue
+
         logger.info(
             "[Run %d/%d] Sample: %s",
-            run_id, n_iter, sample,
+            run_id, len(samples), sample,
         )
 
         try:
@@ -188,8 +233,8 @@ def parse_args() -> argparse.Namespace:
         description="Random search for AE hyperparameter validation (§4.8.2)"
     )
     parser.add_argument(
-        "--n-iter", type=int, default=20,
-        help="Number of random configurations to sample (default: 20)",
+        "--n-iter", type=int, default=None,
+        help="Number of random configurations to sample. If not set, runs ALL combinations exhaustively (default: exhaustive)",
     )
     parser.add_argument(
         "--seed", type=int, default=42,
