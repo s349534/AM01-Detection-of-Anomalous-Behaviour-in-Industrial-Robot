@@ -144,48 +144,58 @@ def split_temporal_data(
     slow: np.ndarray,
     config: dict[str, Any],
 ) -> dict[str, np.ndarray]:
-    """Temporal split (no shuffle) of KukaNormal plus all of KukaSlow.
+    """Temporal split (no shuffle) of KukaNormal and KukaSlow.
 
-    Normal data is split 60/20/20 along the time axis.  All of KukaSlow
-    (the anomaly class) goes to ``test_anomaly``.  No shuffle because
-    lag-1 autocorrelation ≈ 0.99+: shuffling would leak future into past.
+    Normal data is split 70/15/15 along the time axis.
+    KukaSlow is split 50/50 along the time axis.
+    No shuffle because lag-1 autocorrelation ≈ 0.99+: shuffling would leak future into past.
 
-    Returns dict with keys: train, val, test_normal, test_anomaly.
+    Returns dict with keys: train, val_normal, val_anomaly, test_normal, test_anomaly.
     """
-    train_split = float(config["training"]["train_split"])  # 0.6
-    val_split = float(config["training"]["val_split"])      # 0.2
+    train_split = float(config["training"]["train_split"])           # 0.70
+    val_split = float(config["training"]["val_split"])               # 0.15
+    slow_val_split = float(config["training"].get("slow_val_split", 0.50))  # 0.50
 
     n_total = normal.shape[0]
     n_train = int(train_split * n_total)
     n_val = int(val_split * n_total)
-    # n_test = n_total - n_train - n_val  (the remainder)
+    # n_test = n_total - n_train - n_val  (remainder = 15%)
 
     train = normal[:n_train]
-    val = normal[n_train : n_train + n_val]
+    val_normal = normal[n_train : n_train + n_val]
     test_normal = normal[n_train + n_val :]
-    test_anomaly = slow  # entire KukaSlow → test_anomaly
+
+    s_total = slow.shape[0]
+    s_val = int(slow_val_split * s_total)
+    val_anomaly = slow[:s_val]
+    test_anomaly = slow[s_val:]
 
     logger.info(
         "Temporal split (no shuffle): "
-        "train=%d (%.0f%%), val=%d (%.0f%%), "
-        "test_normal=%d (%.0f%%), test_anomaly=%d (100%% of KukaSlow)",
+        "train=%d (%.0f%%), val_normal=%d (%.0f%%), test_normal=%d (%.0f%%), "
+        "val_anomaly=%d (%.0f%%), test_anomaly=%d (%.0f%%)",
         train.shape[0], train_split * 100,
-        val.shape[0], val_split * 100,
+        val_normal.shape[0], val_split * 100,
         test_normal.shape[0], (1 - train_split - val_split) * 100,
-        test_anomaly.shape[0],
+        val_anomaly.shape[0], slow_val_split * 100,
+        test_anomaly.shape[0], (1 - slow_val_split) * 100,
     )
 
     # --- Sanity assertions ---
-    assert train.shape[0] + val.shape[0] + test_normal.shape[0] == n_total, (
-        "Split mismatch — train + val + test_normal ≠ normal"
+    assert train.shape[0] + val_normal.shape[0] + test_normal.shape[0] == n_total, (
+        "Split mismatch — train + val_normal + test_normal ≠ normal"
     )
-    assert test_normal.shape[1] == train.shape[1] == val.shape[1] == slow.shape[1], (
+    assert val_anomaly.shape[0] + test_anomaly.shape[0] == s_total, (
+        "Split mismatch — val_anomaly + test_anomaly ≠ slow"
+    )
+    assert test_normal.shape[1] == train.shape[1] == val_normal.shape[1] == slow.shape[1], (
         "Feature dimension mismatch across splits"
     )
 
     return {
         "train": train,
-        "val": val,
+        "val_normal": val_normal,
+        "val_anomaly": val_anomaly,
         "test_normal": test_normal,
         "test_anomaly": test_anomaly,
     }
@@ -241,7 +251,7 @@ def normalize_data(
         scaled[key] = scaler.transform(arr).astype(np.float32)
 
     # --- Log statistics (train should be ≈0 mean, ≈1 std for non-constant feats) ---
-    for key in ("train", "val", "test_normal", "test_anomaly"):
+    for key in ("train", "val_normal", "val_anomaly", "test_normal", "test_anomaly"):
         arr = scaled[key]
         logger.info(
             "%-14s: mean=%.4f  std=%.4f  min=%.4f  max=%.4f  shape=%s",
@@ -267,7 +277,7 @@ def normalize_data(
         )
 
     # --- Assertions: val/test are NOT zero-mean (proves no leakage) ---
-    val_mean_abs = np.abs(scaled["val"].mean(axis=0)).max()
+    val_mean_abs = np.abs(scaled["val_normal"].mean(axis=0)).max()
     assert val_mean_abs > 1e-3, (
         f"Val mean ≈ 0 — possible scaler leakage (max abs mean={val_mean_abs})"
     )

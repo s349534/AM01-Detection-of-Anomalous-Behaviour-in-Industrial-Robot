@@ -42,9 +42,11 @@ training:
     patience: 10
     min_delta: 0.0001
 
-  train_split: 0.6       # 60% of KukaNormal → training (semi-supervised: normal only)
-  val_split: 0.2         # 20% of KukaNormal → validation + threshold calibration
-  # test_split = 1.0 - train_split - val_split = 0.2 (20% KukaNormal → test_normal)
+  train_split: 0.70       # 70% of KukaNormal → training (semi-supervised: normal only)
+  val_split: 0.15         # 15% of KukaNormal → validation (early stopping + threshold + HP selection)
+  # test_normal = 1.0 - train_split - val_split = 0.15 (15% KukaNormal → test_normal)
+  slow_val_split: 0.50    # 50% of KukaSlow → validation anomaly (HP selection)
+  # slow_test_split = 1.0 - slow_val_split = 0.50 (50% KukaSlow → test_anomaly)
 
 data:
   normal_data_path: "data/raw/KukaNormal.npy"

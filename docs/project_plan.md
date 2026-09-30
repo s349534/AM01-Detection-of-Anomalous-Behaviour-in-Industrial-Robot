@@ -77,15 +77,17 @@
 
 ### 2.3 Strategia di split
 - **KukaNormal NON va nel training per intero.** Va diviso in tre sottoinsiemi
-  (60/20/20), più tutto `KukaSlow` aggiunto al test set come classe anomala.
-- **Training (60% di KukaNormal, ~140k)**: il modello impara la distribuzione
+  (70/15/15), mentre `KukaSlow` viene diviso 50/50 tra validation e test.
+- **Training (70% di KukaNormal, ~163k)**: il modello impara la distribuzione
   normale.
-- **Validation (20% di KukaNormal, ~47k)**: per early stopping + per calibrare
-  la soglia di decisione (es. 99° percentile dell'errore di ricostruzione).
-- **Test set finale**:
-  - 20% di KukaNormal (~47k) → classe "normale" per le metriche.
-  - Tutto KukaSlow (~41k) → classe "anomala" per le metriche.
-  - Totale ~88k campioni etichettati.
+- **Validation set (HP selection)**:
+  - 15% di KukaNormal (~35k) → `val_normal`: per early stopping + calibrazione soglia (99° percentile errore ricostruzione)
+  - 50% di KukaSlow (~21k) → `val_anomaly`: per calcolo PR-AUC/ROC-AUC/F1 nella selezione HP
+  - Totale ~56k campioni etichettati (normal + anomaly)
+- **Test set finale (report only)**:
+  - 15% di KukaNormal (~35k) → `test_normal`: classe "normale" per metriche finali
+  - 50% di KukaSlow (~21k) → `test_anomaly`: classe "anomala" per metriche finali
+  - Totale ~56k campioni etichettati
 
 **Modalità di split**: **temporale** (no shuffle).
 - **Temporale** (scelta adottata): simula il deployment reale (addestri su
@@ -106,6 +108,11 @@
 > possiamo fare early stopping né calibrare la soglia; senza test_norm non
 > abbiamo un riferimento "vero negativo" pulito su cui riportare metriche
 > oneste.
+>
+> **Perché KukaSlow diviso 50/50 tra val e test?** Per calcolare PR-AUC/ROC-AUC
+> durante la HP selection servono anomalie nel validation set. Senza, `best_val_pr_auc`
+> verrebbe calcolato sul test set (data leakage). Il 50% di slow in validation
+> permette selezione HP onesta; il resto in test garantisce report finale pulito.
 
 ---
 
@@ -148,12 +155,13 @@ temporale).
   4 feature costanti (verificate su entrambi i dataset).
 - **NO clipping** — i valori di saturazione sensore vengono gestiti da
   StandardScaler + MAE loss (vedi §7 #9).
-- **Split**: solo `KukaNormal` per train+val (60/20/20, no shuffle); test =
-  Normal hold-out + tutto `KukaSlow` (classe anomala).
+- **Split** (temporale, no shuffle):
+  - `KukaNormal`: 70% train, 15% val_normal, 15% test_normal
+  - `KukaSlow`: 50% val_anomaly, 50% test_anomaly
 - **Normalizzazione**: `StandardScaler` (fit **solo** sul train) — motivazione §4.
 - Windowing on-the-fly in `KukaDataset` (non pre-computato) — motivazione §4.1.
 - Salvataggio:
-  - `data/processed/{train, val, test_normal, test_anomaly}.npy`
+  - `data/processed/{train, val_normal, val_anomaly, test_normal, test_anomaly}.npy` (5 file)
   - `data/processed/scaler.pkl`
   - `data/processed/selected_columns.npy` (82 nomi, dtype `<U37`)
   - Le etichette sono implicite (0 = normal, 1 = anomaly), non salvate separatamente.
@@ -188,6 +196,12 @@ non può esplorare lo spazio di ricerca.
   sensitività (`sensitivity_ae_*.png`).
 - Selezione: riga con `best_val_pr_auc` massimo (vedi §4.8.8).
 - Output finale: `config/params_validated_ae.yaml`.
+
+> **Nota sul flusso validation**: Ogni run esegue:
+> 1. Training su `train` (70% normali) con early stopping su `val_normal` (15% normali)
+> 2. HP selection: soglia (99° percentile su `val_normal`) + PR-AUC/ROC-AUC/F1 su `val_normal` + `val_anomaly` (15% normali + 50% slow)
+> 3. Test finale: metriche su `test_normal` + `test_anomaly` (15% normali + 50% slow) — **solo per report, mai per HP selection**
+> 4. `best_val_pr_auc` proviene dal validation set (NON dal test set come in versioni precedenti)
 
 #### **Fase 3.2 — Training finale AE**
 **Obiettivo**: addestrare il modello definitivo con `HP_AE_best`.
@@ -673,6 +687,13 @@ AM01-.../
 │   ├── raw/                         # Dati originali (versionati o via DVC)
 │   │   └── KukaVelocityDataset/
 │   └── processed/                   # Output del preprocessing
+│       ├── train.npy                # 70% KukaNormal (~163k, 82 features)
+│       ├── val_normal.npy           # 15% KukaNormal (~35k, early stopping + threshold)
+│       ├── val_anomaly.npy          # 50% KukaSlow (~21k, HP selection)
+│       ├── test_normal.npy          # 15% KukaNormal (~35k, final report)
+│       ├── test_anomaly.npy         # 50% KukaSlow (~21k, final report)
+│       ├── scaler.pkl               # StandardScaler fitted on train
+│       └── selected_columns.npy     # 82 column names
 │
 ├── src/                             # Codice di produzione (importabile, testabile)
 │   ├── data/
@@ -758,7 +779,7 @@ celle, va spostata in un modulo `.py`.
 ### Fase 2 — Preprocessing
 - [x] Gestione colonna extra (`anomaly` rimossa da KukaSlow: 87→86)
 - [x] Pulizia NaN/inf/outlier (nessun NaN/inf nel raw; saturazione sensore gestita da scaler)
-- [x] Split deterministico temporale (60/20/20, no shuffle)
+- [x] Split deterministico temporale (70/15/15 normal, 50/50 slow, no shuffle)
 - [x] Normalizzazione (StandardScaler, fit su train only)
 - [x] `src/data/preprocessing.py` implementato (load → split → normalize → save)
 - [x] `src/data/dataset.py` implementato (KukaDataset, windowing on-the-fly)
@@ -766,7 +787,7 @@ celle, va spostata in un modulo `.py`.
 - [x] `notebooks/02_preprocessing.ipynb` popolato (6 celle)
 - [x] `src/utils/config.py` creato (loader YAML unificato)
 - [x] `src/main.py` refactorato (usa config.py, flag --phase)
-- [x] Output generati in `data/processed/` (4 .npy + scaler.pkl + selected_columns.npy)
+- [x] Output generati in `data/processed/` (5 .npy + scaler.pkl + selected_columns.npy)
 - [x] Verifica locale: pipeline end-to-end ✅, pytest 33/33 ✅
 
 ### Fase 3.0 — Costruzione AE parametrico (COMPLETATA)
@@ -863,12 +884,12 @@ se `data/processed/train.npy` è mancante (sui script SLURM).
    dataset. Correlazione > 0.95 → valutare rimozione feature correlate (Fase 2).
 3. ✅ **Split temporale vs random — definizione**:
    - **Temporale**: i dati vengono divisi mantenendo l'ordine cronologico
-     (primi 60% → train, successivi 20% → val, ultimi 20% → test).
+     (primi 70% → train, successivi 15% → val_normal, ultimi 15% → test_normal).
+     Per KukaSlow: primi 50% → val_anomaly, ultimi 50% → test_anomaly.
    - **Random**: mescola i dati con un seed prima dello split.
    Scelta: **temporale**. Confermato in Fase 1: lag-1 AC = 0.99+ su tutte le
    feature → i dati sono una sessione continua. Lo shuffle romperebbe la
-   continuità e causerebbe leakage. Split 60/20/20 su KukaNormal, test =
-   Normal hold-out + Slow.
+   continuità e causerebbe leakage. Split normal 70/15/15, slow 50/50.
 4. **Dimensione della finestra W — definizione**: numero di timestep consecutivi
    dati in pasto alla rete ad ogni sample (slide con stride=1). Default `W=16`.
    In Fase 3 si confrontano `W ∈ {8, 16, 32, 64}` su validation set → si
@@ -1036,22 +1057,27 @@ se `data/processed/train.npy` è mancante (sui script SLURM).
 
 **Prossima fase:** Fase 4 — AAE (adversarial autoencoder).
 
-### Sessione 4 — Debug HPC path bug + cleanup (12set2026)
+### Sessione 5 — Fix validation split & HP selection leakage (30set2026)
 
-**Problema**: `hpc_connect.sh batch` scaricava i risultati in `hpc/reports/`,
-`hpc/data/`, `hpc/logs/` invece che in `reports/`, `data/processed/`, `logs/`
-alla root del progetto.
+**Problema identificato**: Il flusso di validazione precedente aveva due problemi critici:
+1. **HP selection usava test set** → `best_val_pr_auc` proveniva dal test set (data leakage totale)
+2. **Validation solo normali** → impossibile calcolare PR-AUC/ROC-AUC senza anomalie
+3. **Split 60/20/20 non conforme** → specifica richiedeva 70/15/15 normal + 50/50 slow
 
-**Root cause**: `cmd_batch` usa path relativi (`./reports/`, `./data/processed/`,
-`./...`) ma viene eseguito da `hpc/` (come da istruzioni README). I path relativi
-si risolvevano quindi sotto `hpc/`.
+**Soluzione implementata**:
+- **Nuovi split** (`config/params.yaml`): `train_split=0.70`, `val_split=0.15`, `slow_val_split=0.50`
+- **Preprocessing** (`src/data/preprocessing.py`): split normal 70/15/15, slow 50/50 → 5 file .npy separati
+- **Validation experiment** (`src/validation/run_experiment_ae.py`):
+  - 5 DataLoader separati (train, val_normal, val_anomaly, test_normal, test_anomaly)
+  - Early stopping su `val_normal` (reconstruction loss)
+  - HP selection: threshold (99° percentile su val_normal) + PR-AUC/ROC-AUC/F1 su val_normal + val_anomaly
+  - Test finale: metriche su test_normal + test_anomaly (solo report)
+  - `best_val_pr_auc` ora proviene da validation set (non test!)
+- **Leakage accettato**: `val_normal` serve per early stopping E threshold/PR-AUC (standard practice ML); test set rimane unseen
 
-**Fix**: aggiunto blocco `cd "${PROJECT_ROOT}"` in `cmd_batch` (dopo deploy,
-prima del fetch) che risale alla root del progetto tramite `pyproject.toml`.
-`PROJECT_ROOT` (risolto via `SCRIPT_DIR/..`) è già usato da `cmd_upload_project`.
+**File modificati**:
+- `config/params.yaml`
+- `src/data/preprocessing.py` (split_temporal_data, normalize_data)
+- `src/validation/run_experiment_ae.py` (5 loader, _compute_errors_for_loader, train_and_evaluate_ae)
 
-**Cleanup**: rimossi `hpc/reports/`, `hpc/data/`, `hpc/logs/` (contenevano CSV
-obsoleti con 34 righe/2 epoche e log sbagliati). Aggiunti a `.gitignore`.
-
-**Verifica**: `./hpc_connect.sh batch --dry-run` showa i path corretti; i risultati
-verranno ora in `reports/`, `data/processed/`, `logs/` alla root.
+**Prossima fase**: Rigenerare processed data e lanciare HP search con nuova logica.
