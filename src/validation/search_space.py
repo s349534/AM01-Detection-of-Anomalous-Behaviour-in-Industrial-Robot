@@ -19,7 +19,7 @@ def get_search_space_ae() -> dict[str, Any]:
         and the config structure in ``params.yaml``::
 
             {
-                "model.window_size": [8, 12, 16, 24, 32],
+                "model.window_size": [16, 32, 64, 128],
                 "model.latent_dim": [8, 12, 16, 24, 32],
                 "model.encoder.conv_channels": [[64, 32], [128, 64]],
             }
@@ -30,10 +30,12 @@ def get_search_space_ae() -> dict[str, Any]:
       ``Conv1dEncoder`` and ``Conv1dDecoder`` are hardcoded for exactly 2 conv
       layers (they do ``c1, c2 = conv_channels``).  See ``src/models/autoencoder.py``
       lines 95 and 169.
-    - Total grid: 5 × 5 × 2 = 50 combinations. 20 are sampled per validation run.
+    - Total grid: 4 × 5 × 2 = 40 combinations. 20 are sampled per validation run.
+    - W range: potenze di 2 da 16 a 128, default 16. Copre finestre brevi (pattern locali)
+      a lunghe (trend lenti). Il default 16 è allineato a params.yaml.
     """
     return {
-        "model.window_size": [8, 12, 16, 24, 32],
+        "model.window_size": [16, 32, 64, 128],
         "model.latent_dim": [8, 12, 16, 24, 32],
         "model.encoder.conv_channels": [[64, 32], [128, 64]],
     }

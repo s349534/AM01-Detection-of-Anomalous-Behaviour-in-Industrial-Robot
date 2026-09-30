@@ -515,26 +515,26 @@ report di media ± deviazione standard.
 
 | HP | Range | Tipo | Giustificazione del range |
 |----|-------|------|---------------------------|
-| `W` | {8, 12, 16, 24, 32} | discreto | Limiti inferiore/superiore vincolati da Fase 1 (frequenza di campionamento, costo computazionale) |
+| `W` | {16, 32, 64, 128} | discreto | Potenze di 2 da 16 a 128, default 16. Copre finestre brevi (pattern locali) a lunghe (trend lenti) |
 | `latent_dim` | {8, 12, 16, 24, 32} | discreto | Compromesso compressione 82→{8..32} = 2.5×–10× |
-| `encoder_channels` | {[64,32], [128,64], [128,64,32]} | categorico | 2 o 3 layer, range standard per AE su dati 1D |
+| `encoder_channels` | {[64,32], [128,64]} | categorico | 2 layer conv (architettura hardcoded a 2 layer), range standard per AE su dati 1D |
 
-Spazio totale: 75 combinazioni, 20 campionate con
+Spazio totale: 40 combinazioni (4 × 5 × 2), 20 campionate con
 `sklearn.model_selection.ParameterSampler(seed=42)`. Esempio delle prime 10
 combinazioni campionate:
 
 | run_id | W | latent_dim | encoder_channels |
 |--------|---|------------|------------------|
-| 1      | 24 | 16         | [128, 64]        |
-| 2      | 12 | 32         | [64, 32]         |
-| 3      | 16 | 8          | [128, 64, 32]    |
-| 4      | 8  | 24         | [128, 64]        |
-| 5      | 32 | 12         | [64, 32]         |
-| 6      | 24 | 32         | [128, 64, 32]    |
-| 7      | 16 | 16         | [64, 32]         |
-| 8      | 12 | 8          | [128, 64]        |
+| 1      | 64 | 16         | [128, 64]        |
+| 2      | 32 | 32         | [64, 32]         |
+| 3      | 16 | 8          | [128, 64]        |
+| 4      | 128 | 24         | [64, 32]         |
+| 5      | 32 | 12         | [128, 64]        |
+| 6      | 64 | 32         | [64, 32]         |
+| 7      | 16 | 16         | [128, 64]        |
+| 8      | 128 | 8          | [64, 32]         |
 | 9      | 32 | 24         | [128, 64]        |
-| 10     | 8  | 12         | [128, 64, 32]    |
+| 10     | 64 | 12         | [64, 32]         |
 
 (Le combinazioni effettive dipendono dal seed; sopra è un'illustrazione del
 formato. Le 20 run prodotte andranno a popolare il CSV finale.)
