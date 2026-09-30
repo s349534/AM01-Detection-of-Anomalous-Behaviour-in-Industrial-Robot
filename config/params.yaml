@@ -35,6 +35,8 @@ training:
 
   adversarial_weight: 0.1
   reconstruction_weight: 1.0
+  loss: "mae"                    # "mae" | "mse" — loss di ricostruzione (MAE robusta a feature saturo, vedi §7 #9)
+  reconstruction_metric: "mae"   # "mae" | "mse" — metrica per anomaly scoring (deve match loss)
 
   early_stopping:
     patience: 10
@@ -57,4 +59,5 @@ data:
   normalization: "standard"   # StandardScaler fit on train only
   augmentation: false
   # No outlier clipping — by project design (see §7 #9 in project_plan).
-  # Sensor saturation (Gyro ±2000, Acc ±16) is handled by StandardScaler + MSE loss.
+  # Sensor saturation (Gyro ±2000, Acc ±16) is handled by StandardScaler + MAE loss
+  # (robust to outlier scale; MSE would square large residuals).

@@ -110,7 +110,7 @@ class TestSequenceAutoencoder:
         model = SequenceAutoencoder(input_dim=82, window_size=16, latent_dim=16)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         x_hat = model(batch_conv_format)
-        loss = nn.functional.mse_loss(x_hat, batch_conv_format)
+        loss = nn.functional.l1_loss(x_hat, batch_conv_format)
         loss.backward()
 
         for name, param in model.named_parameters():

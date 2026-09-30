@@ -204,7 +204,7 @@ def normalize_data(
     normalisation the latent space is dominated by high-variance features.
     Fit on train only — any other split would leak statistics and bias
     evaluation.  No clipping: sensor saturation is absorbed by the scaler
-    and the MSE loss (§7 #9).
+    and the MAE loss (§7 #9).
 
     Returns
     -------

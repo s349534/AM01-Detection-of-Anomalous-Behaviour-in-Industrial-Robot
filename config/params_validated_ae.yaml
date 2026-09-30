@@ -54,6 +54,9 @@ training:
   num_workers: 4
   adversarial_weight: 0.1
   reconstruction_weight: 1.0
+  loss: "mae"                    # MAE: robusta a feature saturo (vedi §7 #9)
+  reconstruction_metric: "mae"   # metrica per anomaly scoring
+
   early_stopping:
     patience: 10
     min_delta: 0.0001

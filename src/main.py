@@ -101,6 +101,7 @@ def run_phase_train(config: dict) -> None:
     weight_decay = float(get_param(config, "training.weight_decay", 1e-4))
     patience = int(get_param(config, "training.early_stopping.patience", 10))
     min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
+    loss_name = get_param(config, "training.loss", "mae")
 
     print(f"Loading datasets from {processed_dir} (W={window_size}, batch_size={batch_size})...")
     loaders = build_datasets(
@@ -128,6 +129,7 @@ def run_phase_train(config: dict) -> None:
         min_delta=min_delta,
         checkpoint_path=checkpoint_path,
         device=device,
+        loss=loss_name,
     )
     print(f"Baseline Autoencoder training complete. Checkpoint: {checkpoint_path}")
     print("[Pending] Fase 4: Train Adversarial Autoencoder")

@@ -71,7 +71,7 @@ def _compute_errors(
     model: SequenceAutoencoder,
     loader: DataLoader,
     device: torch.device,
-    metric: str = "mse",
+    metric: str = "mae",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute per-sample reconstruction errors and labels."""
     model.eval()
@@ -154,6 +154,9 @@ def train_single_seed(
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Model parameters: %d total, %d trainable", total_params, trainable_params)
 
+    # --- Read loss config ---
+    loss_name = get_param(config, "training.loss", "mae")
+
     # --- Train ---
     start_time = time.time()
     history = fit_autoencoder(
@@ -167,6 +170,7 @@ def train_single_seed(
         min_delta=min_delta,
         checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
         device=dev,
+        loss=loss_name,
     )
     train_time_sec = time.time() - start_time
     best_epoch = history.get("best_epoch", 0) if history else 0

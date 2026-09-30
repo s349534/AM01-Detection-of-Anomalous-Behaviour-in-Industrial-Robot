@@ -147,7 +147,7 @@ temporale).
 - Rimozione colonna `anomaly` da `KukaSlow` (etichetta, non feature) + rimozione
   4 feature costanti (verificate su entrambi i dataset).
 - **NO clipping** — i valori di saturazione sensore vengono gestiti da
-  StandardScaler + MSE loss (vedi §7 #9).
+  StandardScaler + MAE loss (vedi §7 #9).
 - **Split**: solo `KukaNormal` per train+val (60/20/20, no shuffle); test =
   Normal hold-out + tutto `KukaSlow` (classe anomala).
 - **Normalizzazione**: `StandardScaler` (fit **solo** sul train) — motivazione §4.
@@ -391,7 +391,7 @@ AdaptiveAvgPool1d(1) → (B, 64, 1)         Conv1d(128→86, kernel=3, pad=1)
 Flatten → (B, 64)                          Output (B, 86, W)
    ↓                                          ↓
 Linear(64 → latent_dim)                    → ricostruzione della sequenza
-   ↓                                          → errore = MSE(x, x̂)
+   ↓                                          → errore = MAE(x, x̂)
 z  (B, latent_dim)
 ```
 
@@ -415,7 +415,7 @@ z  (B, latent_dim)
   finestre piccole (W=16) la ricostruzione è praticamente perfetta sui
   sample normali → l'errore è guidato quasi solo dalle anomalie.
 
-**Addestramento**: MSE tra input e ricostruzione, ottimizzatore Adam, batch
+**Addestramento**: MAE tra input e ricostruzione, ottimizzatore Adam, batch
 size 256 (da `params.yaml`).
 
 #### 4.1.3 Estensione all'AAE
@@ -443,14 +443,16 @@ pipeline AAE rimane identico al piano originale.
 - Normalizzazione per-feature con statistiche di dominio (angoli → [-π,π]) →
   da valutare caso per caso se StandardScaler fallisce.
 
-### 4.3 Loss di ricostruzione: MSE (poi MAE da confrontare)
-**Scelta iniziale**: MSE per il baseline; MAE come confronto se MSE produce
-code troppo pesanti per le anomalie.
+### 4.3 Loss di ricostruzione: MAE (scelta)
+**Scelta**: MAE per il baseline. Inizialmente si era scelto MSE, ma è stata
+cambiata in MAE perché i valori saturo (Gyro ±2000, Acc ±16) producevano
+errori di ricostruzione al quadrato eccessivi, distorti il training e
+sovrastavano le anomalie vere.
 
 **Motivazione**:
-- MSE penalizza di più gli errori grandi → enfatizza le anomalie, che è
-  *esattamente* ciò che vogliamo in anomaly detection.
-- MAE è più robusto a outlier → utile in scenari industriali rumorosi.
+- MAE penalizza linearmente gli errori → robusta a outlier e feature saturo.
+- MSE (scomodatazione valutata) amplifica al quadrato gli errori grandi,
+  causando errori di ricostruzione proibitivi quando i sensori saturano.
 
 ### 4.4 Dimensione latente: 16 (iniziale) → tuning
 **Scelta iniziale**: `latent_dim=16` (da `params.yaml`).
@@ -572,7 +574,7 @@ in Fase 5, diventano candidati per analisi di sensitività post-hoc.
 | `optimizer` | Adam | Kingma & Ba, 2014 (standard de facto) |
 | `learning_rate` | 1e-3 | Default Adam (Kingma & Ba, 2014) |
 | `batch_size` | 256 | Compromesso standard su GPU moderne per dataset 10⁵-10⁶ |
-| `loss` (reconstruction) | MSE | Massima verosimiglianza gaussiana, enfatizza outlier (anomalie) |
+| `loss` (reconstruction) | MAE | Robusta a feature saturo (±2000), non amplifica errori grandi al quadrato |
 | `weight_decay` | 0 | Non critico per AE brevi (Goodfellow et al., 2016, §6.2) |
 | `early_stopping_patience` | 10 | Standard (Goodfellow et al., 2016, §7.8) |
 | `early_stopping_min_delta` | 1e-4 | EarlyStopping: stop se miglioramento < min_delta |
@@ -872,9 +874,10 @@ se `data/processed/train.npy` è mancante (sui script SLURM).
    In Fase 3 si confrontano `W ∈ {8, 16, 32, 64}` su validation set → si
    conferma il valore migliore per trade-off errore di ricostruzione / costo
    computazionale. Vedi §4.1.1.
-5. **MAE vs MSE — definizione**:
+5. **MAE vs MSE — definizione** (MAE scelta, MSE valutata):
+   - **MAE** (Mean Absolute Error): penalizza linearmente, robusto a outlier e
+     satura — **loss scelta** (config: `training.loss: "mae"`).
    - **MSE** (Mean Squared Error): penalizza quadraticamente gli errori grandi.
-   - **MAE** (Mean Absolute Error): penalizza linearmente, più robusto a outlier.
    Confronto empirico in Fase 5.
 6. **Dimensione latente ottimale — definizione**: numero di dimensioni del
    vettore latente z. Grid search su {8, 16, 32} in Fase 5.
@@ -890,10 +893,10 @@ se `data/processed/train.npy` è mancante (sui script SLURM).
    bound sono calcolati su train only** (nessun leakage).
    **Deciso: NON applicare clipping.** I valori di saturazione sensore (Gyro
    ±2000, Acc ±16) sono artefatti hardware, non anomalie da rilevare. Lo
-   StandardScaler li assorbe (z-score alti ma finiti) e la MSE loss penalizza
-   naturalmente le finestre con spike saturati. La classe anomala si
-   caratterizza da drift lenti, non da spike — il clipping non aiuterebbe e
-   potrebbe nascondere pattern utili.
+   StandardScaler li assorbe (z-score alti ma finiti) e la MAE loss gestisce
+   linearmente le finestre con spike saturati senza amplificarli al quadrato.
+   La classe anomala si caratterizza da drift lenti, non da spike — il clipping
+   non aiuterebbe e potrebbe nascondere pattern utili.
    → Pipeline: load → split → normalize → save (NO clipping step).
 10. ✅ **Validare gli iperparametri dei modelli?** Sì, con random search
     vincolato (Bergstra & Bengio, 2012) su 3 HP AE (`W`, `latent_dim`,
@@ -969,7 +972,7 @@ se `data/processed/train.npy` è mancante (sui script SLURM).
 **Processo (ordine di lavoro):**
 1. **Scelta clipping**: valutata la possibilità di clippare i valori di saturazione
    sensore (Gyro ±2000, Acc ±16). **Deciso: NO** — artefatti hardware, la classe
-   anomala si caratterizza da drift lenti non da spike, StandardScaler + MSE li
+   anomala si caratterizza da drift lenti non da spike, StandardScaler + MAE li
    gestiscono. Pipeline = load → split → normalize → save.
 2. **`src/utils/config.py`**: creato il loader YAML unificato (config.yaml +
    params.yaml). Path root con `parents[2]` (utils/ → src/ → root).

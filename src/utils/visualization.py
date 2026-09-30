@@ -55,7 +55,7 @@ def plot_training_history(
                    label=f"Best (epoch {best_epoch})")
 
     ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("Loss (MSE)", fontsize=12)
+    ax.set_ylabel("Loss (MAE)", fontsize=12)
     ax.set_title("Training History", fontsize=14, fontweight="bold")
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
@@ -205,7 +205,7 @@ def plot_error_distribution(
         ax.axvline(threshold, color="#f59e0b", linestyle="--", linewidth=2,
                    label=f"Threshold = {threshold:.4f}")
 
-    ax.set_xlabel("Reconstruction Error (MSE)", fontsize=12)
+    ax.set_xlabel("Reconstruction Error (MAE)", fontsize=12)
     ax.set_ylabel("Density", fontsize=12)
     ax.set_title(title, fontsize=14, fontweight="bold")
     ax.legend(fontsize=11)

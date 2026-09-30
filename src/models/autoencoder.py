@@ -351,7 +351,7 @@ class SequenceAutoencoder(nn.Module):
         self,
         x: torch.Tensor,
         reduction: Literal["none", "mean", "sample"] = "sample",
-        metric: Literal["mse", "mae"] = "mse",
+        metric: Literal["mse", "mae"] = "mae",
     ) -> torch.Tensor:
         """Compute reconstruction error between input and its autoencoder reconstruction.
 
@@ -364,8 +364,9 @@ class SequenceAutoencoder(nn.Module):
             - "mean": scalar average error over the entire batch.
             - "sample": 1D tensor of shape ``(B,)`` containing the mean error
               per window. This is the standard anomaly score per sample.
-        metric : {"mse", "mae"}, default="mse"
-            Distance metric used (MSE: squared difference, MAE: absolute difference).
+        metric : {"mse", "mae"}, default="mae"
+            Distance metric used (MAE: absolute difference, MSE: squared difference).
+            Default is "mae" for robustness to sensor saturation (see §7 #9).
 
         Returns
         -------
@@ -552,6 +553,7 @@ def fit_autoencoder(
     checkpoint_path: str | Path | None = None,
     device: str | torch.device = "cuda" if torch.cuda.is_available() else "cpu",
     criterion: nn.Module | None = None,
+    loss: str | None = None,
 ) -> dict[str, list[float]]:
     """Complete training loop for the baseline SequenceAutoencoder.
 
@@ -581,7 +583,10 @@ def fit_autoencoder(
     device : str | torch.device
         Hardware device to train on.
     criterion : nn.Module | None
-        Loss function, defaults to nn.MSELoss().
+        Loss function instance. If None, ``loss`` is used to build it.
+    loss : str | None
+        Loss name ("mae" or "mse"), used to build ``criterion`` when ``criterion``
+        is None.  Defaults to "mae" (robust to sensor saturation, see §7 #9).
 
     Returns
     -------
@@ -593,7 +598,12 @@ def fit_autoencoder(
     model.to(dev)
 
     if criterion is None:
-        criterion = nn.MSELoss()
+        if loss is None or loss == "mae":
+            criterion = nn.L1Loss()
+        elif loss == "mse":
+            criterion = nn.MSELoss()
+        else:
+            raise ValueError(f"Unsupported loss '{loss}', must be 'mae' or 'mse'")
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay

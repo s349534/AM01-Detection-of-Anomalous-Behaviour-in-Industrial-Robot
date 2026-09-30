@@ -107,7 +107,7 @@ def _compute_reconstruction_errors(
     model: SequenceAutoencoder,
     dataloader: DataLoader,
     device: torch.device,
-    metric: str = "mse",
+    metric: str = "mae",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute per-sample reconstruction errors and labels from a DataLoader.
 
@@ -235,6 +235,8 @@ def train_and_evaluate_ae(
     min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
     num_workers = int(get_param(config, "training.num_workers", num_workers))
     processed_dir = Path(get_param(config, "paths.data_processed", "data/processed/"))
+    loss_name = get_param(config, "training.loss", "mae")
+    metric = get_param(config, "training.reconstruction_metric", "mae")
 
     logger.info(
         "Run %d (seed=%d): W=%d, latent_dim=%d, channels=%s, epochs=%d",
@@ -266,18 +268,19 @@ def train_and_evaluate_ae(
         min_delta=min_delta,
         checkpoint_path=str(ckpt_path),
         device=dev,
+        loss=loss_name,
     )
 
     train_time_sec = time.time() - start_time
     best_epoch = history.get("best_epoch", 0) if history else 0
 
     # --- Calibrate threshold on validation (normal only) ---
-    val_errors, _ = _compute_reconstruction_errors(model, val_loader, dev, metric="mse")
+    val_errors, _ = _compute_reconstruction_errors(model, val_loader, dev, metric=metric)
     threshold = percentile_threshold(val_errors, threshold_percentile)
 
     # --- Evaluate on test (normal + anomaly) ---
     test_errors, test_labels = _compute_reconstruction_errors(
-        model, test_loader, dev, metric="mse"
+        model, test_loader, dev, metric=metric
     )
 
     auc_scores = calculate_auc(test_labels, test_errors)
