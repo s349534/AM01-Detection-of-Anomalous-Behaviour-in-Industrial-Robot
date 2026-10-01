@@ -31,7 +31,6 @@ CSV_COLUMNS = [
     "run_id",
     "W",
     "latent_dim",
-    "encoder_channels",
     "best_val_pr_auc",
     "best_val_f1",
     "best_epoch",
@@ -174,7 +173,6 @@ def run_search(
                 "run_id": run_id,
                 "W": window_size,
                 "latent_dim": run_config.get("model", {}).get("latent_dim", ""),
-                "encoder_channels": str(run_config.get("model", {}).get("encoder", {}).get("conv_channels", "")),
                 "best_val_pr_auc": -1.0,
                 "best_val_f1": -1.0,
                 "best_epoch": 0,
@@ -201,8 +199,8 @@ def run_search(
             write_result_row_csv(output_csv, result, write_header=write_header)
             write_header = False  # header written after first row
             logger.info(
-                "  -> W=%d latent=%d channels=%s pr_auc=%.4f f1=%.4f time=%.1fs",
-                result["W"], result["latent_dim"], result["encoder_channels"],
+                "  -> W=%d latent=%d pr_auc=%.4f f1=%.4f time=%.1fs",
+                result["W"], result["latent_dim"],
                 result["best_val_pr_auc"], result["best_val_f1"],
                 result["train_time_sec"],
             )
@@ -214,7 +212,6 @@ def run_search(
                 "run_id": run_id,
                 "W": sample.get("model.window_size", ""),
                 "latent_dim": sample.get("model.latent_dim", ""),
-                "encoder_channels": str(sample.get("model.encoder.conv_channels", "")),
                 "best_val_pr_auc": -1.0,  # sentinel for failure
                 "best_val_f1": -1.0,
                 "best_epoch": 0,

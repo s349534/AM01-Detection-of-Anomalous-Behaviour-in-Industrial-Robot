@@ -21,23 +21,23 @@ def get_search_space_ae() -> dict[str, Any]:
             {
                 "model.window_size": [16, 32, 64, 128],
                 "model.latent_dim": [8, 12, 16, 24, 32],
-                "model.encoder.conv_channels": [[64, 32], [128, 64]],
             }
 
     Notes
     -----
-    - ``encoder_channels = [128, 64, 32]`` (3-layer) is **excluded** because
-      ``Conv1dEncoder`` and ``Conv1dDecoder`` are hardcoded for exactly 2 conv
-      layers (they do ``c1, c2 = conv_channels``).  See ``src/models/autoencoder.py``
-      lines 95 and 169.
-    - Total grid: 4 × 5 × 2 = 40 combinations. 20 are sampled per validation run.
-    - W range: potenze di 2 da 16 a 128, default 16. Copre finestre brevi (pattern locali)
-      a lunghe (trend lenti). Il default 16 è allineato a params.yaml.
+    - Encoder architecture is now FIXED to 3 layers with channels (64, 32, 16).
+      The ``encoder_channels`` hyperparameter has been removed from the search space.
+    - Decoder is auto-derived from encoder channels (reversed), not configured separately.
+    - Window size must be a multiple of 4 (due to 2 pooling stages = factor 4 reduction).
+      All values in the search space (16, 32, 64, 128) satisfy this constraint.
+    - Total grid: 4 × 5 = 20 combinations. All can be sampled exhaustively.
+    - W range: powers of 2 from 16 to 128, default 16. Covers short windows (local patterns)
+      to long windows (slow trends). Default 16 aligned with params.yaml.
     """
     return {
-        "model.window_size": [16, 32, 64, 128],
+        "model.window_size": [16, 32, 64, 128],  # all multiples of 4
         "model.latent_dim": [8, 12, 16, 24, 32],
-        "model.encoder.conv_channels": [[64, 32], [128, 64]],
+        # encoder_channels REMOVED - fixed architecture (64, 32, 16)
     }
 
 

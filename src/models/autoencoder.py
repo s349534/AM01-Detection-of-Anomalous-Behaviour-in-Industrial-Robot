@@ -4,30 +4,42 @@ This module implements the baseline autoencoder architecture designed for the
 Kuka industrial robot time-series dataset.
 
 Architecture overview (see docs/project_plan.md §4.1.2):
---------------------------------------------------------
-Encoder (1D-Conv):
-    Input:  (B, input_dim=82, W=16)
-       ↓    Conv1d(82 → 128, kernel=5, padding=2) + ReLU
-            MaxPool1d(kernel_size=2) → (B, 128, W/2=8)
-       ↓    Conv1d(128 → 64, kernel=3, padding=1) + ReLU
-            AdaptiveAvgPool1d(1) → (B, 64, 1)
-       ↓    Flatten → (B, 64)
-            Linear(64 → latent_dim=16)
-    Output: z ∈ ℝ^(B, 16)
+---------------------------------------------------------
+Encoder (1D-Conv, 3 layers, 2 pooling stages):
+    Input:  (B, input_dim=82, W)  with W multiple of 4
+       ↓    Conv1d(82 → 64, kernel=5, padding=2) + ReLU
+            MaxPool1d(kernel_size=2) → (B, 64, W/2)
+       ↓    Conv1d(64 → 32, kernel=3, padding=1) + ReLU
+            MaxPool1d(kernel_size=2) → (B, 32, W/4)
+       ↓    Conv1d(32 → 16, kernel=3, padding=1) + ReLU
+            → (B, 16, W/4)
+       ↓    Flatten → (B, 16 * W/4) = (B, 4W)
+            Linear(4W → latent_dim)
+    Output: z ∈ ℝ^(B, latent_dim)
 
-Decoder (Symmetric 1D-ConvTranspose):
-    Input:  z ∈ ℝ^(B, 16)
-       ↓    Linear(16 → 64 * (W // 2)) + ReLU
-            Reshape → (B, 64, W/2=8)
-       ↓    ConvTranspose1d(64 → 128, kernel=4, stride=2, padding=1) + ReLU → (B, 128, W=16)
-       ↓    Conv1d(128 → input_dim=82, kernel=3, padding=1)
-    Output: x̂ ∈ ℝ^(B, input_dim=82, W=16)
+Decoder (Auto-derived symmetric 1D-ConvTranspose):
+    Input:  z ∈ ℝ^(B, latent_dim)
+       ↓    Linear(latent_dim → 16 * (W/4)) + ReLU
+            Reshape → (B, 16, W/4)
+       ↓    ConvTranspose1d(16 → 32, kernel=4, stride=2, padding=1) + ReLU → (B, 32, W/2)
+       ↓    ConvTranspose1d(32 → 64, kernel=4, stride=2, padding=1) + ReLU → (B, 64, W)
+       ↓    Conv1d(64 → input_dim=82, kernel=3, padding=1)
+    Output: x̂ ∈ ℝ^(B, input_dim=82, W)
+
+    Decoder channels are automatically derived as the reverse of encoder
+    conv_channels (excluding input_dim). No separate decoder_channels config.
 
 Input Layout Support:
     The model accepts both (B, input_dim, W) and (B, W, input_dim) tensors.
     If the caller provides (B, W, input_dim) — as produced by standard DataLoaders
     wrapping KukaDataset — the input is transposed internally and the reconstructed
     tensor is returned in the same (B, W, input_dim) layout.
+
+Fixed Architecture Parameters:
+    - Encoder conv_channels: (64, 32, 16) — funnel progression
+    - Encoder conv_kernels: (5, 3, 3)
+    - Pooling: 2 stages of MaxPool1d(2) after conv layers 1 and 2
+    - Window size must be a multiple of 4
 """
 from __future__ import annotations
 
@@ -54,18 +66,25 @@ class Conv1dEncoder(nn.Module):
     Compresses an input tensor of shape ``(B, input_dim, W)`` into a latent
     vector ``z`` of shape ``(B, latent_dim)``.
 
+    Architecture (fixed 3-layer funnel with 2 pooling stages):
+        Conv1d(input_dim → 64, k=5) + ReLU + MaxPool1d(2)  → (B, 64, W/2)
+        Conv1d(64 → 32, k=3) + ReLU + MaxPool1d(2)        → (B, 32, W/4)
+        Conv1d(32 → 16, k=3) + ReLU                       → (B, 16, W/4)
+        Flatten                                            → (B, 16 * W/4)
+        Linear(16 * W/4 → latent_dim)
+
     Parameters
     ----------
     input_dim : int, default=82
         Number of sensor channels (features).
     window_size : int, default=16
-        Number of timesteps per window (W).
-    conv_channels : tuple[int, int], default=(128, 64)
-        Number of output channels for the two Conv1d layers.
-    conv_kernels : tuple[int, int], default=(5, 3)
-        Kernel sizes for the two Conv1d layers.
+        Number of timesteps per window (W). Must be a multiple of 4.
+    conv_channels : tuple[int, int, int], default=(64, 32, 16)
+        Output channels for the three Conv1d layers (funnel: decreasing).
+    conv_kernels : tuple[int, int, int], default=(5, 3, 3)
+        Kernel sizes for the three Conv1d layers.
     pool_size : int, default=2
-        Kernel size and stride for the intermediate MaxPool1d.
+        Kernel size and stride for the two MaxPool1d layers (after conv 1 & 2).
     latent_dim : int, default=16
         Dimension of the compressed latent representation z.
     activation : str, default="relu"
@@ -76,8 +95,8 @@ class Conv1dEncoder(nn.Module):
         self,
         input_dim: int = 82,
         window_size: int = 16,
-        conv_channels: tuple[int, int] = (128, 64),
-        conv_kernels: tuple[int, int] = (5, 3),
+        conv_channels: tuple[int, int, int] = (64, 32, 16),
+        conv_kernels: tuple[int, int, int] = (5, 3, 3),
         pool_size: int = 2,
         latent_dim: int = 16,
         activation: str = "relu",
@@ -90,10 +109,23 @@ class Conv1dEncoder(nn.Module):
         self.pool_size = pool_size
         self.latent_dim = latent_dim
 
+        # Validate window_size compatibility with 2 pooling stages (factor 4)
+        if window_size % 4 != 0:
+            raise ValueError(
+                f"window_size must be a multiple of 4 (got {window_size}), "
+                f"because the encoder applies two MaxPool1d({pool_size}) stages "
+                f"reducing temporal dimension by factor {pool_size**2}."
+            )
+
         act_cls = nn.LeakyReLU if activation.lower() == "leaky_relu" else nn.ReLU
 
-        c1, c2 = conv_channels
-        k1, k2 = conv_kernels
+        c1, c2, c3 = conv_channels
+        k1, k2, k3 = conv_kernels
+
+        # Temporal length after two pooling stages
+        self.reduced_temporal_len = window_size // (pool_size * pool_size)
+        # Flattened feature size before the final Linear layer
+        self.flattened_size = c3 * self.reduced_temporal_len
 
         self.net = nn.Sequential(
             # Layer 1: preserves temporal length L=W
@@ -104,11 +136,15 @@ class Conv1dEncoder(nn.Module):
             # Layer 2: preserves reduced length
             nn.Conv1d(c1, c2, kernel_size=k2, padding=k2 // 2),
             act_cls(),
-            # Adaptive pooling: guarantees temporal dimension of 1 regardless of W
-            nn.AdaptiveAvgPool1d(1),
+            # Pool 2: reduces temporal length to W // (pool_size^2)
+            nn.MaxPool1d(kernel_size=pool_size),
+            # Layer 3: preserves final reduced length (no pooling after)
+            nn.Conv1d(c2, c3, kernel_size=k3, padding=k3 // 2),
+            act_cls(),
+            # Flatten entire sequence (no AdaptiveAvgPool1d)
             nn.Flatten(),
             # Dense projection to latent bottleneck
-            nn.Linear(c2, latent_dim),
+            nn.Linear(self.flattened_size, latent_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -131,10 +167,24 @@ class Conv1dEncoder(nn.Module):
 # 2. Decoder
 # ---------------------------------------------------------------------------
 class Conv1dDecoder(nn.Module):
-    """Symmetric 1D-Transposed Convolutional Decoder.
+    """Auto-derived Symmetric 1D-Transposed Convolutional Decoder.
 
     Reconstructs the original sequence window ``(B, input_dim, W)`` from a
     latent vector ``z`` of shape ``(B, latent_dim)``.
+
+    The decoder architecture is automatically derived from the encoder's
+    ``conv_channels`` by reversing the channel progression (excluding input_dim):
+    - Encoder channels: (c1, c2, c3) = (64, 32, 16)  [funnel down]
+    - Decoder channels: (c3, c2, c1) = (16, 32, 64)  [funnel up]
+    - Two ConvTranspose1d layers for the two pooling stages
+    - Final Conv1d projects c1 → input_dim
+
+    Architecture (for encoder conv_channels=(64, 32, 16), 2 pooling stages):
+        Linear(latent_dim → 16 * (W/4)) + ReLU
+        Reshape → (B, 16, W/4)
+        ConvTranspose1d(16 → 32, k=4, s=2, p=1) + ReLU → (B, 32, W/2)
+        ConvTranspose1d(32 → 64, k=4, s=2, p=1) + ReLU → (B, 64, W)
+        Conv1d(64 → input_dim, k=3, p=1) → (B, input_dim, W)
 
     Parameters
     ----------
@@ -143,9 +193,11 @@ class Conv1dDecoder(nn.Module):
     input_dim : int, default=82
         Number of output sensor channels.
     window_size : int, default=16
-        Target temporal length (W) to reconstruct.
-    conv_channels : tuple[int, int], default=(64, 128)
-        Channel dimensions for transposed and regular convolutions.
+        Target temporal length (W) to reconstruct. Must be multiple of 4.
+    encoder_channels : tuple[int, int, int], default=(64, 32, 16)
+        Encoder's conv_channels (used to derive decoder structure).
+    pool_size : int, default=2
+        Pooling factor used in encoder (determines upsampling stages).
     activation : str, default="relu"
         Activation function ("relu" or "leaky_relu").
     """
@@ -155,35 +207,53 @@ class Conv1dDecoder(nn.Module):
         latent_dim: int = 16,
         input_dim: int = 82,
         window_size: int = 16,
-        conv_channels: tuple[int, int] = (64, 128),
+        encoder_channels: tuple[int, int, int] = (64, 32, 16),
+        pool_size: int = 2,
         activation: str = "relu",
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.input_dim = input_dim
         self.window_size = window_size
-        self.conv_channels = conv_channels
+        self.encoder_channels = encoder_channels
+        self.pool_size = pool_size
 
-        # The intermediate temporal length before upsampling is W // 2
-        self.half_w = max(1, window_size // 2)
-        c1, c2 = conv_channels
+        # Validate window_size compatibility
+        if window_size % (pool_size * pool_size) != 0:
+            raise ValueError(
+                f"window_size must be a multiple of {pool_size * pool_size} "
+                f"(got {window_size}) for {2} upsampling stages."
+            )
 
         act_cls = nn.LeakyReLU if activation.lower() == "leaky_relu" else nn.ReLU
 
-        # Project latent vector to flat intermediate feature map
+        # Encoder channels: (c1, c2, c3) = e.g., (64, 32, 16)
+        # Decoder works in reverse: starts from c3, goes to c2, then c1
+        c1, c2, c3 = encoder_channels
+
+        # Temporal length at the bottleneck (after encoder's 2 pooling stages)
+        self.bottleneck_temporal_len = window_size // (pool_size * pool_size)
+        # Flattened size at bottleneck = c3 * bottleneck_temporal_len
+        self.bottleneck_flat_size = c3 * self.bottleneck_temporal_len
+
+        # Project latent vector to flat bottleneck feature map
         self.fc = nn.Sequential(
-            nn.Linear(latent_dim, c1 * self.half_w),
+            nn.Linear(latent_dim, self.bottleneck_flat_size),
             act_cls(),
         )
 
-        # Upsampling via ConvTranspose1d: (B, c1, half_w) → (B, c2, W)
-        # For L_in = W // 2, kernel=4, stride=2, padding=1 gives:
-        # L_out = (L_in - 1)*2 - 2*1 + 4 = 2 * L_in = W (for even W).
+        # Two upsampling stages (matching encoder's two pooling stages)
+        # Stage 1: (B, c3, W/4) → (B, c2, W/2)
+        # Stage 2: (B, c2, W/2) → (B, c1, W)
         self.deconv = nn.Sequential(
-            nn.ConvTranspose1d(c1, c2, kernel_size=4, stride=2, padding=1),
+            # Upsample 1: c3 → c2
+            nn.ConvTranspose1d(c3, c2, kernel_size=4, stride=pool_size, padding=1),
             act_cls(),
-            # Final 1x1-equivalent smoothing/projection to original sensor count
-            nn.Conv1d(c2, input_dim, kernel_size=3, padding=1),
+            # Upsample 2: c2 → c1
+            nn.ConvTranspose1d(c2, c1, kernel_size=4, stride=pool_size, padding=1),
+            act_cls(),
+            # Final projection to original sensor count
+            nn.Conv1d(c1, input_dim, kernel_size=3, padding=1),
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -201,10 +271,11 @@ class Conv1dDecoder(nn.Module):
         """
         batch_size = z.size(0)
         h = self.fc(z)
-        h = h.view(batch_size, self.conv_channels[0], self.half_w)
+        # Reshape to (B, c3, bottleneck_temporal_len)
+        h = h.view(batch_size, self.encoder_channels[2], self.bottleneck_temporal_len)
         x_rec = self.deconv(h)
 
-        # Safety adjustment if window_size was odd
+        # Safety adjustment if window_size doesn't match exactly
         if x_rec.size(-1) != self.window_size:
             x_rec = nn.functional.interpolate(
                 x_rec, size=self.window_size, mode="linear", align_corners=False
@@ -223,22 +294,23 @@ class SequenceAutoencoder(nn.Module):
     methods for end-to-end forward pass, standalone encoding/decoding, and
     sample-wise anomaly score calculation.
 
+    The decoder architecture is automatically derived from the encoder's
+    conv_channels (reversed), ensuring perfect symmetry.
+
     Parameters
     ----------
     input_dim : int, default=82
         Number of input channels (sensor features).
     window_size : int, default=16
-        Number of consecutive timesteps per window (W).
+        Number of consecutive timesteps per window (W). Must be multiple of 4.
     latent_dim : int, default=16
         Dimension of latent bottleneck vector z.
-    encoder_channels : tuple[int, int], default=(128, 64)
-        Conv channels in encoder.
-    encoder_kernels : tuple[int, int], default=(5, 3)
-        Conv kernel sizes in encoder.
+    encoder_channels : tuple[int, int, int], default=(64, 32, 16)
+        Conv channels in encoder (3 layers, funnel: decreasing).
+    encoder_kernels : tuple[int, int, int], default=(5, 3, 3)
+        Conv kernel sizes in encoder (3 layers).
     pool_size : int, default=2
-        Pooling kernel size.
-    decoder_channels : tuple[int, int], default=(64, 128)
-        Conv channels in decoder.
+        Pooling kernel size (applied after conv layers 1 and 2).
     activation : str, default="relu"
         Activation function.
     """
@@ -248,10 +320,9 @@ class SequenceAutoencoder(nn.Module):
         input_dim: int = 82,
         window_size: int = 16,
         latent_dim: int = 16,
-        encoder_channels: tuple[int, int] = (128, 64),
-        encoder_kernels: tuple[int, int] = (5, 3),
+        encoder_channels: tuple[int, int, int] = (64, 32, 16),
+        encoder_kernels: tuple[int, int, int] = (5, 3, 3),
         pool_size: int = 2,
-        decoder_channels: tuple[int, int] = (64, 128),
         activation: str = "relu",
     ) -> None:
         super().__init__()
@@ -273,7 +344,8 @@ class SequenceAutoencoder(nn.Module):
             latent_dim=latent_dim,
             input_dim=input_dim,
             window_size=window_size,
-            conv_channels=decoder_channels,
+            encoder_channels=encoder_channels,
+            pool_size=pool_size,
             activation=activation,
         )
 
@@ -401,6 +473,18 @@ class SequenceAutoencoder(nn.Module):
         """Instantiate a SequenceAutoencoder from a configuration dictionary.
 
         If config is None, loads default config via ``src.utils.config.load_config()``.
+
+        Expected config structure:
+            model:
+              input_dim: 82
+              window_size: 32          # must be multiple of 4
+              latent_dim: 16
+              encoder:
+                conv_channels: [64, 32, 16]  # 3 layers, funnel
+                conv_kernels: [5, 3, 3]
+                pool_size: 2
+                activation: "relu"
+              # decoder section is derived from encoder, not configured separately
         """
         if config is None:
             config = load_config()
@@ -410,15 +494,12 @@ class SequenceAutoencoder(nn.Module):
         latent_dim = int(get_param(config, "model.latent_dim", 16))
 
         enc_channels = tuple(
-            get_param(config, "model.encoder.conv_channels", [128, 64])
+            get_param(config, "model.encoder.conv_channels", [64, 32, 16])
         )
         enc_kernels = tuple(
-            get_param(config, "model.encoder.conv_kernels", [5, 3])
+            get_param(config, "model.encoder.conv_kernels", [5, 3, 3])
         )
         pool_size = int(get_param(config, "model.encoder.pool_size", 2))
-        dec_channels = tuple(
-            get_param(config, "model.decoder.conv_channels", [64, 128])
-        )
         activation = str(get_param(config, "model.encoder.activation", "relu"))
 
         return cls(
@@ -428,7 +509,6 @@ class SequenceAutoencoder(nn.Module):
             encoder_channels=enc_channels,  # type: ignore[arg-type]
             encoder_kernels=enc_kernels,    # type: ignore[arg-type]
             pool_size=pool_size,
-            decoder_channels=dec_channels,  # type: ignore[arg-type]
             activation=activation,
         )
 

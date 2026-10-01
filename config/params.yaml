@@ -4,21 +4,19 @@
 model:
   name: "adversarial_autoencoder"
   input_dim: 82            # 86 original columns - 4 constant features (sensor_id{2,5,6,7}_temp)
-  window_size: 16          # timesteps per sliding window
-  encoding_dim: 32         # intermediate dense layer dimension
+  window_size: 16          # timesteps per sliding window (must be multiple of 4)
+  encoding_dim: 32         # intermediate dense layer dimension (unused in conv AE)
   latent_dim: 16           # latent vector dimension
 
   encoder:
     # 1D-Conv architecture (see §4.1.2 in project_plan)
-    conv_channels: [128, 64]   # output channels per Conv1d
-    conv_kernels: [5, 3]       # kernel size per Conv1d
-    pool_size: 2               # MaxPool after first conv
+    conv_channels: [64, 32, 16]   # output channels per Conv1d (3 layers, funnel)
+    conv_kernels: [5, 3, 3]       # kernel size per Conv1d
+    pool_size: 2               # MaxPool after first and second conv
     activation: "relu"
 
-  decoder:
-    # Symmetric decoder: ConvTranspose1d for temporal upsampling
-    conv_channels: [64, 128]   # channels (reverse order of encoder)
-    activation: "relu"
+  # decoder is auto-derived from encoder conv_channels (reversed)
+  # no separate decoder configuration needed
 
   discriminator:
     hidden_layers: [32, 16]

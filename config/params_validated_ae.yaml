@@ -24,21 +24,20 @@ model:
   input_dim: 82
   window_size: 32
   encoding_dim: 32
-  latent_dim: 8
+  latent_dim: 16
   encoder:
     conv_channels:
     - 64
     - 32
+    - 16
     conv_kernels:
     - 5
     - 3
+    - 3
     pool_size: 2
     activation: relu
-  decoder:
-    conv_channels:
-    - 64
-    - 128
-    activation: relu
+  # decoder is auto-derived from encoder conv_channels (reversed)
+  # no separate decoder configuration needed
   discriminator:
     hidden_layers:
     - 32

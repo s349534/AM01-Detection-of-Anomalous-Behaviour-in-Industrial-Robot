@@ -387,47 +387,57 @@ data:
 L'encoder non è più un MLP piatto: deve ridurre un tensore `(W, 86)` a un
 vettore latente `(latent_dim,)` **riassumendo l'evoluzione temporale**.
 
-**Architettura scelta: Encoder convoluzionale 1D + Decoder speculare.**
+**Architettura scelta: Encoder convoluzionale 1D (3 layer, 2 pooling) + Decoder speculare auto-derivato.**
 
 ```
-ENCODER                                    DECODER
-─────────────────────────                 ─────────────────────────
-Input  (B, 86, W)                          Input  (B, latent_dim)
-   ↓                                          ↓
-Conv1d(86→128, kernel=5, pad=2)            Linear(latent → 64·W')
-   ↓ ReLU                                    ↓ ReLU
-MaxPool1d(2)  → (B, 128, W/2)             Reshape → (B, 64, W')
-   ↓                                          ↓
-Conv1d(128→64, kernel=3, pad=1)           ConvTranspose1d(64→128, kernel=4, stride=2)
-   ↓ ReLU                                    ↓ ReLU
-AdaptiveAvgPool1d(1) → (B, 64, 1)         Conv1d(128→86, kernel=3, pad=1)
-   ↓                                          ↓
-Flatten → (B, 64)                          Output (B, 86, W)
-   ↓                                          ↓
-Linear(64 → latent_dim)                    → ricostruzione della sequenza
-   ↓                                          → errore = MAE(x, x̂)
+NEW ENCODER (3 conv layers, 2 pools)          NEW DECODER (auto-derived)
+─────────────────────────────────────────     ─────────────────────────────────────────
+Input  (B, 82, W)                              Input  (B, latent_dim)
+   ↓                                               ↓
+Conv1d(82→64, kernel=5, pad=2) + ReLU            Linear(latent → 16·W/4) + ReLU
+   ↓                                               ↓
+MaxPool1d(2)  → (B, 64, W/2)                   Reshape → (B, 16, W/4)
+   ↓                                               ↓
+Conv1d(64→32, kernel=3, pad=1) + ReLU          ConvTranspose1d(16→32, k=4,s=2,p=1) + ReLU
+   ↓                                               ↓
+MaxPool1d(2)  → (B, 32, W/4)                   ConvTranspose1d(32→64, k=4,s=2,p=1) + ReLU
+   ↓                                               ↓
+Conv1d(32→16, kernel=3, pad=1) + ReLU          Conv1d(64→82, kernel=3, pad=1)
+   ↓                                               ↓
+Flatten → (B, 16·W/4)                          Output (B, 82, W)
+   ↓
+Linear(16·W/4 → latent_dim)
+   ↓
 z  (B, latent_dim)
 ```
 
 **Note sull'architettura**:
 
 - **Input layout**: PyTorch `Conv1d` vuole `(batch, channels, length)`,
-  quindi passiamo `(B, 86, W)`: gli 86 sensori sono i "canali", le `W`
+  quindi passiamo `(B, 82, W)`: gli 82 sensori sono i "canali", le `W`
   posizioni temporali sono la "lunghezza". È un ribaltamento del layout
-  `(B, W, 86)` che useremo nel `Dataset` per comodità.
+  `(B, W, 82)` che useremo nel `Dataset` per comodità.
 - **Perché 1D-Conv e non LSTM**: la 1D-Conv è molto più veloce da
   addestrare (parallelizzabile, niente stato ricorrente) e cattura pattern
   locali (brevi trend, oscillazioni) che sono esattamente ciò che ci
   interessa in finestre corte. LSTM avrebbe senso per finestre molto
   lunghe (W ≥ 200) o se volessimo modellare dipendenze a lungo raggio, ma
   qui non serve.
-- **AdaptiveAvgPool1d(1)**: comprime la dimensione temporale a 1 dopo le
-  conv, così il Linear finale riceve un vettore di lunghezza fissa
-  indipendente da W. Vantaggio: posso cambiare W senza ridisegnare
-  l'encoder.
-- **Decoder speculare**: ConvTranspose1d fa l'upsampling temporale. Per
-  finestre piccole (W=16) la ricostruzione è praticamente perfetta sui
-  sample normali → l'errore è guidato quasi solo dalle anomalie.
+- **3 layer convoluzionali a imbuto (64 → 32 → 16)**: ogni strato comprime
+  gradualmente l'informazione, costruendo rappresentazioni gerarchiche.
+  I primi layer catturano dettagli locali a grana fine, gli ultimi combinano
+  quei dettagli in pattern più ampi.
+- **Due stadi di pooling (MaxPool1d dopo layer 1 e 2)**: riducono la
+  dimensione temporale di fattore 4 complessivo (W → W/2 → W/4). Questo
+  richiede che W sia multiplo di 4. Il terzo layer conv NON ha pooling,
+  preservando la risoluzione temporale residua per il flatten.
+- **Niente AdaptiveAvgPool1d**: il flatten preserva l'intera sequenza
+  temporale residua (W/4 posizioni × 16 canali = 4W elementi), dando
+  allo strato denso finale accesso a tutta l'informazione spaziotemporale.
+- **Decoder auto-derivato**: i canali del decoder sono l'inverso di quelli
+  dell'encoder (16 → 32 → 64 → 82), con due ConvTranspose1d per i due
+  stadi di upsampling. È strutturalmente impossibile disallineare encoder
+  e decoder.
 
 **Addestramento**: MAE tra input e ricostruzione, ottimizzatore Adam, batch
 size 256 (da `params.yaml`).
@@ -531,33 +541,50 @@ report di media ± deviazione standard.
 
 | HP | Range | Tipo | Giustificazione del range |
 |----|-------|------|---------------------------|
-| `W` | {16, 32, 64, 128} | discreto | Potenze di 2 da 16 a 128, default 16. Copre finestre brevi (pattern locali) a lunghe (trend lenti) |
-| `latent_dim` | {8, 12, 16, 24, 32} | discreto | Compromesso compressione 82→{8..32} = 2.5×–10× |
-| `encoder_channels` | {[64,32], [128,64]} | categorico | 2 layer conv (architettura hardcoded a 2 layer), range standard per AE su dati 1D |
+| `W` | {16, 32, 64, 128} | discreto | Potenze di 2 da 16 a 128 (tutti multipli di 4), default 16. Copre finestre brevi (pattern locali) a lunghe (trend lenti). Vincolo: W deve essere multiplo di 4 per i 2 stadi di pooling. |
+| `latent_dim` | {8, 12, 16, 24, 32} | discreto | Compromesso compressione: input al Linear = 4×W (es. 64 per W=16, 512 per W=128) → latent_dim. |
 
-Spazio totale: 40 combinazioni (4 × 5 × 2), 20 campionate con
-`sklearn.model_selection.ParameterSampler(seed=42)`. Esempio delle prime 10
-combinazioni campionate:
+**Architettura encoder FISSATA (non validata):**
+- 3 layer convoluzionali con canali: `(64, 32, 16)` (progressione a imbuto)
+- Kernel sizes: `(5, 3, 3)`
+- 2 stadi di MaxPool1d(2) dopo layer 1 e 2 → riduzione temporale fattore 4
+- Nessun AdaptiveAvgPool1d → Flatten preserva sequenza temporale (W/4 × 16 = 4W elementi)
+- Decoder auto-derivato: canali inversi `(16, 32, 64)` + 2 ConvTranspose1d + Conv1d finale
 
-| run_id | W | latent_dim | encoder_channels |
-|--------|---|------------|------------------|
-| 1      | 64 | 16         | [128, 64]        |
-| 2      | 32 | 32         | [64, 32]         |
-| 3      | 16 | 8          | [128, 64]        |
-| 4      | 128 | 24         | [64, 32]         |
-| 5      | 32 | 12         | [128, 64]        |
-| 6      | 64 | 32         | [64, 32]         |
-| 7      | 16 | 16         | [128, 64]        |
-| 8      | 128 | 8          | [64, 32]         |
-| 9      | 32 | 24         | [128, 64]        |
-| 10     | 64 | 12         | [64, 32]         |
+Spazio totale: **20 combinazioni** (4 × 5), tutte campionabili esaustivamente con
+`sklearn.model_selection.ParameterGrid` o `ParameterSampler(seed=42)`.
 
-(Le combinazioni effettive dipendono dal seed; sopra è un'illustrazione del
-formato. Le 20 run prodotte andranno a popolare il CSV finale.)
+Esempio delle 20 combinazioni (griglia completa):
+
+| run_id | W | latent_dim |
+|--------|---|------------|
+| 1      | 16 | 8          |
+| 2      | 16 | 12         |
+| 3      | 16 | 16         |
+| 4      | 16 | 24         |
+| 5      | 16 | 32         |
+| 6      | 32 | 8          |
+| 7      | 32 | 12         |
+| 8      | 32 | 16         |
+| 9      | 32 | 24         |
+| 10     | 32 | 32         |
+| 11     | 64 | 8          |
+| 12     | 64 | 12         |
+| 13     | 64 | 16         |
+| 14     | 64 | 24         |
+| 15     | 64 | 32         |
+| 16     | 128 | 8         |
+| 17     | 128 | 12         |
+| 18     | 128 | 16         |
+| 19     | 128 | 24         |
+| 20     | 128 | 32         |
+
+(Le combinazioni effettive dipendono dal seed se si usa random sampling; sopra è la griglia esaustiva.)
 
 **4.8.3 Spazio di ricerca AAE**
 
-HP AE-derivati (`W`, `latent_dim`, `encoder_channels`) fissati a `HP_AE_best`.
+HP AE-derivati (`W`, `latent_dim`) fissati a `HP_AE_best`.
+L'architettura encoder (3 layer, canali 64/32/16) è fissa e non è più un iperparametro.
 HP validati:
 
 | HP | Range | Tipo | Giustificazione |
@@ -595,6 +622,17 @@ in Fase 5, diventano candidati per analisi di sensitività post-hoc.
 | `best_epoch` | tracciato in `EarlyStopping` | Ora traccia l'epoca reale del miglior val_loss (non `len(history)`) |
 | `discriminator_updates_per_gen` | 1 | Default GAN (Goodfellow et al., 2014) |
 | `discriminator_lr` | 1e-3 | Stesso di E+D, default comune nelle implementazioni AAE |
+| **Architettura Encoder (FIXA)** | | |
+| `encoder_num_layers` | 3 | Scelto per rappresentazioni gerarchiche più ricche (vedi §4.1.2) |
+| `encoder_conv_channels` | (64, 32, 16) | Progressione a imbuto: compressione graduale da 82 sensori verso 16 |
+| `encoder_conv_kernels` | (5, 3, 3) | Kernel ampio all'inizio per contesto largo, poi stretti per dettagli |
+| `encoder_pool_stages` | 2 | MaxPool1d(2) dopo layer 1 e 2 → riduzione temporale ×4 |
+| `encoder_pool_size` | 2 | Fattore di pooling per stadio |
+| `adaptive_avg_pool` | False | Rimosso: Flatten preserva informazione temporale per Linear finale |
+| **Architettura Decoder (AUTO-DERIVATA)** | | |
+| `decoder_channels` | (16, 32, 64, 82) | Inverso di encoder_channels + input_dim finale |
+| `decoder_upsample_stages` | 2 | ConvTranspose1d per ogni stadio di pooling dell'encoder |
+| `decoder_final_kernel` | 3 | Conv1d finale per proiezione a input_dim |
 
 **4.8.5 Workflow CLI**
 
