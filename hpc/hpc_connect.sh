@@ -441,7 +441,7 @@ EOFSRIPT
     else
         # Fallback: scp individual files (no rsync → no --delete, so we must
         # proactively remove stale files above and overwrite unconditionally)
-        for f in train.npy val.npy test_normal.npy test_anomaly.npy \
+        for f in train.npy val_normal.npy val_anomaly.npy test_normal.npy test_anomaly.npy \
                  scaler.pkl selected_columns.npy; do
             scp "$(ssh_target):~/am01_project/data/processed/${f}" \
                 "${PROJECT_ROOT}/data/processed/" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/data/processed/${f}" || true

@@ -278,7 +278,7 @@ Questo evita di dover caricare manualmente i dati processati — basta avere
 1. **Locale**: `data/raw/` contiene i 3 file `.npy` grezzi (KukaNormal, KukaSlow, ColumnNames)
 2. **Deploy**: `./hpc_connect.sh deploy` fa rsync di tutto il progetto (incluso `data/raw/`) → `~/am01_project/` su HPC
 3. **SLURM job**: fa rsync `~/am01_project/` → `$SCRATCH/am01/` su compute node
-4. **Preprocessing** (su compute node): legge `data/raw/`, scrive `data/processed/` (train.npy, val.npy, test_normal.npy, test_anomaly.npy, scaler.pkl, selected_columns.npy)
+4. **Preprocessing** (su compute node): legge `data/raw/`, scrive `data/processed/` (train.npy, val_normal.npy, val_anomaly.npy, test_normal.npy, test_anomaly.npy, scaler.pkl, selected_columns.npy)
 5. **Training/Validation**: usa `data/processed/`
 6. **Post-run rsync**: copia `data/processed/`, `reports/`, `config/`, log da `$SCRATCH` → `~/am01_project/`
 7. **Auto-fetch** (`batch`): scarica da `~/am01_project/` → locale (`./data/processed/`, `./reports/`, `./config/`, `./logs/`)

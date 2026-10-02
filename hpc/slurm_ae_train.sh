@@ -70,7 +70,8 @@ NEED_PREPROCESS=0
 # List of ALL files that must exist after correct preprocessing
 REQUIRED_PROCESSED_FILES=(
     "data/processed/train.npy"
-    "data/processed/val.npy"
+    "data/processed/val_normal.npy"
+    "data/processed/val_anomaly.npy"
     "data/processed/test_normal.npy"
     "data/processed/test_anomaly.npy"
     "data/processed/scaler.pkl"
@@ -92,7 +93,7 @@ if [[ ${ALL_EXIST} -eq 1 ]]; then
     # Check validation set size (need at least window_size+1 samples)
     VAL_SAMPLES=$(uv run python -c 'import numpy as np, sys;
 try:
-    arr = np.load("data/processed/val.npy", mmap_mode="r")
+    arr = np.load("data/processed/val_normal.npy", mmap_mode="r")
     print(arr.shape[0])
 except Exception:
     print(0)

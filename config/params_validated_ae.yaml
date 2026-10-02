@@ -71,7 +71,7 @@ data:
   augmentation: false
 validation:
   threshold_run_id: 1
-  threshold_calibrated_at: '2026-10-02T14:47:10.100344+00:00'
+  threshold_calibrated_at: '2026-10-02T15:29:55.244373+00:00'
   val_roc_auc: 0.316332
   val_pr_auc: 0.269922
   source_csv: reports\tables\validation_results_ae.csv
