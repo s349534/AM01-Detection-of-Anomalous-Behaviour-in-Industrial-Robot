@@ -5,7 +5,7 @@ After Fase 3.1 validation selects HP_AE_best and writes
 
     - 3 runs with different seeds (nested validation, §4.8.1)
     - Saves best checkpoint to reports/checkpoints/ae_baseline.pth
-    - Writes reports/tables/ae_final_metrics.csv with mean ± std
+    - Writes reports/tables/ae_final_metrics.csv with mean +/- std
 
 Usage:
     python -m src.models.train_ae --config config/params_validated_ae.yaml
@@ -32,7 +32,6 @@ from src.utils.metrics import (
     calculate_auc,
     calculate_metrics,
     compute_anomaly_scores,
-    percentile_threshold,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,17 +96,24 @@ def _compute_errors(
 def train_single_seed(
     config: dict[str, Any],
     seed: int,
+    threshold: float,
     checkpoint_path: str | Path | None = None,
     device: str | torch.device | None = None,
 ) -> dict[str, Any]:
     """Train a single AE with a given seed and evaluate on test set.
 
+    Uses the calibrated threshold from Stage 2 (params_validated_ae.yaml).
+    Validation set consists of val_normal (for early stopping) + val_anomaly
+    (for metrics, no longer used for threshold calibration here).
+
     Parameters
     ----------
     config : dict
-        Validated config (from params_validated_ae.yaml).
+        Validated config (from params_validated_ae.yaml, including model.threshold).
     seed : int
         Random seed for this run.
+    threshold : float
+        Pre-calibrated decision threshold from Stage 2 (find_optimal_threshold).
     checkpoint_path : str | Path | None
         Where to save the model checkpoint.
     device : str | torch.device | None
@@ -140,7 +146,7 @@ def train_single_seed(
 
     # --- Build dataloaders ---
     train_loader = _build_loader(processed_dir, "train.npy", window_size, batch_size, label=0, shuffle=True)
-    val_loader = _build_loader(processed_dir, "val.npy", window_size, batch_size, label=0, shuffle=False)
+    val_normal_loader = _build_loader(processed_dir, "val_normal.npy", window_size, batch_size, label=0)
 
     # Test loader: normal + anomaly
     test_normal_loader = _build_loader(processed_dir, "test_normal.npy", window_size, batch_size, label=0)
@@ -162,7 +168,7 @@ def train_single_seed(
     history = fit_autoencoder(
         model=model,
         train_loader=train_loader,
-        val_loader=val_loader,
+        val_loader=val_normal_loader,   # early stopping on val_normal only
         epochs=epochs,
         learning_rate=lr,
         weight_decay=weight_decay,
@@ -175,9 +181,8 @@ def train_single_seed(
     train_time_sec = time.time() - start_time
     best_epoch = history.get("best_epoch", 0) if history else 0
 
-    # --- Calibrate threshold on validation (normal only) ---
-    val_errors, _ = _compute_errors(model, val_loader, dev)
-    threshold = percentile_threshold(val_errors, 99.0)
+    # --- Use pre-calibrated threshold from Stage 2 (find_optimal_threshold) ---
+    # No percentile computation here -- threshold is passed as parameter.
 
     # --- Evaluate on test (normal + anomaly) ---
     test_normal_errors, _ = _compute_errors(model, test_normal_loader, dev)
@@ -211,7 +216,7 @@ def train_single_seed(
         "test_recall": round(test_metrics["recall"], 6),
         "threshold": round(float(threshold), 6),
         "n_train_windows": len(train_loader.dataset),
-        "n_val_windows": len(val_loader.dataset),
+        "n_val_windows": len(val_normal_loader.dataset),
         "n_test_normal_windows": len(test_normal_loader.dataset),
         "n_test_anomaly_windows": len(test_anomaly_loader.dataset),
     }
@@ -248,7 +253,7 @@ def run_final_training(
 
     if max_epochs is not None:
         config["training"]["epochs"] = max_epochs
-        logger.info("Overriding training.epochs → %d (max-epochs)", max_epochs)
+        logger.info("Overriding training.epochs -> %d (max-epochs)", max_epochs)
 
     reports_dir = Path(get_param(config, "paths.reports", "reports/"))
     ckpt_dir = reports_dir / "checkpoints"
@@ -262,12 +267,20 @@ def run_final_training(
     # Read model HP for logging
     window_size = int(get_param(config, "model.window_size", 16))
     latent_dim = int(get_param(config, "model.latent_dim", 16))
-    enc_channels = list(get_param(config, "model.encoder.conv_channels", [128, 64]))
+    enc_channels = list(get_param(config, "model.encoder.conv_channels", [64, 32, 16]))
+
+    # Read pre-calibrated threshold from Stage 2
+    threshold = get_param(config, "model.threshold", None)
+    if threshold is None:
+        logger.error("No threshold found in params_validated_ae.yaml (model.threshold).")
+        logger.error("Run Stage 2 first: python -m src.validation.select_threshold")
+        raise ValueError("model.threshold not found in config. Run Stage 2 (select_threshold) first.")
 
     logger.info("=" * 60)
-    logger.info("Fase 3.2 — Final AE Training")
+    logger.info("Fase 3.2 -- Final AE Training")
     logger.info("HP_AE_best: W=%d, latent_dim=%d, encoder_channels=%s",
                 window_size, latent_dim, enc_channels)
+    logger.info("Calibrated threshold: %.6f (from Stage 2)", float(threshold))
     logger.info("Nested validation: %d seeds %s", len(seeds), seeds)
     logger.info("=" * 60)
 
@@ -277,7 +290,8 @@ def run_final_training(
         # Save checkpoint only for the first seed (the baseline)
         save_ckpt = str(checkpoint_path) if i == 0 else None
 
-        result = train_single_seed(config, seed, checkpoint_path=save_ckpt, device=device)
+        result = train_single_seed(config, seed, threshold=float(threshold),
+                                   checkpoint_path=save_ckpt, device=device)
         all_results.append(result)
 
     # --- Write metrics CSV ---
@@ -293,16 +307,16 @@ def run_final_training(
         for row in all_results:
             writer.writerow({col: row.get(col, "") for col in csv_columns})
 
-    # --- Compute mean ± std ---
+    # --- Compute mean +/- std ---
     pr_aucs = [r["test_pr_auc"] for r in all_results]
     f1s = [r["test_f1"] for r in all_results]
     roc_aucs = [r["test_roc_auc"] for r in all_results]
 
     logger.info("=" * 60)
-    logger.info("FINAL METRICS (mean ± std over %d seeds)", len(seeds))
-    logger.info("  PR-AUC:  %.4f ± %.4f", float(np.mean(pr_aucs)), float(np.std(pr_aucs)))
-    logger.info("  ROC-AUC: %.4f ± %.4f", float(np.mean(roc_aucs)), float(np.std(roc_aucs)))
-    logger.info("  F1:      %.4f ± %.4f", float(np.mean(f1s)), float(np.std(f1s)))
+    logger.info("FINAL METRICS (mean +/- std over %d seeds)", len(seeds))
+    logger.info("  PR-AUC:  %.4f +/- %.4f", float(np.mean(pr_aucs)), float(np.std(pr_aucs)))
+    logger.info("  ROC-AUC: %.4f +/- %.4f", float(np.mean(roc_aucs)), float(np.std(roc_aucs)))
+    logger.info("  F1:      %.4f +/- %.4f", float(np.mean(f1s)), float(np.std(f1s)))
     logger.info("=" * 60)
     logger.info("Checkpoint: %s", checkpoint_path)
     logger.info("Metrics:    %s", metrics_path)
@@ -318,12 +332,12 @@ def run_final_training(
                          "n_test_normal_windows", "n_test_anomaly_windows"])
         # Write summary row
         summary_row = {
-            "seed": "MEAN±STD",
-            "train_time_sec": f"{float(np.mean([r['train_time_sec'] for r in all_results])):.2f} ± {float(np.std([r['train_time_sec'] for r in all_results])):.2f}",
-            "best_epoch": f"{float(np.mean([r['best_epoch'] for r in all_results])):.1f} ± {float(np.std([r['best_epoch'] for r in all_results])):.1f}",
-            "test_pr_auc": f"{float(np.mean(pr_aucs)):.4f} ± {float(np.std(pr_aucs)):.4f}",
-            "test_roc_auc": f"{float(np.mean(roc_aucs)):.4f} ± {float(np.std(roc_aucs)):.4f}",
-            "test_f1": f"{float(np.mean(f1s)):.4f} ± {float(np.std(f1s)):.4f}",
+            "seed": "MEAN+/-STD",
+            "train_time_sec": f"{float(np.mean([r['train_time_sec'] for r in all_results])):.2f} +/- {float(np.std([r['train_time_sec'] for r in all_results])):.2f}",
+            "best_epoch": f"{float(np.mean([r['best_epoch'] for r in all_results])):.1f} +/- {float(np.std([r['best_epoch'] for r in all_results])):.1f}",
+            "test_pr_auc": f"{float(np.mean(pr_aucs)):.4f} +/- {float(np.std(pr_aucs)):.4f}",
+            "test_roc_auc": f"{float(np.mean(roc_aucs)):.4f} +/- {float(np.std(roc_aucs)):.4f}",
+            "test_f1": f"{float(np.mean(f1s)):.4f} +/- {float(np.std(f1s)):.4f}",
         }
         writer.writerow([summary_row.get(col, "") for col in csv_columns])
 

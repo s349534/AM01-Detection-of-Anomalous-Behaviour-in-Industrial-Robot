@@ -6,7 +6,7 @@ Usage:
 
 Actions:
     1. Read the validation results CSV
-    2. Select HP_AE_best (max best_val_pr_auc, tie-break best_val_f1, then best_epoch)
+    2. Select HP_AE_best (max val_pr_auc, tie-break val_roc_auc, then best_epoch)
     3. Generate 3 sensitivity plots
     4. Write config/params_validated_ae.yaml with the best parameters
 """
@@ -33,7 +33,6 @@ logger = logging.getLogger(__name__)
 SENSITIVITY_SPECS = [
     ("W", "ae_W", "Sensitivity to Window Size (W)", "Window Size (timesteps)"),
     ("latent_dim", "ae_latent_dim", "Sensitivity to Latent Dimension", "Latent Dimension"),
-    ("encoder_channels", "ae_encoder_channels", "Sensitivity to Encoder Channels", "Encoder Channels"),
 ]
 
 
@@ -63,7 +62,7 @@ def get_default_params_path() -> Path:
 def load_results_csv(csv_path: Path) -> list[dict[str, Any]]:
     """Load validation results from CSV.
 
-    Returns a list of dicts, skipping failure rows (best_val_pr_auc == -1).
+    Returns a list of dicts, skipping failure rows (val_pr_auc == -1).
     """
     rows: list[dict[str, Any]] = []
     with open(csv_path, "r", newline="", encoding="utf-8") as f:
@@ -73,13 +72,13 @@ def load_results_csv(csv_path: Path) -> list[dict[str, Any]]:
                 row["run_id"] = int(row["run_id"])
                 row["W"] = int(row["W"])
                 row["latent_dim"] = int(row["latent_dim"])
-                row["best_val_pr_auc"] = float(row["best_val_pr_auc"])
-                row["best_val_f1"] = float(row["best_val_f1"])
+                row["val_roc_auc"] = float(row["val_roc_auc"])
+                row["val_pr_auc"] = float(row["val_pr_auc"])
                 row["best_epoch"] = int(row["best_epoch"])
                 row["train_time_sec"] = float(row["train_time_sec"])
                 row["seed"] = int(row["seed"])
                 # Skip failed runs
-                if row["best_val_pr_auc"] < 0 or row["best_val_f1"] < 0:
+                if row["val_pr_auc"] < 0 or row["val_roc_auc"] < 0:
                     logger.warning("Skipping failed run_id=%d", row["run_id"])
                     continue
                 rows.append(row)
@@ -96,16 +95,16 @@ def select_best_config(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Select HP_AE_best per §4.8.8.
 
     Selection criteria (in order):
-        1. best_val_pr_auc (max)
-        2. best_val_f1 (max, tie-break)
+        1. val_pr_auc (max) — primary metric, threshold-free
+        2. val_roc_auc (max) — tie-break
         3. best_epoch (min, prefers faster convergence)
 
     Returns the best row dict.
     """
     best = max(rows, key=lambda r: (
-        r["best_val_pr_auc"],      # primary: PR-AUC
-        r["best_val_f1"],          # tie-break 1: F1
-        -r["best_epoch"],          # tie-break 2: fewer epochs (negated for max)
+        r["val_pr_auc"],        # primary: PR-AUC (threshold-free)
+        r["val_roc_auc"],       # tie-break 1: ROC-AUC
+        -r["best_epoch"],       # tie-break 2: fewer epochs (negated for max)
     ))
     return best
 
@@ -139,7 +138,7 @@ def generate_sensitivity_plots(
         groups: dict[Any, list[float]] = defaultdict(list)
         for row in rows:
             key = row[hparam_col]
-            groups[key].append(row["best_val_pr_auc"])
+            groups[key].append(row["val_pr_auc"])
 
         if not groups:
             logger.warning("No data for %s, skipping plot", hparam_col)
@@ -187,7 +186,8 @@ def write_validated_params(best_row: dict[str, Any], base_config: dict, output_p
     """Write params_validated_ae.yaml with the best hyperparameters.
 
     Merges the best config into the base params.yaml structure, overriding
-    only the validated HPs.
+    only the validated HPs: W (window_size), latent_dim, and threshold (to be
+    filled later by Stage 2 select_threshold.py).
 
     Parameters
     ----------
@@ -199,13 +199,16 @@ def write_validated_params(best_row: dict[str, Any], base_config: dict, output_p
         Output YAML file path.
     """
     import copy
+
     validated = copy.deepcopy(base_config)
 
-    # Override validated hyperparameters
+    # Override validated hyperparameters (Stage 1: model selection)
     w_val = best_row["W"]
     validated["model"]["window_size"] = w_val
     validated["model"]["latent_dim"] = best_row["latent_dim"]
-    validated["model"]["encoder"]["conv_channels"] = eval(best_row["encoder_channels"])  # noqa: S306
+
+    # Threshold placeholder - filled by Stage 2 (select_threshold.py)
+    validated["model"]["threshold"] = None
 
     # Sincronizza anche data.window_size con model.window_size (§4.8.2)
     if "data" in validated and "window_size" in validated["data"]:
@@ -219,13 +222,11 @@ def write_validated_params(best_row: dict[str, Any], base_config: dict, output_p
         yaml.dump(validated, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
     logger.info("Wrote validated params to %s", output_path)
-    # Usa .get() con fallback per gestire best_row parziale (es. test programmatici)
     logger.info(
-        "Best config: W=%s, latent_dim=%s, channels=%s, pr_auc=%.4f, f1=%.4f",
+        "Best config: W=%s, latent_dim=%s, val_roc_auc=%.4f, val_pr_auc=%.4f",
         best_row.get("W", "?"), best_row.get("latent_dim", "?"),
-        best_row.get("encoder_channels", "?"),
-        float(best_row.get("best_val_pr_auc", 0.0)),
-        float(best_row.get("best_val_f1", 0.0)),
+        float(best_row.get("val_roc_auc", 0.0)),
+        float(best_row.get("val_pr_auc", 0.0)),
     )
 
 
@@ -280,18 +281,18 @@ def run_analysis(
     for row in rows:
         flag = " <-- BEST" if row == best_row else ""
         logger.info(
-            "  Run %2d | W=%-2d latent=%-2d channels=%-15s | "
-            "pr_auc=%.4f f1=%.4f epoch=%-3d%s",
-            row["run_id"], row["W"], row["latent_dim"], row["encoder_channels"],
-            row["best_val_pr_auc"], row["best_val_f1"], row["best_epoch"], flag,
+            "  Run %2d | W=%-2d latent=%-2d | "
+            "roc_auc=%.4f pr_auc=%.4f epoch=%-3d%s",
+            row["run_id"], row["W"], row["latent_dim"],
+            row["val_roc_auc"], row["val_pr_auc"], row["best_epoch"], flag,
         )
     logger.info("=" * 60)
     logger.info(
-        "HP_AE_best: W=%d, latent_dim=%d, encoder_channels=%s",
-        best_row["W"], best_row["latent_dim"], best_row["encoder_channels"],
+        "HP_AE_best: W=%d, latent_dim=%d",
+        best_row["W"], best_row["latent_dim"],
     )
-    logger.info("  best_val_pr_auc = %.4f", best_row["best_val_pr_auc"])
-    logger.info("  best_val_f1    = %.4f", best_row["best_val_f1"])
+    logger.info("  val_roc_auc = %.4f", best_row["val_roc_auc"])
+    logger.info("  val_pr_auc  = %.4f", best_row["val_pr_auc"])
     logger.info("=" * 60)
 
     # --- Generate plots ---

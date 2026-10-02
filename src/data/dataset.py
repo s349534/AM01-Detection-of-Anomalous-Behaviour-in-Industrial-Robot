@@ -129,26 +129,33 @@ def build_datasets(
 ) -> dict[str, torch.utils.data.DataLoader]:
     """Load processed .npy files and create DataLoaders for train/val/test.
 
-    Reads ``train.npy``, ``val.npy``, ``test_normal.npy``,
-    ``test_anomaly.npy`` from ``processed_dir``.  ``train`` is shuffled;
-    ``val`` and ``test`` are not.  The ``test`` loader concatenates
-    ``test_normal`` (label 0) and ``test_anomaly`` (label 1) via
-    ``ConcatDataset`` so evaluation runs in a single pass.
+    Reads the 5-file temporal split from ``processed_dir``:
+    ``train.npy``, ``val_normal.npy``, ``val_anomaly.npy``,
+    ``test_normal.npy``, ``test_anomaly.npy``.
+
+    ``train`` is shuffled; ``val_*`` and ``test`` are not.
+    The ``val`` loader concatenates ``val_normal`` (label 0) and
+    ``val_anomaly`` (label 1) via ``ConcatDataset``.
+    The ``test`` loader concatenates ``test_normal`` (label 0) and
+    ``test_anomaly`` (label 1) via ``ConcatDataset``.
     """
     from torch.utils.data import ConcatDataset, DataLoader
 
     processed_dir = Path(processed_dir)
 
     train_data = np.load(processed_dir / "train.npy")
-    val_data = np.load(processed_dir / "val.npy")
+    val_normal_data = np.load(processed_dir / "val_normal.npy")
+    val_anomaly_data = np.load(processed_dir / "val_anomaly.npy")
     test_normal_data = np.load(processed_dir / "test_normal.npy")
     test_anomaly_data = np.load(processed_dir / "test_anomaly.npy")
 
     train_ds = KukaDataset(train_data, window_size, stride, label=0)
-    val_ds = KukaDataset(val_data, window_size, stride, label=0)
+    val_normal_ds = KukaDataset(val_normal_data, window_size, stride, label=0)
+    val_anomaly_ds = KukaDataset(val_anomaly_data, window_size, stride, label=1)
     test_normal_ds = KukaDataset(test_normal_data, window_size, stride, label=0)
     test_anomaly_ds = KukaDataset(test_anomaly_data, window_size, stride, label=1)
 
+    val_ds = ConcatDataset([val_normal_ds, val_anomaly_ds])
     test_ds = ConcatDataset([test_normal_ds, test_anomaly_ds])
 
     loaders: dict[str, DataLoader] = {

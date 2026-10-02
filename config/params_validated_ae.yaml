@@ -22,9 +22,9 @@ logging:
 model:
   name: adversarial_autoencoder
   input_dim: 82
-  window_size: 32
+  window_size: 16
   encoding_dim: 32
-  latent_dim: 16
+  latent_dim: 8
   encoder:
     conv_channels:
     - 64
@@ -36,13 +36,12 @@ model:
     - 3
     pool_size: 2
     activation: relu
-  # decoder is auto-derived from encoder conv_channels (reversed)
-  # no separate decoder configuration needed
   discriminator:
     hidden_layers:
     - 32
     - 16
     activation: leaky_relu
+  threshold: 0.137498
 training:
   batch_size: 256
   epochs: 100
@@ -53,20 +52,26 @@ training:
   num_workers: 4
   adversarial_weight: 0.1
   reconstruction_weight: 1.0
-  loss: "mae"                    # MAE: robusta a feature saturo (vedi §7 #9)
-  reconstruction_metric: "mae"   # metrica per anomaly scoring
-
+  loss: mae
+  reconstruction_metric: mae
   early_stopping:
     patience: 10
     min_delta: 0.0001
-  train_split: 0.6
-  val_split: 0.2
+  train_split: 0.7
+  val_split: 0.15
+  slow_val_split: 0.5
 data:
   normal_data_path: data/raw/KukaNormal.npy
   slow_data_path: data/raw/KukaSlow.npy
   column_names_path: data/raw/KukaColumnNames.npy
-  window_size: 32
+  window_size: 16
   window_stride: 1
   drop_incomplete: true
   normalization: standard
   augmentation: false
+validation:
+  threshold_run_id: 1
+  threshold_calibrated_at: '2026-10-02T14:47:10.100344+00:00'
+  val_roc_auc: 0.316332
+  val_pr_auc: 0.269922
+  source_csv: reports\tables\validation_results_ae.csv

@@ -104,7 +104,7 @@ def load_kuka_data(
         indices = np.where(one_only_mask)[0]
         names = [str(col_names[i]) for i in indices]
         warnings.warn(
-            f"Feature(s) constant in KukaNormal but NOT in KukaSlow — kept: {names}. "
+            f"Feature(s) constant in KukaNormal but NOT in KukaSlow -- kept: {names}. "
             "They may be discriminative between normal and anomalous behaviour.",
             UserWarning,
         )
@@ -116,7 +116,7 @@ def load_kuka_data(
         indices = np.where(one_only_mask_2)[0]
         names = [str(col_names[i]) for i in indices]
         warnings.warn(
-            f"Feature(s) constant in KukaSlow but NOT in KukaNormal — kept: {names}.",
+            f"Feature(s) constant in KukaSlow but NOT in KukaNormal -- kept: {names}.",
             UserWarning,
         )
 
@@ -129,7 +129,7 @@ def load_kuka_data(
     selected_col_names = col_names[keep_indices]
 
     logger.info(
-        "After removing %d constant features → normal=%s, slow=%s",
+        "After removing %d constant features -> normal=%s, slow=%s",
         constant_indices.size, normal.shape, slow.shape,
     )
 
@@ -279,7 +279,7 @@ def normalize_data(
     # --- Assertions: val/test are NOT zero-mean (proves no leakage) ---
     val_mean_abs = np.abs(scaled["val_normal"].mean(axis=0)).max()
     assert val_mean_abs > 1e-3, (
-        f"Val mean ≈ 0 — possible scaler leakage (max abs mean={val_mean_abs})"
+        f"Val mean ~= 0 -- possible scaler leakage (max abs mean={val_mean_abs})"
     )
 
     return scaled, scaler

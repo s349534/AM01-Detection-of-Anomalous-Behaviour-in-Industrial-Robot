@@ -3,23 +3,21 @@
 This module provides :func:`train_and_evaluate_ae`, the atomic unit invoked by
 ``run_search_ae.py`` for each sampled hyperparameter configuration.
 
-Workflow per run:
+Workflow per run (Stage 1 - Model Selection):
     1. Set seed for reproducibility
-    2. Build DataLoaders from processed .npy files (5 separate loaders)
+    2. Build DataLoaders from processed .npy files (3 loaders: train, val_normal, val_anomaly)
     3. Instantiate ``SequenceAutoencoder`` from config
     4. Train with early stopping on validation normal reconstruction loss
     5. Compute reconstruction errors on val_normal + val_anomaly (HP selection set)
-    6. Calibrate threshold (99th percentile on val_normal) and compute PR-AUC/ROC-AUC/F1 on validation
-    7. Evaluate on test set (normal + anomaly) for final report only
-    8. Return dict matching CSV format §4.8.8 with best_val_pr_auc from validation set
+    6. Compute ROC-AUC and PR-AUC on validation (threshold-free, no binarization)
+    7. Save raw errors + labels to .npz for Stage 2 threshold calibration
+    8. Return dict with val_roc_auc, val_pr_auc, errors_file (no test metrics, no threshold)
 
 Validation set composition (HP selection):
-    - val_normal: 15% of KukaNormal (early stopping + threshold calibration)
-    - val_anomaly: 50% of KukaSlow (anomalies for PR-AUC calculation)
+    - val_normal: 15% of KukaNormal (early stopping)
+    - val_anomaly: 50% of KukaSlow (anomalies for AUC calculation)
 
-Test set composition (final report only):
-    - test_normal: 15% of KukaNormal
-    - test_anomaly: 50% of KukaSlow
+Test set is NOT accessed in this stage.
 """
 from __future__ import annotations
 
@@ -35,12 +33,7 @@ from torch.utils.data import DataLoader
 from src.data.dataset import KukaDataset
 from src.models.autoencoder import SequenceAutoencoder, fit_autoencoder
 from src.utils.config import get_param
-from src.utils.metrics import (
-    calculate_auc,
-    calculate_metrics,
-    compute_anomaly_scores,
-    percentile_threshold,
-)
+from src.utils.metrics import calculate_auc
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +72,7 @@ def _build_val_normal_loader(
     batch_size: int,
     num_workers: int = 0,
 ) -> DataLoader:
-    """Build a DataLoader for the validation normal set (early stopping + threshold)."""
+    """Build a DataLoader for the validation normal set (early stopping)."""
     val_data = np.load(processed_dir / "val_normal.npy")
     val_ds = KukaDataset(val_data, window_size=window_size, label=0)
     return DataLoader(
@@ -98,34 +91,6 @@ def _build_val_anomaly_loader(
     val_ds = KukaDataset(val_data, window_size=window_size, label=1)
     return DataLoader(
         val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False
-    )
-
-
-def _build_test_normal_loader(
-    processed_dir: Path,
-    window_size: int,
-    batch_size: int,
-    num_workers: int = 0,
-) -> DataLoader:
-    """Build a DataLoader for the test normal set (final report only)."""
-    test_data = np.load(processed_dir / "test_normal.npy")
-    test_ds = KukaDataset(test_data, window_size=window_size, label=0)
-    return DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False
-    )
-
-
-def _build_test_anomaly_loader(
-    processed_dir: Path,
-    window_size: int,
-    batch_size: int,
-    num_workers: int = 0,
-) -> DataLoader:
-    """Build a DataLoader for the test anomaly set (final report only)."""
-    test_data = np.load(processed_dir / "test_anomaly.npy")
-    test_ds = KukaDataset(test_data, window_size=window_size, label=1)
-    return DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False
     )
 
 
@@ -224,12 +189,15 @@ def train_and_evaluate_ae(
     run_id: int = 0,
     seed: int = 42,
     max_val_epochs: int | None = None,
-    threshold_percentile: float = 99.0,
     device: str | torch.device | None = None,
     patience: int | None = None,
     num_workers: int = 0,
 ) -> dict[str, Any]:
-    """Train a single AE configuration and evaluate on validation + test.
+    """Train a single AE configuration and evaluate on validation (Stage 1).
+
+    This is the Model Selection stage: computes ROC-AUC and PR-AUC on
+    val_normal + val_anomaly WITHOUT any threshold. Saves raw errors+labels
+    to .npz for Stage 2 threshold calibration.
 
     Parameters
     ----------
@@ -245,9 +213,6 @@ def train_and_evaluate_ae(
     max_val_epochs : int or None
         Max epochs for this validation run.  Defaults to
         ``DEFAULT_VAL_EPOCHS``.
-    threshold_percentile : float
-        Percentile of validation (normal) errors used as decision threshold.
-        Default 99 → ~1% FPR on normal data.
     device : str | torch.device | None
         Device to train/evaluate on. ``None`` → auto-detect.
     patience : int or None
@@ -259,21 +224,21 @@ def train_and_evaluate_ae(
     Returns
     -------
     dict
-        Result row matching CSV format §4.8.8::
+        Result row for CSV (Stage 1 format)::
 
             {
                 "run_id": int,
                 "W": int,
                 "latent_dim": int,
-                "encoder_channels": str,   # e.g. "[128, 64]"
-                "best_val_pr_auc": float,  # PR-AUC on validation set (HP selection)
-                "best_val_f1": float,
+                "val_roc_auc": float,   # ROC-AUC on validation (threshold-free)
+                "val_pr_auc": float,    # PR-AUC on validation (threshold-free)
                 "best_epoch": int,
                 "train_time_sec": float,
                 "seed": int,
+                "errors_file": str,     # path to .npz with raw errors+labels
             }
 
-        Plus a ``_test_metrics`` dict with extended metrics (not written to CSV).
+        No test metrics, no threshold, no F1.
     """
     _set_seed(seed)
 
@@ -284,7 +249,7 @@ def train_and_evaluate_ae(
     # --- Extract hyperparameters from config ---
     window_size = int(get_param(config, "model.window_size", 16))
     latent_dim = int(get_param(config, "model.latent_dim", 16))
-    enc_channels = tuple(get_param(config, "model.encoder.conv_channels", [128, 64]))
+    enc_channels = tuple(get_param(config, "model.encoder.conv_channels", [64, 32, 16]))
     batch_size = int(get_param(config, "training.batch_size", 256))
     epochs = max_val_epochs or int(get_param(config, "training.epochs", DEFAULT_VAL_EPOCHS))
     lr = float(get_param(config, "training.learning_rate", 1e-3))
@@ -303,12 +268,10 @@ def train_and_evaluate_ae(
         run_id, seed, window_size, latent_dim, list(enc_channels), epochs,
     )
 
-    # --- Build dataloaders (5 separate loaders) ---
+    # --- Build dataloaders (3 loaders only: train, val_normal, val_anomaly) ---
     train_loader = _build_train_loader(processed_dir, window_size, batch_size, num_workers)
     val_normal_loader = _build_val_normal_loader(processed_dir, window_size, batch_size, num_workers)
     val_anomaly_loader = _build_val_anomaly_loader(processed_dir, window_size, batch_size, num_workers)
-    test_normal_loader = _build_test_normal_loader(processed_dir, window_size, batch_size, num_workers)
-    test_anomaly_loader = _build_test_anomaly_loader(processed_dir, window_size, batch_size, num_workers)
 
     # --- Instantiate model ---
     model = SequenceAutoencoder.from_config(config)
@@ -336,78 +299,50 @@ def train_and_evaluate_ae(
     train_time_sec = time.time() - start_time
     best_epoch = history.get("best_epoch", 0) if history else 0
 
-    # --- HP Selection: Threshold + Metrics on Validation (val_normal + val_anomaly) ---
+    # --- HP Selection: ROC-AUC + PR-AUC on Validation (val_normal + val_anomaly) ---
+    # Compute errors separately (no labels needed from these loaders)
     val_normal_errors = _compute_errors_for_loader(model, val_normal_loader, dev, metric=metric)
     val_anomaly_errors = _compute_errors_for_loader(model, val_anomaly_loader, dev, metric=metric)
 
-    # Threshold: 99th percentile ONLY on val_normal
-    threshold = percentile_threshold(val_normal_errors, threshold_percentile)
-
-    # Combine for metrics (known order: normals first, then anomalies)
+    # Concatenate errors and create labels (0 = normal, 1 = anomaly)
     val_errors = np.concatenate([val_normal_errors, val_anomaly_errors])
     val_labels = np.concatenate([
-        np.zeros(len(val_normal_errors)),
-        np.ones(len(val_anomaly_errors))
+        np.zeros(len(val_normal_errors), dtype=np.int32),
+        np.ones(len(val_anomaly_errors), dtype=np.int32)
     ])
 
-    val_auc = calculate_auc(val_labels, val_errors)           # PR-AUC, ROC-AUC for HP selection
-    val_pred = compute_anomaly_scores(val_errors, threshold)
-    val_metrics = calculate_metrics(val_labels, val_pred)      # F1, precision, recall
+    # Compute AUC metrics (threshold-free: no binarization, no fixed threshold)
+    val_auc = calculate_auc(val_labels, val_errors)   # returns {"roc_auc": ..., "pr_auc": ...}
 
-    # --- Final Test (report only, NEVER used for HP selection) ---
-    test_normal_errors = _compute_errors_for_loader(model, test_normal_loader, dev, metric=metric)
-    test_anomaly_errors = _compute_errors_for_loader(model, test_anomaly_loader, dev, metric=metric)
-
-    test_errors = np.concatenate([test_normal_errors, test_anomaly_errors])
-    test_labels = np.concatenate([
-        np.zeros(len(test_normal_errors)),
-        np.ones(len(test_anomaly_errors))
-    ])
-
-    test_auc = calculate_auc(test_labels, test_errors)
-    test_pred = compute_anomaly_scores(test_errors, threshold)
-    test_metrics = calculate_metrics(test_labels, test_pred)
+    # --- Save raw errors + labels for Stage 2 threshold calibration ---
+    errors_dir = Path("reports/errors")
+    errors_dir.mkdir(parents=True, exist_ok=True)
+    errors_filename = f"ae_errors_run{run_id}_seed{seed}_W{window_size}_latent{latent_dim}.npz"
+    errors_path = errors_dir / errors_filename
+    np.savez_compressed(errors_path, errors=val_errors, labels=val_labels)
+    logger.info("Saved validation errors to %s", errors_path)
 
     # --- Cleanup temp checkpoint ---
     if ckpt_path.exists():
         ckpt_path.unlink()
 
     logger.info(
-        "Run %d done: val_pr_auc=%.4f, val_f1=%.4f, val_roc_auc=%.4f, "
-        "test_pr_auc=%.4f, test_f1=%.4f, test_roc_auc=%.4f, time=%.1fs",
+        "Run %d done: val_roc_auc=%.4f, val_pr_auc=%.4f, best_epoch=%d, time=%.1fs",
         run_id,
-        val_auc["pr_auc"], val_metrics["f1"], val_auc["roc_auc"],
-        test_auc["pr_auc"], test_metrics["f1"], test_auc["roc_auc"],
-        train_time_sec,
+        val_auc["roc_auc"], val_auc["pr_auc"], best_epoch, train_time_sec,
     )
 
-    # --- Return result row (matches CSV format §4.8.8) ---
-    # best_val_pr_auc now comes from VALIDATION set (not test!)
+    # --- Return result row (Stage 1 CSV format) ---
     result: dict[str, Any] = {
         "run_id": run_id,
         "W": window_size,
         "latent_dim": latent_dim,
-        "encoder_channels": str(list(enc_channels)),
-        "best_val_pr_auc": round(val_auc["pr_auc"], 6),       # HP selection metric
-        "best_val_f1": round(val_metrics["f1"], 6),
+        "val_roc_auc": round(val_auc["roc_auc"], 6),
+        "val_pr_auc": round(val_auc["pr_auc"], 6),
         "best_epoch": best_epoch,
         "train_time_sec": round(train_time_sec, 2),
         "seed": seed,
-    }
-
-    # Extended metrics for analysis (not written to the search CSV)
-    result["_test_metrics"] = {
-        "roc_auc": test_auc["roc_auc"],
-        "pr_auc": test_auc["pr_auc"],
-        "accuracy": test_metrics["accuracy"],
-        "precision": test_metrics["precision"],
-        "recall": test_metrics["recall"],
-        "f1": test_metrics["f1"],
-        "threshold": float(threshold),
-        "val_mean_error": float(np.mean(val_normal_errors)),
-        "val_std_error": float(np.std(val_normal_errors)),
-        "test_normal_mean_error": float(test_normal_errors.mean()),
-        "test_anomaly_mean_error": float(test_anomaly_errors.mean()),
+        "errors_file": str(errors_path),
     }
 
     return result

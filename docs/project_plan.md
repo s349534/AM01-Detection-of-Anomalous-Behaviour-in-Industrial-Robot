@@ -188,20 +188,27 @@ non può esplorare lo spazio di ricerca.
 
 #### **Fase 3.1 — Validazione AE**
 **Obiettivo**: identificare `HP_AE_best` tramite random search vincolato
-(spazio in §4.8).
+(spazio in §4.8), seguito da calibrazione della soglia operativa.
 
-- Esecuzione: `python -m src.validation.run_search_ae --n-iter 20 --seed 42`.
-- Output: `reports/tables/validation_results_ae.csv`.
-- Analisi: `python -m src.validation.analyze_results` → 3 grafici di
-  sensitività (`sensitivity_ae_*.png`).
-- Selezione: riga con `best_val_pr_auc` massimo (vedi §4.8.8).
-- Output finale: `config/params_validated_ae.yaml`.
+Pipeline a **tre stadi separati**:
 
-> **Nota sul flusso validation**: Ogni run esegue:
-> 1. Training su `train` (70% normali) con early stopping su `val_normal` (15% normali)
-> 2. HP selection: soglia (99° percentile su `val_normal`) + PR-AUC/ROC-AUC/F1 su `val_normal` + `val_anomaly` (15% normali + 50% slow)
-> 3. Test finale: metriche su `test_normal` + `test_anomaly` (15% normali + 50% slow) — **solo per report, mai per HP selection**
-> 4. `best_val_pr_auc` proviene dal validation set (NON dal test set come in versioni precedenti)
+- **Stage 1 (Model Selection):** `python -m src.validation.run_search_ae --n-iter 20 --seed 42 --no-resume`
+  - Per ogni config: training su `train` (70% normali) con early stopping su `val_normal` (15% normali)
+  - HP selection: **solo ROC-AUC e PR-AUC** su `val_normal` + `val_anomaly` (threshold-free)
+  - Nessun accesso al test set, nessuna soglia fissata, nessun F1 calcolato
+  - Output: `reports/tables/validation_results_ae.csv` + `reports/errors/ae_errors_run_*.npz`
+  - Selezione: riga con `val_pr_auc` massimo, tie-break `val_roc_auc`, poi `best_epoch`
+
+- **Stage 1b (Analysis):** `python -m src.validation.analyze_results` → grafici di sensitività
+  - Output: `config/params_validated_ae.yaml` con `W`, `latent_dim`, `model.threshold: null`
+
+- **Stage 2 (Threshold Calibration):** `python -m src.validation.select_threshold`
+  - Su sola configurazione vincente: trova soglia che massimizza F1 via `find_optimal_threshold`
+  - Aggiorna `config/params_validated_ae.yaml` con `model.threshold`
+
+> **Nota sull'architettura fissa**: l'encoder (canali 64/32/16, 3 layer) è fissato e
+> **non** è un iperparametro di ricerca — non appare nel CSV né in `params_validated_ae.yaml`
+> come colonna. Appare solo come configurazione fissa in `params.yaml`.
 
 #### **Fase 3.2 — Training finale AE**
 **Obiettivo**: addestrare il modello definitivo con `HP_AE_best`.
@@ -513,11 +520,41 @@ sovrastavano le anomalie vere.
 > accuracy altissima ma F1=0).
 
 ### 4.7 Scelta della soglia
-- **Soglia primaria**: 99° percentile dell'errore di ricostruzione sul
-  validation set (garantisce FPR ≈ 1% in condizioni normali).
-- **Soglia alternativa**: soglia che massimizza F1 sul validation set
-  (ottimistica, da usare come upper bound).
-- **Soglie da confrontare** per mostrare il trade-off operazionale.
+La scelta della soglia operativa è divise in **tre stadi separati**:
+
+**Stadio 1 — Selezione configurazione (senza soglia):**
+Per ogni combinazione di iperparametri (W, latent_dim) provata nella ricerca,
+il modello viene addestrato con early stopping su `val_normal` e valutato
+calcolando **esclusivamente ROC-AUC e PR-AUC** su `val_normal` + `val_anomaly`
+concatenati. Queste metriche sono **threshold-free**: valutano il ranking
+degli score continui (errori di ricostruzione) senza binarizzare. Nessun
+accesso al test set durante la ricerca. La configurazione vincente si sceglie
+da (PR-AUC, ROC-AUC, best_epoch).
+
+**Stadio 2 — Calibrazione soglia (solo sulla configurazione vincente):**
+Una sola volta, sulla configurazione scelta dallo Stadio 1, la funzione
+`find_optimal_threshold(y_true, scores)` da `src/utils/metrics.py` cerca
+tra **tutti i valori di errore osservati** (e i loro punti medi) quello che
+massimizza l'F1. Questo è diverso da una ricerca su percentili prefissati:
+prova ogni valore reale come candidato soglia, non un intervallo ridotto.
+La soglia trovata viene scritta in `config/params_validated_ae.yaml` (campo
+`model.threshold`). Se la soglia cade nel 2% più basso o più alto degli errori
+osservati, viene emesso un warning (potrebbe indicare povera calibratura).
+
+**Stadio 3 — Valutazione finale:**
+Il training finale (`train_ae.py`) usa la soglia calibrata dallo Stadio 2
+senza ricalcolarla. Le metriche F1/precision/recall sul test set vengono
+calcolate con questa soglia congelata.
+
+**Motivazione della separazione:**
+- AUC (ROC-AUC, PR-AUC) seleziona la configurazione senza dipendere da una
+  soglia arbitraria — la scelta è pura, basata sul ranking.
+- La soglia operativa è un'ipotesi da calibrazione, non da ottimizzazione
+  massiccia. Calcolarla una sola volta sulla configurazione vincente evita
+  di "over-fit" la soglia ad ogni combinazione di iperparametri.
+- Separare i tre stadi rende la pipeline verificabile: ogni fase ha un
+  input e un output ben definiti, e nessun dato di test è mai toccato
+  durante la ricerca o la calibrazione.
 
 ### 4.8 Validazione iperparametri
 
@@ -641,14 +678,16 @@ compatibilità con HPC e parallelizzazione. I notebook sono usati solo per
 ispezione visiva dei CSV.
 
 ```bash
-# AE
+# AE (3-stage pipeline: selection → threshold → training)
 python -m src.validation.run_search_ae --n-iter 20 --seed 42 --no-resume
 python -m src.validation.analyze_results --input validation_results_ae.csv
+python -m src.validation.select_threshold           # NEW: calibrate threshold from best config
 python -m src.models.train_ae --config params_validated_ae.yaml
 
-# AAE
+# AAE (uses AE's threshold + best config; same pipeline structure)
 python -m src.validation.run_search_aae --n-iter 15 --seed 42 --no-resume
 python -m src.validation.analyze_results --input validation_results_aae.csv
+python -m src.validation.select_threshold --input validation_results_aae.csv --params config/params_validated_aae.yaml
 python -m src.models.train_aae --config params_validated_aae.yaml
 ```
 
@@ -684,30 +723,32 @@ Dopo aver selezionato `HP_AAE_best`, si confronta `PR-AUC_AAE` vs
 
 **4.8.8 Formato degli output e criterio di selezione**
 
-`reports/tables/validation_results_ae.csv`:
+`reports/tables/validation_results_ae.csv` (Stage 1 output):
 
 ```csv
-run_id,W,latent_dim,encoder_channels,best_val_pr_auc,best_val_f1,best_epoch,train_time_sec,seed
-1,24,16,[128, 64],0.852,0.781,12,341,42
-2,12,32,[64, 32],0.834,0.762,15,298,42
+run_id,W,latent_dim,val_roc_auc,val_pr_auc,best_epoch,train_time_sec,seed,errors_file
+1,24,16,0.952,0.852,12,341,42,reports/errors/ae_errors_run1_seed43_W24_latent16.npz
+2,12,32,0.918,0.834,15,298,42,reports/errors/ae_errors_run2_seed44_W12_latent32.npz
 ...
 ```
 
-`HP_AE_best` = riga con `best_val_pr_auc` massimo. Tie-break su
-`best_val_f1`, poi `best_epoch` (preferenza per convergenza più rapida).
+Il CSV contiene **solo metriche threshold-free** (val_roc_auc, val_pr_auc) e
+il path al file `.npz` con gli errori grezzi. Non contiene F1, soglia, o
+metriche sul test set. L'architettura encoder (canali 64/32/16) è fissa, non
+è una colonna del CSV.
 
-Stesso formato per `validation_results_aae.csv`, con colonne
-`reconstruction_weight` e `adversarial_weight` al posto di quelle AE.
+`HP_AE_best` = riga con `val_pr_auc` massimo. Tie-break su `val_roc_auc`,
+poi `best_epoch` (preferenza per convergenza più rapida).
 
-Output finali:
-- `reports/tables/validation_results_ae.csv`
-- `reports/tables/validation_results_aae.csv`
-- `reports/figures/sensitivity_ae_W.png`, `sensitivity_ae_latent_dim.png`,
-  `sensitivity_ae_encoder_channels.png`
-- `reports/figures/sensitivity_aae_reconstruction_weight.png`,
-  `sensitivity_aae_adversarial_weight.png`
-- `config/params_validated_ae.yaml`
-- `config/params_validated_aae.yaml`
+`config/params_validated_ae.yaml` (Stage 1b + Stage 2 output):
+- Stage 1b (analyze_results): scritto con `W`, `latent_dim`, `model.threshold: null`
+- Stage 2 (select_threshold): aggiornato con `model.threshold` = valore calibrato
+
+Output finali della validazione AE:
+- `reports/tables/validation_results_ae.csv` (Stage 1)
+- `reports/figures/sensitivity_ae_W.png`, `sensitivity_ae_latent_dim.png` (Stage 1b)
+- `config/params_validated_ae.yaml` (Stage 1b, aggiornato da Stage 2)
+- `reports/errors/ae_errors_run_*_seed_*_W*_latent*.npz` (Stage 1, raw errors)
 
 ---
 
@@ -835,18 +876,24 @@ celle, va spostata in un modulo `.py`.
 - [x] `src/validation/run_search_ae.py` (CLI per N run random, default `--no-resume`)
 - [x] Test 1 run (3-5 epoche) verificata
 
-### Fase 3.1 — Validazione AE (COMPLETATA)
-- [x] `python -m src.validation.run_search_ae --n-iter 20 --seed 42 --no-resume`
-- [x] `reports/tables/validation_results_ae.csv` (20 righe, 50 epoche garantite)
-- [x] `python -m src.validation.analyze_results` → 3 grafici sensitività
-- [x] `config/params_validated_ae.yaml`
-- [x] Selezione `HP_AE_best` (riga con PR-AUC max, vedi §4.8.8)
+### Fase 3.1 — Validazione AE (DA RIESGUIRE)
+- [ ] `python -m src.validation.run_search_ae --n-iter 20 --seed 42 --no-resume`
+  - **NOTA**: pipeline ristrutturata in 3 stadi. CSV ora usa `val_roc_auc`/`val_pr_auc` (senza soglia).
+  - Output: `reports/tables/validation_results_ae.csv` + `reports/errors/ae_errors_run_*.npz`
+- [ ] `python -m src.validation.analyze_results` → 2 grafici sensitività (W, latent_dim — senza encoder_channels)
+- [ ] `python -m src.validation.select_threshold` — **NUOVO**: calibra soglia F1-max sulla best config
+- [ ] `config/params_validated_ae.yaml` (ora include `model.threshold`)
+- [ ] Selezione `HP_AE_best` (riga con val_pr_auc max, tie-break val_roc_auc, poi best_epoch)
+- [x] Articolato in sessione precedente; ristrutturazione pipeline completata in codice
 
-### Fase 3.2 — Training finale AE (COMPLETATA)
-- [x] `python -m src.models.train_ae --config params_validated_ae.yaml`
-- [x] Nested validation (3 run con seed diversi) → media ± std
-- [x] `reports/checkpoints/ae_baseline.pth`
-- [x] `reports/tables/ae_final_metrics.csv`
+### Fase 3.2 — Training finale AE (DA RIESGUIRE)
+- [ ] `python -m src.models.train_ae --config params_validated_ae.yaml`
+  - **NOTA**: usa soglia calibrata da Stage 2 (non più 99° percentile)
+  - **NOTA**: loader `val_normal.npy` + `val_anomaly.npy` (non più `val.npy`)
+- [ ] Nested validation (3 run con seed diversi) → media ± std
+- [ ] `reports/checkpoints/ae_baseline.pth`
+- [ ] `reports/tables/ae_final_metrics.csv`
+- [ ] Artefatti vecchi cancellati, da rigenerare con nuova pipeline
 
 ### Fase 4.0 — Costruzione AAE parametrico
 - [ ] `src/models/adversarial_ae.py` (Discriminator, AdversarialAE)
@@ -1119,3 +1166,52 @@ se `data/processed/train.npy` è mancante (sui script SLURM).
 - `src/validation/run_experiment_ae.py` (5 loader, _compute_errors_for_loader, train_and_evaluate_ae)
 
 **Prossima fase**: Rigenerare processed data e lanciare HP search con nuova logica.
+
+### Sessione 6 — Ristrutturazione pipeline in tre stadi (2°ott2026)
+
+**Problema identificato**: La pipeline di validazione mescolava selezione della configurazione
+e calibrazione della soglia in un unico stadio:
+1. **Soglia arbitraria al 99° percentile** — mai validata, scelta per convenzione
+2. **F1 calcolato ad ogni run** usando soglia arbitraria come tie-break nella selezione HP
+3. **Test set toccato durante ricerca** — calcolo di `_test_metrics` ad ogni run (lavoro sprecato, contatto con test da eliminare)
+
+**Soluzione implementata** (tre stadi separati e sequenziali):
+
+- **Stadio 1 (Model Selection)** — `run_experiment_ae.py`:
+  - Addestramento con early stopping su `val_normal` (invariato)
+  - HP selection: **solo ROC-AUC e PR-AUC** su `val_normal + val_anomaly` (threshold-free)
+  - Nessun test set access, nessuna soglia, nessun F1 durante la ricerca
+  - Salvataggio errori grezzi in `reports/errors/ae_errors_run_*_seed_*_W*_latent*.npz`
+  - CSV: colonne `val_roc_auc`, `val_pr_auc` (rinominate da `best_val_pr_auc`)
+  - Rimozione `encoder_channels` dal CSV (architettura fissa, non HP)
+
+- **Stadio 2 (Threshold Calibration)** — `select_threshold.py` (nuovo script):
+  - Eseguito una sola volta sulla configurazione vincente (non a ogni run)
+  - Usa `find_optimal_threshold()` già esistente in `src/utils/metrics.py:106`
+  - Scrive soglia calibrata in `config/params_validated_ae.yaml` (campo `model.threshold`)
+
+- **Stadio 3 (Final Training)** — `train_ae.py`:
+  - Usa soglia pre-calibrata da `params_validated_ae.yaml` (non riconta il 99° percentile)
+  - Loader `val_normal.npy` + `val_anomaly.npy` (non più `val.npy`)
+  - Rimosso controllo di calibrazione (non richiesto)
+
+**Motivazione della separazione**: AUC (ROC-AUC, PR-AUC) seleziona la configurazione
+senza dipendere da una soglia arbitraria — la scelta è pura, basata sul ranking.
+La soglia operativa è una singola ipotesi da calibrare, non da ottimizzare ad ogni
+combinazione di iperparametri. Separare i tre stadi rende la pipeline verificabile
+e impedisce data leakage dal test set.
+
+**File modificati:**
+- `src/validation/run_experiment_ae.py` (rimozione test loaders, threshold, F1)
+- `src/validation/run_search_ae.py` (nuove colonne CSV)
+- `src/validation/analyze_results.py` (criterio selezione, rimozione encoder_channels/eval)
+- `src/validation/select_threshold.py` (nuovo file, Stage 2)
+- `src/models/train_ae.py` (soglia da config, loader separati)
+- `docs/project_plan.md` (aggiornamento §4.7, §4.8.5, §4.8.8, §6, §9)
+
+**Artefatti cancellati e da rigenerare:**
+- `reports/tables/validation_results_ae.csv` ✅ cancellato
+- `config/params_validated_ae.yaml` ✅ cancellato
+- `reports/tables/ae_final_metrics.csv` ✅ cancellato
+- `reports/checkpoints/ae_baseline.pth` ✅ cancellato
+- Preprocessing da rilanciare per rigenerare i 5 file .npy

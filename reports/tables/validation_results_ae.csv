@@ -1,7 +1,4 @@
-run_id,W,latent_dim,encoder_channels,best_val_pr_auc,best_val_f1,best_epoch,train_time_sec,seed
-1,128,32,"[64, 32]",0.495878,0.02886,5,435.96,43
-2,16,32,"[64, 32]",0.39953,0.009246,5,191.21,44
-run_id,W,latent_dim,encoder_channels,best_val_pr_auc,best_val_f1,best_epoch,train_time_sec,seed
-1,128,32,"[64, 32]",0.461621,0.030102,3,307.92,43
-2,16,32,"[64, 32]",0.405382,0.009148,3,110.74,44
-3,128,24,"[64, 32]",0.458399,0.026454,5,445.96,45
+run_id,W,latent_dim,val_roc_auc,val_pr_auc,best_epoch,train_time_sec,seed,errors_file
+1,16,8,0.316332,0.269922,5,101.07,43,reports\errors\ae_errors_run1_seed43_W16_latent8.npz
+2,32,32,0.254716,0.253416,5,124.83,44,reports\errors\ae_errors_run2_seed44_W32_latent32.npz
+3,128,24,0.279163,0.2586,5,327.37,45,reports\errors\ae_errors_run3_seed45_W128_latent24.npz

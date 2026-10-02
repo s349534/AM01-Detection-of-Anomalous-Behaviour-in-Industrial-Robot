@@ -31,11 +31,12 @@ CSV_COLUMNS = [
     "run_id",
     "W",
     "latent_dim",
-    "best_val_pr_auc",
-    "best_val_f1",
+    "val_roc_auc",
+    "val_pr_auc",
     "best_epoch",
     "train_time_sec",
     "seed",
+    "errors_file",
 ]
 
 
@@ -144,13 +145,13 @@ def run_search(
     # --- Run experiments ---
     # Pre-load validation data shape for window_size validation
     processed_dir = Path(base_config.get("paths", {}).get("data_processed", "data/processed/"))
-    val_data_path = processed_dir / "val.npy"
+    val_data_path = processed_dir / "val_normal.npy"
     val_samples = None
     if val_data_path.exists():
         val_samples = np.load(val_data_path, mmap_mode="r").shape[0]
         logger.info("Validation set size: %d samples", val_samples)
     else:
-        logger.warning("Validation data not found at %s — cannot validate window_size", val_data_path)
+        logger.warning("Validation data not found at %s -- cannot validate window_size", val_data_path)
 
     for i, sample in enumerate(samples):
         run_id = i + 1
@@ -173,11 +174,12 @@ def run_search(
                 "run_id": run_id,
                 "W": window_size,
                 "latent_dim": run_config.get("model", {}).get("latent_dim", ""),
-                "best_val_pr_auc": -1.0,
-                "best_val_f1": -1.0,
+                "val_roc_auc": -1.0,
+                "val_pr_auc": -1.0,
                 "best_epoch": 0,
                 "train_time_sec": 0.0,
                 "seed": seed + run_id,
+                "errors_file": "",
             }
             write_result_row_csv(output_csv, fail_row, write_header=write_header)
             write_header = False
@@ -199,9 +201,9 @@ def run_search(
             write_result_row_csv(output_csv, result, write_header=write_header)
             write_header = False  # header written after first row
             logger.info(
-                "  -> W=%d latent=%d pr_auc=%.4f f1=%.4f time=%.1fs",
+                "  -> W=%d latent=%d roc_auc=%.4f pr_auc=%.4f time=%.1fs",
                 result["W"], result["latent_dim"],
-                result["best_val_pr_auc"], result["best_val_f1"],
+                result["val_roc_auc"], result["val_pr_auc"],
                 result["train_time_sec"],
             )
 
@@ -212,11 +214,12 @@ def run_search(
                 "run_id": run_id,
                 "W": sample.get("model.window_size", ""),
                 "latent_dim": sample.get("model.latent_dim", ""),
-                "best_val_pr_auc": -1.0,  # sentinel for failure
-                "best_val_f1": -1.0,
+                "val_roc_auc": -1.0,  # sentinel for failure
+                "val_pr_auc": -1.0,
                 "best_epoch": 0,
                 "train_time_sec": 0.0,
                 "seed": seed + run_id,
+                "errors_file": "",
             }
             write_result_row_csv(output_csv, fail_row, write_header=write_header)
             write_header = False

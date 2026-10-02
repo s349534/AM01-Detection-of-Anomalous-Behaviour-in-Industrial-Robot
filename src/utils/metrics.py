@@ -106,15 +106,17 @@ def percentile_threshold(scores: np.ndarray, percentile: float) -> float:
 def find_optimal_threshold(y_true: np.ndarray, scores: np.ndarray) -> tuple[float, dict[str, float]]:
     """Find the threshold that maximizes F1-score on the given data.
 
-    Sweeps all unique score values as candidate thresholds and selects the
-    one that gives the best F1.  Useful for calibrating on the validation set.
+    Uses :func:`sklearn.metrics.precision_recall_curve` to efficiently
+    identify all decision boundaries that produce distinct (precision,
+    recall) pairs in O(n log n), then selects the threshold with the
+    highest F1.
 
     Parameters
     ----------
     y_true : array-like of shape (n_samples,)
         Ground truth binary labels.
     scores : array-like of shape (n_samples,)
-        Continuous anomaly scores.
+        Continuous anomaly scores (higher = more anomalous).
 
     Returns
     -------
@@ -126,26 +128,34 @@ def find_optimal_threshold(y_true: np.ndarray, scores: np.ndarray) -> tuple[floa
     y_true = np.asarray(y_true, dtype=np.int32)
     scores = np.asarray(scores, dtype=np.float64)
 
-    # Candidate thresholds: all unique score values + midpoints
-    candidate_thresholds = np.unique(scores)
-    # Also try midpoints between consecutive thresholds for finer granularity
-    midpoints = (candidate_thresholds[:-1] + candidate_thresholds[1:]) / 2
-    all_candidates = np.concatenate([candidate_thresholds, midpoints]) if len(candidate_thresholds) > 1 else candidate_thresholds
+    # Handle degenerate cases: single-class sets cannot be calibrated
+    if len(np.unique(y_true)) <= 1:
+        return 0.5, {"accuracy": 0.5, "precision": 0.0, "recall": 0.0, "f1": 0.0}
 
-    best_f1 = -1.0
-    best_threshold = 0.5
-    best_metrics: dict[str, float] = {}
+    # precision_recall_curve returns precision/recall arrays of length
+    # n_thresholds + 1 (the extra point is precision=1, recall=0 at
+    # threshold = +inf). We only iterate over the aligned thresholds.
+    precisions, recalls, thresholds = precision_recall_curve(y_true, scores)
 
-    for threshold in all_candidates:
-        y_pred = (scores >= threshold).astype(np.int32)
-        metrics = calculate_metrics(y_true, y_pred)
-        if metrics["f1"] > best_f1:
-            best_f1 = metrics["f1"]
-            best_threshold = float(threshold)
-            best_metrics = metrics
+    # F1 = 2 * P * R / (P + R), computed for each candidate threshold
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p_slice = precisions[:len(thresholds)]
+        r_slice = recalls[:len(thresholds)]
+        f1_per_threshold = np.where(
+            (p_slice + r_slice) > 0,
+            2.0 * p_slice * r_slice / (p_slice + r_slice),
+            0.0,
+        )
 
-    if not best_metrics:
-        best_metrics = {"accuracy": 0.5, "precision": 0.0, "recall": 0.0, "f1": 0.0}
+    if len(f1_per_threshold) == 0 or f1_per_threshold.max() == 0.0:
+        return 0.5, {"accuracy": 0.5, "precision": 0.0, "recall": 0.0, "f1": 0.0}
+
+    best_idx = int(np.argmax(f1_per_threshold))
+    best_threshold = float(thresholds[best_idx])
+
+    # Compute full metrics at the optimal threshold
+    y_pred = (scores >= best_threshold).astype(np.int32)
+    best_metrics = calculate_metrics(y_true, y_pred)
 
     return best_threshold, best_metrics
 
