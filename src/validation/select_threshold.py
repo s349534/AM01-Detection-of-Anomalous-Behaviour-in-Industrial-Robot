@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from src.utils.config import get_param, load_config
+from src.utils.config import load_config
 from src.utils.metrics import find_optimal_threshold
 
 logger = logging.getLogger(__name__)

@@ -14,9 +14,9 @@ from src.models.autoencoder import (
 )
 
 __all__ = [
-    "Conv1dEncoder",
     "Conv1dDecoder",
-    "SequenceAutoencoder",
+    "Conv1dEncoder",
     "EarlyStopping",
+    "SequenceAutoencoder",
     "fit_autoencoder",
 ]

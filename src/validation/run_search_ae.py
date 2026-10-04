@@ -101,7 +101,10 @@ def run_search(
     )
 
     # --- Load base config ---
-    base_config = load_config(config_path, params_path)
+    base_config = load_config(
+        Path(config_path) if config_path else None,
+        Path(params_path) if params_path else None,
+    )
 
     output_csv = get_output_path(base_config)
 
@@ -207,8 +210,8 @@ def run_search(
                 result["train_time_sec"],
             )
 
-        except Exception as e:
-            logger.error("Run %d failed: %s", run_id, e, exc_info=True)
+        except Exception:
+            logger.exception("Run %d failed", run_id)
             # Write a failure row so the CSV maintains run_id continuity
             fail_row = {
                 "run_id": run_id,
@@ -260,7 +263,7 @@ def main() -> None:
     args = parse_args()
     start = time.time()
 
-    output_csv = run_search(
+    run_search(
         n_iter=args.n_iter,
         seed=args.seed,
         max_val_epochs=args.max_val_epochs,

@@ -64,7 +64,7 @@ def import_modules() -> None:
     print("--- Importing project modules ---")
     from src.data import dataset, preprocessing  # noqa: F401
     try:
-        from src.models import autoencoder, adversarial_ae, compare_models  # noqa: F401
+        from src.models import adversarial_ae, autoencoder, compare_models  # noqa: F401
         print("models import OK.")
     except ImportError as e:
         print(f"models import skipped (scaffolding): {e}")
@@ -118,7 +118,7 @@ def run_phase_train(config: dict) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Training on device: {device}")
 
-    history = fit_autoencoder(
+    fit_autoencoder(
         model=model,
         train_loader=loaders["train"],
         val_loader=loaders["val"],
@@ -148,7 +148,7 @@ def main() -> None:
     # Ensure UTF-8 output on Windows (cp1252 can't encode em-dashes etc.)
     # On Linux this is a no-op.
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     except AttributeError:
         pass
 
@@ -181,7 +181,7 @@ def main() -> None:
     }
 
     if args.phase == "all":
-        for phase_name, phase_fn in phases.items():
+        for phase_fn in phases.values():
             phase_fn(config)
     else:
         phases[args.phase](config)

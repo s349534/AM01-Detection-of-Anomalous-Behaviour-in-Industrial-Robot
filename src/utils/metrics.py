@@ -21,7 +21,6 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     roc_auc_score,
-    roc_curve,
 )
 
 
@@ -228,38 +227,3 @@ def evaluate_threshold(
     }
 
 
-def reconstruction_error_to_scores(
-    errors: np.ndarray,
-    val_normal_errors: np.ndarray | None = None,
-    percentile: float = 99.0,
-) -> np.ndarray:
-    """Convert raw reconstruction errors to standardized anomaly scores.
-
-    If val_normal_errors is provided, computes a z-score-like normalization
-    using the validation (normal) statistics. Otherwise returns the errors
-    as-is.
-
-    Parameters
-    ----------
-    errors : array-like
-        Raw reconstruction errors for the samples to score.
-    val_normal_errors : array-like or None
-        Reconstruction errors from the validation set (normal data only),
-        used to compute mean/std for standardization.
-    percentile : float
-        Reserved for future percentile-based scaling. Currently unused
-        (kept for API compatibility).
-
-    Returns
-    -------
-    np.ndarray
-        Standardized anomaly scores (higher = more anomalous).
-    """
-    errors = np.asarray(errors, dtype=np.float64)
-    if val_normal_errors is not None:
-        val_normal_errors = np.asarray(val_normal_errors, dtype=np.float64)
-        mean = val_normal_errors.mean()
-        std = val_normal_errors.std()
-        if std > 0:
-            return (errors - mean) / std
-    return errors

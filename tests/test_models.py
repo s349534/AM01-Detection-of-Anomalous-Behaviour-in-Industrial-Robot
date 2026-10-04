@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.models.autoencoder import (
@@ -108,7 +108,7 @@ class TestSequenceAutoencoder:
 
     def test_gradients_backprop(self, batch_conv_format):
         model = SequenceAutoencoder(input_dim=82, window_size=16, latent_dim=16)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        torch.optim.Adam(model.parameters(), lr=1e-3)
         x_hat = model(batch_conv_format)
         loss = nn.functional.l1_loss(x_hat, batch_conv_format)
         loss.backward()

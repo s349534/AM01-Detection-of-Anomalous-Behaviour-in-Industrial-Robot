@@ -13,19 +13,22 @@ Actions:
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import logging
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 
-from src.utils.config import load_config, get_param
+from src.utils.config import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -65,26 +68,34 @@ def load_results_csv(csv_path: Path) -> list[dict[str, Any]]:
     Returns a list of dicts, skipping failure rows (val_pr_auc == -1).
     """
     rows: list[dict[str, Any]] = []
+    n_failed = 0
+    n_malformed = 0
     with open(csv_path, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            row_data: dict[str, Any] = dict(row)
             try:
-                row["run_id"] = int(row["run_id"])
-                row["W"] = int(row["W"])
-                row["latent_dim"] = int(row["latent_dim"])
-                row["val_roc_auc"] = float(row["val_roc_auc"])
-                row["val_pr_auc"] = float(row["val_pr_auc"])
-                row["best_epoch"] = int(row["best_epoch"])
-                row["train_time_sec"] = float(row["train_time_sec"])
-                row["seed"] = int(row["seed"])
-                # Skip failed runs
-                if row["val_pr_auc"] < 0 or row["val_roc_auc"] < 0:
-                    logger.warning("Skipping failed run_id=%d", row["run_id"])
+                row_data["run_id"] = int(row_data["run_id"])
+                row_data["W"] = int(row_data["W"])
+                row_data["latent_dim"] = int(row_data["latent_dim"])
+                row_data["val_roc_auc"] = float(row_data["val_roc_auc"])
+                row_data["val_pr_auc"] = float(row_data["val_pr_auc"])
+                row_data["best_epoch"] = int(row_data["best_epoch"])
+                row_data["train_time_sec"] = float(row_data["train_time_sec"])
+                row_data["seed"] = int(row_data["seed"])
+                # Skip failed runs (sentinel val_roc_auc/val_pr_auc == -1)
+                if row_data["val_pr_auc"] < 0 or row_data["val_roc_auc"] < 0:
+                    n_failed += 1
                     continue
-                rows.append(row)
+                rows.append(row_data)
             except (ValueError, KeyError) as e:
-                logger.warning("Skipping malformed row: %s", e)
+                n_malformed += 1
                 continue
+
+    if n_failed:
+        logger.warning("Skipped %d failed run(s) (val_roc_auc/val_pr_auc == -1)", n_failed)
+    if n_malformed:
+        logger.warning("Skipped %d malformed row(s)", n_malformed)
 
     if not rows:
         logger.error("No valid rows found in %s", csv_path)
@@ -134,7 +145,6 @@ def generate_sensitivity_plots(
         fig, ax = plt.subplots(figsize=(10, 6))
 
         # Group by hparam value
-        from collections import defaultdict
         groups: dict[Any, list[float]] = defaultdict(list)
         for row in rows:
             key = row[hparam_col]
@@ -146,7 +156,10 @@ def generate_sensitivity_plots(
 
         sorted_keys = sorted(groups.keys(), key=lambda v: (isinstance(v, str), v))
         means = [np.mean(groups[k]) for k in sorted_keys]
-        stds = [np.std(groups[k]) if len(groups[k]) > 1 else 0.0 for k in sorted_keys]
+        stds = np.array(
+            [np.std(groups[k]) if len(groups[k]) > 1 else 0.0 for k in sorted_keys],
+            dtype=float,
+        )
 
         x_positions = list(range(len(sorted_keys)))
         ax.errorbar(
@@ -198,8 +211,6 @@ def write_validated_params(best_row: dict[str, Any], base_config: dict, output_p
     output_path : Path
         Output YAML file path.
     """
-    import copy
-
     validated = copy.deepcopy(base_config)
 
     # Override validated hyperparameters (Stage 1: model selection)

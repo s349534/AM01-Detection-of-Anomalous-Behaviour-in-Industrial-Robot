@@ -10,11 +10,16 @@ the returned ``(W, n_features)`` → ``(B, n_features, W)`` for ``Conv1d``.
 """
 from __future__ import annotations
 
+import logging
 import warnings
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
+
+logger = logging.getLogger(__name__)
 
 
 class KukaDataset(Dataset):
@@ -126,7 +131,7 @@ def build_datasets(
     stride: int = 1,
     batch_size: int = 256,
     num_workers: int = 2,
-) -> dict[str, torch.utils.data.DataLoader]:
+) -> dict[str, DataLoader]:
     """Load processed .npy files and create DataLoaders for train/val/test.
 
     Reads the 5-file temporal split from ``processed_dir``:
@@ -139,8 +144,6 @@ def build_datasets(
     The ``test`` loader concatenates ``test_normal`` (label 0) and
     ``test_anomaly`` (label 1) via ``ConcatDataset``.
     """
-    from torch.utils.data import ConcatDataset, DataLoader
-
     processed_dir = Path(processed_dir)
 
     train_data = np.load(processed_dir / "train.npy")
@@ -155,8 +158,8 @@ def build_datasets(
     test_normal_ds = KukaDataset(test_normal_data, window_size, stride, label=0)
     test_anomaly_ds = KukaDataset(test_anomaly_data, window_size, stride, label=1)
 
-    val_ds = ConcatDataset([val_normal_ds, val_anomaly_ds])
-    test_ds = ConcatDataset([test_normal_ds, test_anomaly_ds])
+    val_ds: ConcatDataset[Any] = ConcatDataset([val_normal_ds, val_anomaly_ds])
+    test_ds: ConcatDataset[Any] = ConcatDataset([test_normal_ds, test_anomaly_ds])
 
     loaders: dict[str, DataLoader] = {
         "train": DataLoader(
@@ -174,3 +177,51 @@ def build_datasets(
     }
 
     return loaders
+
+
+# ---------------------------------------------------------------------------
+# Single-loader convenience (used by train/validiation scripts)
+# ---------------------------------------------------------------------------
+def build_loader(
+    data: np.ndarray | torch.Tensor,
+    window_size: int = 16,
+    stride: int = 1,
+    batch_size: int = 256,
+    label: int = 0,
+    shuffle: bool = False,
+    num_workers: int = 0,
+    drop_last: bool = False,
+) -> DataLoader:
+    """Build a single ``DataLoader`` from a data array.
+
+    Wraps :class:`KukaDataset` + ``DataLoader`` in one call so that training
+    and validation scripts don't need to repeat the boilerplate.
+
+    Parameters
+    ----------
+    data : array-like of shape (n_samples, n_features)
+        The raw data (already normalised).
+    window_size : int, default=16
+        Number of timesteps per sliding-window sample.
+    stride : int, default=1
+        Stride between consecutive windows.
+    batch_size : int, default=256
+    label : int, default=0
+        Label to assign to every window (0 = normal, 1 = anomaly).
+    shuffle : bool, default=False
+        Whether to shuffle the data each epoch.
+    num_workers : int, default=0
+        DataLoader worker processes (``0`` = load in main process).
+    drop_last : bool, default=False
+        Whether to drop the last incomplete batch.
+
+    Returns
+    -------
+    DataLoader
+        A ready-to-use data loader.
+    """
+    ds = KukaDataset(data, window_size=window_size, stride=stride, label=label)
+    return DataLoader(
+        ds, batch_size=batch_size, shuffle=shuffle,
+        num_workers=num_workers, drop_last=drop_last,
+    )

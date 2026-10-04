@@ -9,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-from sklearn.preprocessing import StandardScaler
 
 from src.data.dataset import KukaDataset
 from src.data.preprocessing import (
@@ -144,7 +143,6 @@ class TestSplitTemporal:
         normal, slow, _ = loaded
         n_total = normal.shape[0]
         n_train = int(0.60 * n_total)
-        n_val = int(0.20 * n_total)
 
         splits = split_temporal_data(normal, slow, config)
 

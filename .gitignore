@@ -39,6 +39,9 @@ env/
 *.pt
 *.ckpt
 
+# Intermediate results (error arrays for threshold calibration Stage 2)
+*.npz
+
 # IDE
 .vscode/
 .idea/
@@ -61,6 +64,3 @@ logs/
 # Environment
 .env
 .env.local
-
-# Loss
-*.npz

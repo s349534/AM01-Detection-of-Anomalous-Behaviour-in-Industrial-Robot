@@ -23,74 +23,25 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import ConcatDataset, DataLoader
 
-from src.data.dataset import KukaDataset
-from src.models.autoencoder import SequenceAutoencoder, fit_autoencoder
-from src.utils.config import load_config, get_param
+from src.data.dataset import build_loader
+from src.models.autoencoder import (
+    SequenceAutoencoder,
+    compute_errors_on_loader,
+    fit_autoencoder,
+)
+from src.utils.config import get_param, load_config
 from src.utils.metrics import (
     calculate_auc,
     calculate_metrics,
     compute_anomaly_scores,
 )
+from src.utils.seed import set_seed
 
 logger = logging.getLogger(__name__)
 
 # Nested validation: 3 runs with different seeds (§3.2)
 DEFAULT_SEEDS = [42, 123, 7]
-
-
-def _set_seed(seed: int) -> None:
-    """Set all random seeds for reproducibility."""
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _build_loader(
-    processed_dir: Path,
-    filename: str,
-    window_size: int,
-    batch_size: int,
-    label: int,
-    shuffle: bool = False,
-) -> DataLoader:
-    """Build a DataLoader from a processed .npy file."""
-    data = np.load(processed_dir / filename)
-    ds = KukaDataset(data, window_size=window_size, label=label)
-    return DataLoader(
-        ds, batch_size=batch_size, shuffle=shuffle, num_workers=0, drop_last=False
-    )
-
-
-def _compute_errors(
-    model: SequenceAutoencoder,
-    loader: DataLoader,
-    device: torch.device,
-    metric: str = "mae",
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute per-sample reconstruction errors and labels."""
-    model.eval()
-    all_errors: list[np.ndarray] = []
-    all_labels: list[np.ndarray] = []
-
-    with torch.no_grad():
-        for batch in loader:
-            x = batch[0] if isinstance(batch, (list, tuple)) else batch
-            x = x.to(device)
-            y = batch[1] if isinstance(batch, (list, tuple)) else None
-
-            errors = model.compute_reconstruction_error(x, reduction="sample", metric=metric)
-            all_errors.append(errors.cpu().numpy())
-            if y is not None:
-                all_labels.append(y.cpu().numpy().flatten())
-
-    errors = np.concatenate(all_errors)
-    labels = np.concatenate(all_labels) if all_labels else np.array([])
-    return errors, labels
 
 
 def train_single_seed(
@@ -126,7 +77,7 @@ def train_single_seed(
         test_roc_auc, test_f1, test_accuracy, test_precision, test_recall,
         best_epoch, threshold}
     """
-    _set_seed(seed)
+    set_seed(seed)
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -140,17 +91,23 @@ def train_single_seed(
     patience = int(get_param(config, "training.early_stopping.patience", 10))
     min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
     processed_dir = Path(get_param(config, "paths.data_processed", "data/processed/"))
-    reports_dir = Path(get_param(config, "paths.reports", "reports/"))
 
     logger.info("Training AE (seed=%d) on %s, epochs=%d, patience=%d", seed, dev, epochs, patience)
 
-    # --- Build dataloaders ---
-    train_loader = _build_loader(processed_dir, "train.npy", window_size, batch_size, label=0, shuffle=True)
-    val_normal_loader = _build_loader(processed_dir, "val_normal.npy", window_size, batch_size, label=0)
+    # --- Build dataloaders via shared build_loader ---
+    train_data = np.load(processed_dir / "train.npy")
+    val_normal_data = np.load(processed_dir / "val_normal.npy")
+    test_normal_data = np.load(processed_dir / "test_normal.npy")
+    test_anomaly_data = np.load(processed_dir / "test_anomaly.npy")
 
-    # Test loader: normal + anomaly
-    test_normal_loader = _build_loader(processed_dir, "test_normal.npy", window_size, batch_size, label=0)
-    test_anomaly_loader = _build_loader(processed_dir, "test_anomaly.npy", window_size, batch_size, label=1)
+    train_loader = build_loader(train_data, window_size=window_size,
+                                batch_size=batch_size, label=0, shuffle=True)
+    val_normal_loader = build_loader(val_normal_data, window_size=window_size,
+                                     batch_size=batch_size, label=0)
+    test_normal_loader = build_loader(test_normal_data, window_size=window_size,
+                                      batch_size=batch_size, label=0)
+    test_anomaly_loader = build_loader(test_anomaly_data, window_size=window_size,
+                                       batch_size=batch_size, label=1)
 
     # --- Instantiate model ---
     model = SequenceAutoencoder.from_config(config)
@@ -185,8 +142,8 @@ def train_single_seed(
     # No percentile computation here -- threshold is passed as parameter.
 
     # --- Evaluate on test (normal + anomaly) ---
-    test_normal_errors, _ = _compute_errors(model, test_normal_loader, dev)
-    test_anomaly_errors, _ = _compute_errors(model, test_anomaly_loader, dev)
+    test_normal_errors = compute_errors_on_loader(model, test_normal_loader, dev)
+    test_anomaly_errors = compute_errors_on_loader(model, test_anomaly_loader, dev)
     test_errors = np.concatenate([test_normal_errors, test_anomaly_errors])
     test_labels = np.concatenate([
         np.zeros(len(test_normal_errors), dtype=np.int32),
@@ -215,10 +172,10 @@ def train_single_seed(
         "test_precision": round(test_metrics["precision"], 6),
         "test_recall": round(test_metrics["recall"], 6),
         "threshold": round(float(threshold), 6),
-        "n_train_windows": len(train_loader.dataset),
-        "n_val_windows": len(val_normal_loader.dataset),
-        "n_test_normal_windows": len(test_normal_loader.dataset),
-        "n_test_anomaly_windows": len(test_anomaly_loader.dataset),
+        "n_train_windows": len(train_loader.dataset),  # type: ignore[arg-type]
+        "n_val_windows": len(val_normal_loader.dataset),  # type: ignore[arg-type]
+        "n_test_normal_windows": len(test_normal_loader.dataset),  # type: ignore[arg-type]
+        "n_test_anomaly_windows": len(test_anomaly_loader.dataset),  # type: ignore[arg-type]
     }
 
 
@@ -241,8 +198,6 @@ def run_final_training(
     max_epochs : int or None
         Override ``training.epochs`` from config (useful for quick smoke tests).
     """
-    from src.utils.config import load_config
-
     if seeds is None:
         seeds = DEFAULT_SEEDS
 
@@ -323,15 +278,11 @@ def run_final_training(
 
     # Append summary row to CSV
     with open(metrics_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([])
-        writer.writerow(["seed", "train_time_sec", "best_epoch", "test_pr_auc",
-                         "test_roc_auc", "test_f1", "test_accuracy",
-                         "test_precision", "test_recall", "threshold",
-                         "n_train_windows", "n_val_windows",
-                         "n_test_normal_windows", "n_test_anomaly_windows"])
+        csv_writer = csv.writer(f)
+        csv_writer.writerow([])
+        csv_writer.writerow(csv_columns)
         # Write summary row
-        summary_row = {
+        summary_row: dict[str, str] = {
             "seed": "MEAN+/-STD",
             "train_time_sec": f"{float(np.mean([r['train_time_sec'] for r in all_results])):.2f} +/- {float(np.std([r['train_time_sec'] for r in all_results])):.2f}",
             "best_epoch": f"{float(np.mean([r['best_epoch'] for r in all_results])):.1f} +/- {float(np.std([r['best_epoch'] for r in all_results])):.1f}",
@@ -339,7 +290,7 @@ def run_final_training(
             "test_roc_auc": f"{float(np.mean(roc_aucs)):.4f} +/- {float(np.std(roc_aucs)):.4f}",
             "test_f1": f"{float(np.mean(f1s)):.4f} +/- {float(np.std(f1s)):.4f}",
         }
-        writer.writerow([summary_row.get(col, "") for col in csv_columns])
+        csv_writer.writerow([summary_row.get(col, "") for col in csv_columns])
 
 
 def parse_args() -> argparse.Namespace:

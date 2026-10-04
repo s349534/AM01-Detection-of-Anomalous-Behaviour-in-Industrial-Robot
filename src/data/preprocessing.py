@@ -322,7 +322,6 @@ def run_preprocessing(config: dict[str, Any]) -> dict[str, np.ndarray]:
     """Run the full preprocessing pipeline: load → split → normalize → save."""
     logger.info("=" * 60)
     logger.info("AM01 — Fase 2 Preprocessing Pipeline")
-    logger.info("NO clipping applied (by project design — see §7 #9)")
     logger.info("=" * 60)
 
     # --- Step 1: Load ---

@@ -58,6 +58,7 @@ if [[ -d "${HOME}/am01_project" ]]; then
         --exclude='__pycache__/' \
         --exclude='.ipynb_checkpoints/' \
         --exclude='*.pth' --exclude='*.pt' --exclude='*.ckpt' \
+        --exclude='*.npz' \
         --exclude='outputs/' --exclude='reports/figures/' \
         --exclude='reports/tables/ae_final_metrics.csv' \
         "${HOME}/am01_project/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/"
@@ -169,14 +170,23 @@ uv run python -m src.validation.select_threshold
 
 # ── Verify outputs ──────────────────────────────────────────────────────────
 echo "=== Outputs ==="
-ls -lh reports/tables/validation_results_ae.csv reports/figures/sensitivity_*.png config/params_validated_ae.yaml reports/errors/ae_errors_run*.npz 2>/dev/null || true
+ls -lh reports/tables/validation_results_ae.csv reports/figures/sensitivity_*.png config/params_validated_ae.yaml 2>/dev/null || true
+# Verify .npz error arrays exist (needed by Stage 2 threshold calibration)
+N_NPZ=$(ls reports/errors/ae_errors_run*.npz 2>/dev/null | wc -l)
+if [[ ${N_NPZ} -gt 0 ]]; then
+    ls -lh reports/errors/ae_errors_run*.npz
+    echo "  (${N_NPZ} error array file(s) saved)"
+else
+    echo "WARNING: No .npz error array files found in reports/errors/!"
+    echo "  Stage 2 (threshold calibration) will fail without them."
+fi
 
 # ── Fetch results back to $HOME (so hpc_connect.sh batch can download) ──────
 RESULTS_DIR="${SCRATCH_DIR}/${SCRATCH_PROJECT}"
 HOME_PROJECT="${HOME}/am01_project"
 
 mkdir -p "${HOME_PROJECT}/reports/tables" "${HOME_PROJECT}/reports/figures" "${HOME_PROJECT}/config"
-mkdir -p "${HOME_PROJECT}/logs"
+mkdir -p "${HOME_PROJECT}/reports/errors" "${HOME_PROJECT}/logs"
 
 # Remove stale training residue from previous runs.
 # Validation phase does NOT produce ae_final_metrics.csv — clear it from BOTH
@@ -190,6 +200,10 @@ rsync -a --delete \
     "${RESULTS_DIR}/reports/tables/" "${HOME_PROJECT}/reports/tables/" 2>/dev/null || true
 rsync -a --delete \
     "${RESULTS_DIR}/reports/figures/" "${HOME_PROJECT}/reports/figures/" 2>/dev/null || true
+
+# Error arrays (.npz) — needed by Stage 2 threshold calibration
+rsync -a --delete \
+    "${RESULTS_DIR}/reports/errors/" "${HOME_PROJECT}/reports/errors/" 2>/dev/null || true
 
 # params_validated_ae.yaml (produced by analyze_results + select_threshold)
 rsync -a \

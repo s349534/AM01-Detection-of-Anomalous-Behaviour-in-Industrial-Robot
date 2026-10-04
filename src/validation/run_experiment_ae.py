@@ -28,160 +28,21 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 
-from src.data.dataset import KukaDataset
-from src.models.autoencoder import SequenceAutoencoder, fit_autoencoder
+from src.data.dataset import build_loader
+from src.models.autoencoder import (
+    SequenceAutoencoder,
+    compute_errors_on_loader,
+    fit_autoencoder,
+)
 from src.utils.config import get_param
 from src.utils.metrics import calculate_auc
+from src.utils.seed import set_seed
 
 logger = logging.getLogger(__name__)
 
 # Default epochs for validation search runs (full training happens in Fase 3.2)
 DEFAULT_VAL_EPOCHS = 50
-
-
-def _set_seed(seed: int) -> None:
-    """Set all random seeds for reproducibility."""
-    import random
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _build_train_loader(
-    processed_dir: Path,
-    window_size: int,
-    batch_size: int,
-    num_workers: int = 0,
-) -> DataLoader:
-    """Build a shuffled DataLoader for the training set (normal only)."""
-    train_data = np.load(processed_dir / "train.npy")
-    train_ds = KukaDataset(train_data, window_size=window_size, label=0)
-    return DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=False
-    )
-
-
-def _build_val_normal_loader(
-    processed_dir: Path,
-    window_size: int,
-    batch_size: int,
-    num_workers: int = 0,
-) -> DataLoader:
-    """Build a DataLoader for the validation normal set (early stopping)."""
-    val_data = np.load(processed_dir / "val_normal.npy")
-    val_ds = KukaDataset(val_data, window_size=window_size, label=0)
-    return DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False
-    )
-
-
-def _build_val_anomaly_loader(
-    processed_dir: Path,
-    window_size: int,
-    batch_size: int,
-    num_workers: int = 0,
-) -> DataLoader:
-    """Build a DataLoader for the validation anomaly set (HP selection)."""
-    val_data = np.load(processed_dir / "val_anomaly.npy")
-    val_ds = KukaDataset(val_data, window_size=window_size, label=1)
-    return DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False
-    )
-
-
-def _compute_reconstruction_errors(
-    model: SequenceAutoencoder,
-    dataloader: DataLoader,
-    device: torch.device,
-    metric: str = "mae",
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute per-sample reconstruction errors and labels from a DataLoader.
-
-    Parameters
-    ----------
-    model : SequenceAutoencoder
-        Trained (or eval) model.
-    dataloader : DataLoader
-        Provides batches of ``(window, label)``.
-    device : torch.device
-        Device to run inference on.
-    metric : {"mse", "mae"}
-        Reconstruction error metric.
-
-    Returns
-    -------
-    errors : np.ndarray of shape (n_samples,)
-        Per-sample mean reconstruction error.
-    labels : np.ndarray of shape (n_samples,)
-        Binary labels (0 = normal, 1 = anomaly).
-    """
-    model.eval()
-    all_errors: list[np.ndarray] = []
-    all_labels: list[np.ndarray] = []
-
-    with torch.no_grad():
-        for batch in dataloader:
-            x = batch[0] if isinstance(batch, (list, tuple)) else batch
-            x = x.to(device)
-            y = batch[1] if isinstance(batch, (list, tuple)) else None
-
-            errors = model.compute_reconstruction_error(
-                x, reduction="sample", metric=metric
-            )
-            all_errors.append(errors.cpu().numpy())
-            if y is not None:
-                all_labels.append(y.cpu().numpy().flatten())
-
-    if not all_errors:
-        raise ValueError(
-            f"No batches yielded from DataLoader — dataset may be empty. "
-            f"Check: window_size exceeds validation samples, "
-            f"or DataLoader num_workers > 0 causing multiprocessing issues. "
-            f"Dataset length: {len(dataloader.dataset)}"
-        )
-
-    errors = np.concatenate(all_errors)
-    labels = np.concatenate(all_labels) if all_labels else np.array([])
-    return errors, labels
-
-
-def _compute_errors_for_loader(
-    model: SequenceAutoencoder,
-    dataloader: DataLoader,
-    device: torch.device,
-    metric: str = "mae",
-) -> np.ndarray:
-    """Compute per-sample reconstruction errors from a DataLoader (no labels returned).
-
-    Uses metric from config (training.reconstruction_metric, default "mae").
-    Intended for loaders containing a single class (all normal or all anomaly).
-    """
-    model.eval()
-    all_errors: list[np.ndarray] = []
-
-    with torch.no_grad():
-        for batch in dataloader:
-            x = batch[0] if isinstance(batch, (list, tuple)) else batch
-            x = x.to(device)
-            errors = model.compute_reconstruction_error(
-                x, reduction="sample", metric=metric
-            )
-            all_errors.append(errors.cpu().numpy())
-
-    if not all_errors:
-        raise ValueError(
-            f"No batches yielded from DataLoader — dataset may be empty. "
-            f"Check: window_size exceeds samples, "
-            f"or DataLoader num_workers > 0 causing multiprocessing issues. "
-            f"Dataset length: {len(dataloader.dataset)}"
-        )
-
-    return np.concatenate(all_errors)
 
 
 def train_and_evaluate_ae(
@@ -240,7 +101,7 @@ def train_and_evaluate_ae(
 
         No test metrics, no threshold, no F1.
     """
-    _set_seed(seed)
+    set_seed(seed)
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -269,9 +130,16 @@ def train_and_evaluate_ae(
     )
 
     # --- Build dataloaders (3 loaders only: train, val_normal, val_anomaly) ---
-    train_loader = _build_train_loader(processed_dir, window_size, batch_size, num_workers)
-    val_normal_loader = _build_val_normal_loader(processed_dir, window_size, batch_size, num_workers)
-    val_anomaly_loader = _build_val_anomaly_loader(processed_dir, window_size, batch_size, num_workers)
+    train_data = np.load(processed_dir / "train.npy")
+    val_normal_data = np.load(processed_dir / "val_normal.npy")
+    val_anomaly_data = np.load(processed_dir / "val_anomaly.npy")
+
+    train_loader = build_loader(train_data, window_size=window_size,
+                                batch_size=batch_size, label=0, shuffle=True, num_workers=num_workers)
+    val_normal_loader = build_loader(val_normal_data, window_size=window_size,
+                                     batch_size=batch_size, label=0, num_workers=num_workers)
+    val_anomaly_loader = build_loader(val_anomaly_data, window_size=window_size,
+                                      batch_size=batch_size, label=1, num_workers=num_workers)
 
     # --- Instantiate model ---
     model = SequenceAutoencoder.from_config(config)
@@ -280,8 +148,9 @@ def train_and_evaluate_ae(
     # --- Train + Early Stopping (uses val_normal only) ---
     start_time = time.time()
 
-    # Use a temporary checkpoint path during validation (cleaned up afterwards)
-    ckpt_path = Path(f"/tmp/_ae_val_run_{run_id}_{seed}.pth")
+    # No checkpoint during validation search: early stopping keeps best weights
+    # in memory and the checkpoint would only be a temp file /tmp that gets
+    # deleted immediately.  The real checkpoint is saved by train_ae.py (Stage 2).
     history = fit_autoencoder(
         model=model,
         train_loader=train_loader,
@@ -291,7 +160,6 @@ def train_and_evaluate_ae(
         weight_decay=weight_decay,
         patience=patience,
         min_delta=min_delta,
-        checkpoint_path=str(ckpt_path),
         device=dev,
         loss=loss_name,
     )
@@ -300,9 +168,9 @@ def train_and_evaluate_ae(
     best_epoch = history.get("best_epoch", 0) if history else 0
 
     # --- HP Selection: ROC-AUC + PR-AUC on Validation (val_normal + val_anomaly) ---
-    # Compute errors separately (no labels needed from these loaders)
-    val_normal_errors = _compute_errors_for_loader(model, val_normal_loader, dev, metric=metric)
-    val_anomaly_errors = _compute_errors_for_loader(model, val_anomaly_loader, dev, metric=metric)
+    # Compute errors via shared utility (returns errors array; labels reconstructed manually below)
+    val_normal_errors = compute_errors_on_loader(model, val_normal_loader, dev, metric=metric)
+    val_anomaly_errors = compute_errors_on_loader(model, val_anomaly_loader, dev, metric=metric)
 
     # Concatenate errors and create labels (0 = normal, 1 = anomaly)
     val_errors = np.concatenate([val_normal_errors, val_anomaly_errors])
@@ -321,10 +189,6 @@ def train_and_evaluate_ae(
     errors_path = errors_dir / errors_filename
     np.savez_compressed(errors_path, errors=val_errors, labels=val_labels)
     logger.info("Saved validation errors to %s", errors_path)
-
-    # --- Cleanup temp checkpoint ---
-    if ckpt_path.exists():
-        ckpt_path.unlink()
 
     logger.info(
         "Run %d done: val_roc_auc=%.4f, val_pr_auc=%.4f, best_epoch=%d, time=%.1fs",

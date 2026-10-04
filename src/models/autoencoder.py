@@ -45,11 +45,13 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections.abc import Sized
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
+import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.utils.data import DataLoader
 
 from src.utils.config import get_param, load_config
@@ -369,7 +371,7 @@ class SequenceAutoencoder(nn.Module):
                 f"with shape {x.shape}"
             )
 
-        b, d1, d2 = x.shape
+        _, d1, d2 = x.shape
 
         # Case 1: already (B, input_dim, W)
         if d1 == self.input_dim and d2 == self.window_size:
@@ -563,7 +565,80 @@ class EarlyStopping:
 
 
 # ---------------------------------------------------------------------------
-# 5. Modular Training & Evaluation Functions
+# 5. Shared inference helper
+# ---------------------------------------------------------------------------
+def compute_errors_on_loader(
+    model: SequenceAutoencoder,
+    loader: DataLoader,
+    device: torch.device,
+    metric: str = "mae",
+    *,
+    collect_labels: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """Compute per-sample reconstruction errors from a DataLoader.
+
+    A shared helper used by both the training scripts (``train_ae.py``) and
+    the validation scripts (``run_experiment_ae.py``) to eliminate the
+    previously duplicated ``_compute_errors`` / ``_compute_errors_for_loader``
+    logic.
+
+    Parameters
+    ----------
+    model : SequenceAutoencoder
+        Model in eval mode (or will be set to eval).
+    loader : DataLoader
+        Yields batches of ``(window, label)`` or just ``window``.
+    device : torch.device
+        Device for inference.
+    metric : {"mae", "mse"}, default="mae"
+        Reconstruction error metric.
+    collect_labels : bool, default=False
+        If ``True``, also return per-sample labels alongside errors.
+        If ``False`` (default), return only the error array.
+
+    Returns
+    -------
+    np.ndarray
+        Per-sample mean reconstruction errors of shape ``(n_samples,)``.
+    tuple[np.ndarray, np.ndarray]
+        ``(errors, labels)`` when ``collect_labels=True``.
+    """
+    model.eval()
+    all_errors: list[np.ndarray] = []
+    all_labels: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for batch in loader:
+            x = batch[0] if isinstance(batch, (list, tuple)) else batch
+            x = x.to(device)
+            y = batch[1] if isinstance(batch, (list, tuple)) else None
+
+            errors = model.compute_reconstruction_error(
+                x, reduction="sample", metric=cast("Literal['mae', 'mse']", metric),
+            )
+            all_errors.append(errors.cpu().numpy())
+            if collect_labels and y is not None:
+                all_labels.append(y.cpu().numpy().flatten())
+
+    if not all_errors:
+        ds = loader.dataset
+        ds_len = len(ds) if isinstance(ds, Sized) else "?"
+        raise ValueError(
+            f"No batches yielded from DataLoader — dataset may be empty. "
+            f"Check: window_size exceeds samples, "
+            f"or DataLoader num_workers > 0 causing multiprocessing issues. "
+            f"Dataset length: {ds_len}"
+        )
+
+    errors = np.concatenate(all_errors)
+    if collect_labels:
+        labels = np.concatenate(all_labels) if all_labels else np.array([], dtype=np.int32)
+        return errors, labels
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# 6. Training & Evaluation Loop
 # ---------------------------------------------------------------------------
 def train_epoch(
     model: nn.Module,
@@ -631,7 +706,7 @@ def fit_autoencoder(
     patience: int = 10,
     min_delta: float = 1e-4,
     checkpoint_path: str | Path | None = None,
-    device: str | torch.device = "cuda" if torch.cuda.is_available() else "cpu",
+    device: str | torch.device | None = None,
     criterion: nn.Module | None = None,
     loss: str | None = None,
 ) -> dict[str, list[float]]:
@@ -674,6 +749,8 @@ def fit_autoencoder(
         History with keys "train_loss" (list[float]), "val_loss" (list[float]),
         and "best_epoch" (int — the epoch with the best validation loss).
     """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     dev = torch.device(device)
     model.to(dev)
 

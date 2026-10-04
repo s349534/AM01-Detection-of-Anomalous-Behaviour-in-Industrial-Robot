@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib
+
 matplotlib.use("Agg")  # non-interactive backend for CI/HPC
 import matplotlib.pyplot as plt
 import numpy as np
@@ -379,7 +380,8 @@ def plot_sensitivity(
 
     x_positions = range(len(sorted_x))
     ax.errorbar(
-        x_positions, means, yerr=stds,
+        list(x_positions), np.array(means, dtype=float),
+        yerr=np.array(stds, dtype=float),
         fmt="o-", color="#2563eb", markersize=8, linewidth=2,
         capsize=5, capthick=1.5,
         ecolor="#ef4444",
@@ -391,7 +393,8 @@ def plot_sensitivity(
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title(title, fontsize=14, fontweight="bold")
     ax.grid(True, alpha=0.3)
-    ax.set_ylim(0, max(m + s for m, s in zip(means, stds)) * 1.15)
+    upper = float(max(m + s for m, s in zip(means, stds)) * 1.15)
+    ax.set_ylim(0, upper)
 
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
