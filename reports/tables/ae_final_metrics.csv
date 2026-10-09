@@ -1,0 +1,5 @@
+seed,train_time_sec,best_epoch,test_pr_auc,test_roc_auc,test_f1,test_accuracy,test_precision,test_recall,threshold,val_f1,n_train_windows,n_val_normal_windows,n_val_anomaly_windows,n_test_normal_windows,n_test_anomaly_windows
+42,106.96,1,0.563227,0.685132,0.541593,0.371359,0.371359,1.0,0.291166,0.541607,163527,34941,20642,34943,20642
+
+seed,train_time_sec,best_epoch,test_pr_auc,test_roc_auc,test_f1,test_accuracy,test_precision,test_recall,threshold,val_f1,n_train_windows,n_val_normal_windows,n_val_anomaly_windows,n_test_normal_windows,n_test_anomaly_windows
+MEAN+/-STD,106.96 +/- 0.00,1.0 +/- 0.0,0.5632 +/- 0.0000,0.6851 +/- 0.0000,0.5416 +/- 0.0000,,,,0.291166 +/- 0.000000,0.5416 +/- 0.0000,,,,,

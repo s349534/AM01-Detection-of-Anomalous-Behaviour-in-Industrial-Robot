@@ -70,7 +70,7 @@ def load_results_csv(csv_path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     n_failed = 0
     n_malformed = 0
-    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+    with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
             row_data: dict[str, Any] = dict(row)
@@ -199,8 +199,10 @@ def write_validated_params(best_row: dict[str, Any], base_config: dict, output_p
     """Write params_validated_ae.yaml with the best hyperparameters.
 
     Merges the best config into the base params.yaml structure, overriding
-    only the validated HPs: W (window_size), latent_dim, and threshold (to be
-    filled later by Stage 2 select_threshold.py).
+    only the validated HPs: W (window_size), latent_dim.
+
+    The threshold is NO LONGER written here — it is calibrated in Stage 3
+    (train_ae.py) on the final trained model's validation errors.
 
     Parameters
     ----------
@@ -218,8 +220,8 @@ def write_validated_params(best_row: dict[str, Any], base_config: dict, output_p
     validated["model"]["window_size"] = w_val
     validated["model"]["latent_dim"] = best_row["latent_dim"]
 
-    # Threshold placeholder - filled by Stage 2 (select_threshold.py)
-    validated["model"]["threshold"] = None
+    # Threshold is calibrated per-seed in Stage 3 (train_ae.py),
+    # NOT in Stage 2 (select_threshold.py). No placeholder here.
 
     # Sincronizza anche data.window_size con model.window_size (§4.8.2)
     if "data" in validated and "window_size" in validated["data"]:

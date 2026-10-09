@@ -7,6 +7,15 @@ After Fase 3.1 validation selects HP_AE_best and writes
     - Saves best checkpoint to reports/checkpoints/ae_baseline.pth
     - Writes reports/tables/ae_final_metrics.csv with mean +/- std
 
+Threshold (soglia):
+    La soglia NON viene più calcolata nello Stage 2 (select_threshold.py).
+    Viene calcolata **dopo l'addestramento** di ogni modello, su dati di
+    validazione (val_normal + val_anomaly) che il modello non ha mai visto
+    durante il training. Questo garantisce che la soglia corrisponda al modello
+    che effettivamente farà inferenza.
+
+    Ogni seed produce un modello con pesi diversi → soglia F1-ottimale diversa.
+
 Usage:
     python -m src.models.train_ae --config config/params_validated_ae.yaml
     python -m src.models.train_ae --config config/params_validated_ae.yaml --seeds 42 123 7
@@ -35,6 +44,7 @@ from src.utils.metrics import (
     calculate_auc,
     calculate_metrics,
     compute_anomaly_scores,
+    find_optimal_threshold,
 )
 from src.utils.seed import set_seed
 
@@ -47,24 +57,22 @@ DEFAULT_SEEDS = [42, 123, 7]
 def train_single_seed(
     config: dict[str, Any],
     seed: int,
-    threshold: float,
     checkpoint_path: str | Path | None = None,
     device: str | torch.device | None = None,
 ) -> dict[str, Any]:
     """Train a single AE with a given seed and evaluate on test set.
 
-    Uses the calibrated threshold from Stage 2 (params_validated_ae.yaml).
-    Validation set consists of val_normal (for early stopping) + val_anomaly
-    (for metrics, no longer used for threshold calibration here).
+    The decision threshold is **calibrated in-place** on this model's own
+    validation errors (val_normal + val_anomaly), not inherited from a
+    prior Stage-2 calibration. This guarantees the threshold matches the
+    model that will perform inference.
 
     Parameters
     ----------
     config : dict
-        Validated config (from params_validated_ae.yaml, including model.threshold).
+        Validated config (from params_validated_ae.yaml).
     seed : int
         Random seed for this run.
-    threshold : float
-        Pre-calibrated decision threshold from Stage 2 (find_optimal_threshold).
     checkpoint_path : str | Path | None
         Where to save the model checkpoint.
     device : str | torch.device | None
@@ -75,7 +83,7 @@ def train_single_seed(
     dict
         Metrics dict for this run: {seed, train_time_sec, test_pr_auc,
         test_roc_auc, test_f1, test_accuracy, test_precision, test_recall,
-        best_epoch, threshold}
+        best_epoch, threshold, val_threshold}
     """
     set_seed(seed)
 
@@ -97,6 +105,7 @@ def train_single_seed(
     # --- Build dataloaders via shared build_loader ---
     train_data = np.load(processed_dir / "train.npy")
     val_normal_data = np.load(processed_dir / "val_normal.npy")
+    val_anomaly_data = np.load(processed_dir / "val_anomaly.npy")
     test_normal_data = np.load(processed_dir / "test_normal.npy")
     test_anomaly_data = np.load(processed_dir / "test_anomaly.npy")
 
@@ -104,6 +113,8 @@ def train_single_seed(
                                 batch_size=batch_size, label=0, shuffle=True)
     val_normal_loader = build_loader(val_normal_data, window_size=window_size,
                                      batch_size=batch_size, label=0)
+    val_anomaly_loader = build_loader(val_anomaly_data, window_size=window_size,
+                                      batch_size=batch_size, label=1)
     test_normal_loader = build_loader(test_normal_data, window_size=window_size,
                                       batch_size=batch_size, label=0)
     test_anomaly_loader = build_loader(test_anomaly_data, window_size=window_size,
@@ -138,8 +149,24 @@ def train_single_seed(
     train_time_sec = time.time() - start_time
     best_epoch = history.get("best_epoch", 0) if history else 0
 
-    # --- Use pre-calibrated threshold from Stage 2 (find_optimal_threshold) ---
-    # No percentile computation here -- threshold is passed as parameter.
+    # --- Calibrate threshold on this model's OWN validation errors ---
+    # (val_normal + val_anomaly) — NOT on Stage-1 search model errors.
+    # This guarantees the threshold matches the model that will do inference.
+    val_normal_errors = compute_errors_on_loader(model, val_normal_loader, dev, metric=loss_name)
+    val_anomaly_errors = compute_errors_on_loader(model, val_anomaly_loader, dev, metric=loss_name)
+    val_errors = np.concatenate([val_normal_errors, val_anomaly_errors])
+    val_labels = np.concatenate([
+        np.zeros(len(val_normal_errors), dtype=np.int32),
+        np.ones(len(val_anomaly_errors), dtype=np.int32),
+    ])
+
+    threshold, val_metrics = find_optimal_threshold(val_labels, val_errors)
+    logger.info(
+        "Seed %d: calibrated threshold=%.6f (val F1=%.4f, precision=%.4f, recall=%.4f, "
+        "val_normal_samples=%d, val_anomaly_samples=%d)",
+        seed, threshold, val_metrics["f1"], val_metrics["precision"], val_metrics["recall"],
+        len(val_normal_errors), len(val_anomaly_errors),
+    )
 
     # --- Evaluate on test (normal + anomaly) ---
     test_normal_errors = compute_errors_on_loader(model, test_normal_loader, dev)
@@ -172,8 +199,11 @@ def train_single_seed(
         "test_precision": round(test_metrics["precision"], 6),
         "test_recall": round(test_metrics["recall"], 6),
         "threshold": round(float(threshold), 6),
+        "val_threshold": round(float(threshold), 6),
+        "val_f1": round(val_metrics["f1"], 6),
         "n_train_windows": len(train_loader.dataset),  # type: ignore[arg-type]
-        "n_val_windows": len(val_normal_loader.dataset),  # type: ignore[arg-type]
+        "n_val_normal_windows": len(val_normal_loader.dataset),  # type: ignore[arg-type]
+        "n_val_anomaly_windows": len(val_anomaly_loader.dataset),  # type: ignore[arg-type]
         "n_test_normal_windows": len(test_normal_loader.dataset),  # type: ignore[arg-type]
         "n_test_anomaly_windows": len(test_anomaly_loader.dataset),  # type: ignore[arg-type]
     }
@@ -224,18 +254,14 @@ def run_final_training(
     latent_dim = int(get_param(config, "model.latent_dim", 16))
     enc_channels = list(get_param(config, "model.encoder.conv_channels", [64, 32, 16]))
 
-    # Read pre-calibrated threshold from Stage 2
-    threshold = get_param(config, "model.threshold", None)
-    if threshold is None:
-        logger.error("No threshold found in params_validated_ae.yaml (model.threshold).")
-        logger.error("Run Stage 2 first: python -m src.validation.select_threshold")
-        raise ValueError("model.threshold not found in config. Run Stage 2 (select_threshold) first.")
+    # Threshold is calibrated per-seed inside train_single_seed (Stage 3),
+    # not inherited from Stage 2 (select_threshold.py).
 
     logger.info("=" * 60)
     logger.info("Fase 3.2 -- Final AE Training")
     logger.info("HP_AE_best: W=%d, latent_dim=%d, encoder_channels=%s",
                 window_size, latent_dim, enc_channels)
-    logger.info("Calibrated threshold: %.6f (from Stage 2)", float(threshold))
+    logger.info("Threshold: calibrated per-seed after training (not from Stage 2)")
     logger.info("Nested validation: %d seeds %s", len(seeds), seeds)
     logger.info("=" * 60)
 
@@ -245,7 +271,7 @@ def run_final_training(
         # Save checkpoint only for the first seed (the baseline)
         save_ckpt = str(checkpoint_path) if i == 0 else None
 
-        result = train_single_seed(config, seed, threshold=float(threshold),
+        result = train_single_seed(config, seed,
                                    checkpoint_path=save_ckpt, device=device)
         all_results.append(result)
 
@@ -253,7 +279,9 @@ def run_final_training(
     csv_columns = [
         "seed", "train_time_sec", "best_epoch", "test_pr_auc", "test_roc_auc",
         "test_f1", "test_accuracy", "test_precision", "test_recall", "threshold",
-        "n_train_windows", "n_val_windows", "n_test_normal_windows", "n_test_anomaly_windows",
+        "val_f1",
+        "n_train_windows", "n_val_normal_windows", "n_val_anomaly_windows",
+        "n_test_normal_windows", "n_test_anomaly_windows",
     ]
 
     with open(metrics_path, "w", newline="", encoding="utf-8") as f:
@@ -272,6 +300,9 @@ def run_final_training(
     logger.info("  PR-AUC:  %.4f +/- %.4f", float(np.mean(pr_aucs)), float(np.std(pr_aucs)))
     logger.info("  ROC-AUC: %.4f +/- %.4f", float(np.mean(roc_aucs)), float(np.std(roc_aucs)))
     logger.info("  F1:      %.4f +/- %.4f", float(np.mean(f1s)), float(np.std(f1s)))
+    logger.info("  Threshold (calibrated per-seed):")
+    for r in all_results:
+        logger.info("    seed %d: threshold=%.6f (val_f1=%.4f)", r["seed"], r["threshold"], r["val_f1"])
     logger.info("=" * 60)
     logger.info("Checkpoint: %s", checkpoint_path)
     logger.info("Metrics:    %s", metrics_path)
@@ -282,6 +313,8 @@ def run_final_training(
         csv_writer.writerow([])
         csv_writer.writerow(csv_columns)
         # Write summary row
+        thresholds = [r["threshold"] for r in all_results]
+        val_f1s = [r["val_f1"] for r in all_results]
         summary_row: dict[str, str] = {
             "seed": "MEAN+/-STD",
             "train_time_sec": f"{float(np.mean([r['train_time_sec'] for r in all_results])):.2f} +/- {float(np.std([r['train_time_sec'] for r in all_results])):.2f}",
@@ -289,6 +322,8 @@ def run_final_training(
             "test_pr_auc": f"{float(np.mean(pr_aucs)):.4f} +/- {float(np.std(pr_aucs)):.4f}",
             "test_roc_auc": f"{float(np.mean(roc_aucs)):.4f} +/- {float(np.std(roc_aucs)):.4f}",
             "test_f1": f"{float(np.mean(f1s)):.4f} +/- {float(np.std(f1s)):.4f}",
+            "threshold": f"{float(np.mean(thresholds)):.6f} +/- {float(np.std(thresholds)):.6f}",
+            "val_f1": f"{float(np.mean(val_f1s)):.4f} +/- {float(np.std(val_f1s)):.4f}",
         }
         csv_writer.writerow([summary_row.get(col, "") for col in csv_columns])
 

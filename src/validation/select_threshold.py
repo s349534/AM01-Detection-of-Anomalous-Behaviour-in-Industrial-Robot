@@ -1,17 +1,19 @@
-"""Stage 2: Threshold calibration for the best AE configuration.
+"""Stage 2: Report best configuration from HP validation search.
 
 Usage:
     python -m src.validation.select_threshold
     python -m src.validation.select_threshold --input reports/tables/validation_results_ae.csv
-    python -m src.validation.select_threshold --input reports/tables/validation_results_ae.csv \
-        --params config/params_validated_ae.yaml
 
 Actions:
     1. Load the best row from the validation results CSV (produced by Stage 1)
     2. Load the saved raw errors + labels from the .npz file for the best run
-    3. Call find_optimal_threshold() to find the F1-maximizing threshold
-    4. Check if threshold is near distribution extremes (warn if so)
-    5. Write the threshold into params_validated_ae.yaml (model.threshold)
+    3. Report the best configuration and validation error statistics
+
+NOTE:
+    The threshold is NO LONGER calibrated here. It is calibrated in Stage 3
+    (train_ae.py) on the final trained model's own validation errors
+    (val_normal + val_anomaly). This ensures the threshold matches the model
+    that will actually perform inference.
 """
 from __future__ import annotations
 
@@ -19,14 +21,11 @@ import argparse
 import csv
 import logging
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
-import yaml
 
 from src.utils.config import load_config
-from src.utils.metrics import find_optimal_threshold
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +61,7 @@ def load_best_row(csv_path: Path) -> dict:
         The best row (as a dict of string values from CSV).
     """
     rows: list[dict[str, str]] = []
-    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+    with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
@@ -126,100 +125,29 @@ def find_errors_file(best_row: dict, errors_dir: Path) -> Path:
     return fallback
 
 
-def check_threshold_extremes(errors: np.ndarray, threshold: float) -> bool:
-    """Check if the threshold falls near the extremes of the error distribution.
-
-    A threshold in the lowest 2% or highest 2% of observed errors may indicate
-    poor calibration — the optimal decision boundary is near the edge of the
-    validation data's support.
-
-    Parameters
-    ----------
-    errors : np.ndarray
-        All reconstruction errors (val_normal + val_anomaly).
-    threshold : float
-        The optimal threshold found by find_optimal_threshold.
-
-    Returns
-    -------
-    bool
-        True if threshold is near extremes (warning issued).
-    """
-    lower = np.percentile(errors, 2)
-    upper = np.percentile(errors, 98)
-    if threshold < lower:
-        logger.warning(
-            "Threshold %.6f is below the 2nd percentile of errors (%.6f). "
-            "This may indicate poor calibration -- the validation set may not "
-            "capture the true decision boundary well.", threshold, lower
-        )
-        return True
-    elif threshold > upper:
-        logger.warning(
-            "Threshold %.6f is above the 98th percentile of errors (%.6f). "
-            "This may indicate poor calibration -- the validation set may not "
-            "capture the true decision boundary well.", threshold, upper
-        )
-        return True
-    return False
-
-
-def write_threshold_to_params(params_path: Path, threshold: float, best_row: dict) -> None:
-    """Write the calibrated threshold into params_validated_ae.yaml.
-
-    Updates the existing params_validated_ae.yaml by setting
-    ``model.threshold`` to the calibrated value, along with metadata about
-    the source run.
-
-    Parameters
-    ----------
-    params_path : Path
-        Path to params_validated_ae.yaml.
-    threshold : float
-        The calibrated threshold value.
-    best_row : dict
-        The best row from validation CSV (for metadata).
-    """
-    with open(params_path, "r", encoding="utf-8") as f:
-        params = yaml.safe_load(f)
-
-    if params is None:
-        params = {}
-    if "model" not in params:
-        params["model"] = {}
-
-    params["model"]["threshold"] = round(float(threshold), 6)
-    # Store metadata linking threshold to source run
-    params.setdefault("validation", {})
-    params["validation"]["threshold_run_id"] = int(best_row["run_id"])
-    params["validation"]["threshold_calibrated_at"] = datetime.now(timezone.utc).isoformat()
-    params["validation"]["val_roc_auc"] = float(best_row["val_roc_auc"])
-    params["validation"]["val_pr_auc"] = float(best_row["val_pr_auc"])
-    params["validation"]["source_csv"] = str(get_default_csv_path())
-
-    with open(params_path, "w", encoding="utf-8") as f:
-        yaml.dump(params, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-
-    logger.info("Wrote threshold=%.6f into %s", threshold, params_path)
-
-
 def run_threshold_selection(
     csv_path: Path | None = None,
     params_path: Path | None = None,
 ) -> dict:
-    """Run the full threshold calibration pipeline (Stage 2).
+    """Report the best AE configuration from Stage 1 (no threshold calibration).
+
+    Threshold calibration has been moved to Stage 3 (train_ae.py) where it is
+    performed on the final trained model's own validation errors.  This
+    function now serves as a summary/report of the best HP configuration
+    only.
 
     Parameters
     ----------
     csv_path : Path or None
         Path to validation_results_ae.csv. Defaults to reports/tables/.
     params_path : Path or None
-        Path to params_validated_ae.yaml. Defaults to config/.
+        Path to params_validated_ae.yaml. (No longer written — kept for
+        API backward-compat; used only to display the validated config.)
 
     Returns
     -------
     dict
-        Summary with threshold, f1, best_row info.
+        Summary with best_row info and validation error statistics.
     """
     config = load_config()
 
@@ -233,45 +161,48 @@ def run_threshold_selection(
         logger.error("Run Stage 1 first: python -m src.validation.run_search_ae --no-resume")
         raise FileNotFoundError(f"Validation CSV not found: {csv_path}")
 
-    if not params_path.exists():
-        logger.error("Validated params not found: %s", params_path)
-        logger.error("Run Stage 1b first: python -m src.validation.analyze_results")
-        raise FileNotFoundError(f"Validated params not found: {params_path}")
-
-    # --- Step 1: Load best row from CSV ---
+    # --- Load best row from CSV ---
     best_row = load_best_row(csv_path)
     logger.info("Selected best config: W=%s, latent_dim=%s (run_id=%s)",
                 best_row["W"], best_row["latent_dim"], best_row["run_id"])
+    logger.info("  val_roc_auc=%.4f, val_pr_auc=%.4f",
+                float(best_row["val_roc_auc"]), float(best_row["val_pr_auc"]))
 
-    # --- Step 2: Load raw errors + labels ---
+    # --- Load raw errors + labels for reporting ---
     errors_dir = Path("reports/errors")
-    errors_path = find_errors_file(best_row, errors_dir)
-    data = np.load(errors_path)
-    errors = data["errors"]
-    labels = data["labels"]
-    logger.info("Loaded %d validation samples (errors) from %s", len(errors), errors_path)
+    if "errors_file" in best_row and best_row["errors_file"].strip():
+        errors_path = Path(best_row["errors_file"])
+    else:
+        errors_path = find_errors_file(best_row, errors_dir)
 
-    # --- Step 3: Find optimal threshold via find_optimal_threshold ---
-    threshold, best_metrics = find_optimal_threshold(labels, errors)
-    logger.info("Optimal threshold: %.6f (F1=%.4f, precision=%.4f, recall=%.4f)",
-                threshold, best_metrics["f1"], best_metrics["precision"], best_metrics["recall"])
+    if errors_path and errors_path.exists():
+        data = np.load(errors_path)
+        errors = data["errors"]
+        labels = data["labels"]
+        n_normal = int(np.sum(labels == 0))
+        n_anomaly = int(np.sum(labels == 1))
+        logger.info("Validation errors from %s: %d samples "
+                    "(normal=%d, anomaly=%d)", errors_path.name,
+                    len(errors), n_normal, n_anomaly)
+        logger.info("Error distribution: min=%.6f, max=%.6f, mean=%.6f, median=%.6f",
+                    float(np.min(errors)), float(np.max(errors)),
+                    float(np.mean(errors)), float(np.median(errors)))
+    else:
+        errors = None
+        labels = None
 
-    # --- Step 4: Check threshold extremes ---
-    near_extremes = check_threshold_extremes(errors, threshold)
-
-    # --- Step 5: Write threshold to params_validated_ae.yaml ---
-    write_threshold_to_params(params_path, threshold, best_row)
+    # --- Report (threshold is calibrated in Stage 3 / train_ae.py) ---
+    logger.info("Threshold is calibrated in Stage 3 (train_ae.py) on the final "
+                "trained model's validation errors, not here.")
 
     return {
-        "threshold": threshold,
-        "f1": best_metrics["f1"],
-        "precision": best_metrics["precision"],
-        "recall": best_metrics["recall"],
-        "near_extremes": near_extremes,
         "run_id": best_row["run_id"],
         "W": best_row["W"],
         "latent_dim": best_row["latent_dim"],
-        "params_path": str(params_path),
+        "val_roc_auc": float(best_row["val_roc_auc"]),
+        "val_pr_auc": float(best_row["val_pr_auc"]),
+        "n_val_errors": len(errors) if errors is not None else 0,
+        "params_path": str(params_path) if params_path else "",
     }
 
 
@@ -285,7 +216,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--params", type=Path, default=None,
-        help="Path to params_validated_ae.yaml (default: config/params_validated_ae.yaml)",
+        help="Path to params_validated_ae.yaml (informational only; not modified)",
     )
     return parser.parse_args()
 
@@ -299,7 +230,7 @@ def main() -> None:
         stream=sys.stdout,
     )
     logger.info("=" * 60)
-    logger.info("Stage 2: Threshold Calibration")
+    logger.info("Stage 2: Best Configuration Report")
     logger.info("=" * 60)
 
     result = run_threshold_selection(
@@ -308,15 +239,13 @@ def main() -> None:
     )
 
     logger.info("=" * 60)
-    logger.info("Threshold calibration complete:")
-    logger.info("  threshold: %.6f", result["threshold"])
-    logger.info("  F1: %.4f (precision=%.4f, recall=%.4f)",
-                result["f1"], result["precision"], result["recall"])
-    if result["near_extremes"]:
-        logger.warning("  WARNING: threshold near distribution extremes -- see warnings above")
-    logger.info("  Calibrated on: W=%s, latent_dim=%s (run_id=%s)",
+    logger.info("Best AE configuration (Stage 1):")
+    logger.info("  W=%s, latent_dim=%s (run_id=%s)",
                 result["W"], result["latent_dim"], result["run_id"])
-    logger.info("  Written to: %s", result["params_path"])
+    logger.info("  val_roc_auc=%.4f, val_pr_auc=%.4f",
+                result["val_roc_auc"], result["val_pr_auc"])
+    logger.info("  Validation error samples: %d", result["n_val_errors"])
+    logger.info("NOTE: Threshold is calibrated in Stage 3 (train_ae.py)")
     logger.info("=" * 60)
 
 
