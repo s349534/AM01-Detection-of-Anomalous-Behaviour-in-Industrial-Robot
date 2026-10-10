@@ -18,7 +18,7 @@
 #SBATCH --ntasks-per-node=1          # 1 task = 1 processo Python (NO MPI)
 #SBATCH --cpus-per-task=6            # 6 core per quel task (1 main + 4 worker + 1 margine)
 #SBATCH --gpus=1
-#SBATCH --time=01:30:00              # 1.5h: basta per 50 run con num_workers=4
+#SBATCH --time=04:30:00              # 4.5h: 50 configs × 3 seeds = 150 runs con num_workers=4
 #SBATCH --mem=64GB
 #SBATCH --output=logs/%x_%j.log
 #SBATCH --error=logs/%x_%j.log
@@ -147,12 +147,14 @@ print(f"ColumnNames: {cols.shape}")
 fi
 
 # Build command args for run_search_ae
+# --seed is for ParameterSampler sampling only; training seeds are fixed: [7, 42, 123]
+# (--val-seeds) per config (§4.8.6)
 SEARCH_ARGS=("--seed" "42" "--max-val-epochs" "${MAX_VAL_EPOCHS}" "--no-resume")
 if [[ -n "${N_ITER}" ]]; then
     SEARCH_ARGS+=("--n-iter" "${N_ITER}")
-    echo "=== Phase 3.1: AE validation search (random ${N_ITER} iterations, max ${MAX_VAL_EPOCHS} epochs) ==="
+    echo "=== Phase 3.1: AE validation search (random ${N_ITER} configs × 3 seeds, max ${MAX_VAL_EPOCHS} epochs) ==="
 else
-    echo "=== Phase 3.1: AE validation search (EXHAUSTIVE - all combinations, max ${MAX_VAL_EPOCHS} epochs) ==="
+    echo "=== Phase 3.1: AE validation search (EXHAUSTIVE - all 20 configs × 3 seeds = 60 runs, max ${MAX_VAL_EPOCHS} epochs) ==="
 fi
 
 uv run python -m src.validation.run_search_ae "${SEARCH_ARGS[@]}"

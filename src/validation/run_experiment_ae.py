@@ -4,7 +4,7 @@ This module provides :func:`train_and_evaluate_ae`, the atomic unit invoked by
 ``run_search_ae.py`` for each sampled hyperparameter configuration.
 
 Workflow per run (Stage 1 - Model Selection):
-    1. Set seed for reproducibility
+    1. Set seed for reproducibility (one of VALIDATION_SEEDS: 7, 42, 123)
     2. Build DataLoaders from processed .npy files (3 loaders: train, val_normal, val_anomaly)
     3. Instantiate ``SequenceAutoencoder`` from config
     4. Train with early stopping on validation normal reconstruction loss
@@ -12,6 +12,12 @@ Workflow per run (Stage 1 - Model Selection):
     6. Compute ROC-AUC and PR-AUC on validation (threshold-free, no binarization)
     7. Save raw errors + labels to .npz for Stage 2 threshold calibration
     8. Return dict with val_roc_auc, val_pr_auc, errors_file (no test metrics, no threshold)
+
+Robust hyperparameter selection (§4.8.6):
+    ``run_search_ae.py`` invokes this function **3 times per configuration**,
+    each with a different fixed seed from ``VALIDATION_SEEDS = [7, 42, 123]``.
+    Results are aggregated (mean ± std) in ``analyze_results.py`` before
+    best-config selection.
 
 Validation set composition (HP selection):
     - val_normal: 15% of KukaNormal (early stopping)
