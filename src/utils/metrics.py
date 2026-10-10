@@ -64,6 +64,11 @@ def calculate_auc(y_true: np.ndarray, scores: np.ndarray) -> dict[str, float]:
     -------
     dict
         Dictionary with keys: roc_auc, pr_auc.
+
+    Notes
+    -----
+    If only one class is present in ``y_true``, the AUC scores are degenerate
+    and return 0.5 (random classifier baseline) for both ROC-AUC and PR-AUC.
     """
     y_true = np.asarray(y_true, dtype=np.int32)
     scores = np.asarray(scores, dtype=np.float64)
@@ -123,6 +128,12 @@ def find_optimal_threshold(y_true: np.ndarray, scores: np.ndarray) -> tuple[floa
         The score threshold that maximizes F1.
     best_metrics : dict
         Metrics at the optimal threshold (accuracy, precision, recall, f1).
+
+    Notes
+    -----
+    If only one class is present in ``y_true``, the threshold cannot be
+    meaningfully calibrated and returns ``0.5`` with zero metrics.  This
+    degenerate case is handled gracefully without raising an error.
     """
     y_true = np.asarray(y_true, dtype=np.int32)
     scores = np.asarray(scores, dtype=np.float64)

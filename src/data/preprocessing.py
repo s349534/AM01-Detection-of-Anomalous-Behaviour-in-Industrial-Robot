@@ -5,6 +5,11 @@ importable, unit-testable, and reproducible.
 
 Pipeline (no clipping — see §7 #9):
     load_kuka_data → split_temporal_data → normalize_data → save_processed_data
+
+Key EDA-driven decisions:
+- action (0-31) → one-hot encoding (32 binary cols), excluded from StandardScaler
+- Clipping: NOT implemented (0% hardware saturation)
+- Highly correlated features (Spearman > 0.95) removed from numerical features only
 """
 from __future__ import annotations
 
@@ -15,6 +20,7 @@ from typing import Any
 
 import joblib
 import numpy as np
+from scipy.stats import spearmanr
 from sklearn.preprocessing import StandardScaler
 
 from src.utils.config import load_config
@@ -27,6 +33,16 @@ logger = logging.getLogger(__name__)
 # stuck at its idle reading) trigger removal.
 CONST_STD_THRESHOLD = 1e-8
 
+# Column indices and constants
+ACTION_COL_IDX = 0
+N_ACTION_CLASSES = 32
+CORR_THRESHOLD = 0.95  # Spearman correlation threshold for removing redundant numerical features
+
+
+def _is_onehot_name(name: str) -> bool:
+    """Check if column name is a one-hot action column (prefix 'action_')."""
+    return str(name).startswith("action_")
+
 
 # ---------------------------------------------------------------------------
 # Step 1 — load
@@ -34,18 +50,23 @@ CONST_STD_THRESHOLD = 1e-8
 def load_kuka_data(
     config: dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load the three raw .npy files, drop `anomaly`, remove constant features.
+    """Load the three raw .npy files, drop `anomaly`, remove constant features,
+    remove highly correlated numerical features (Spearman > 0.95),
+    and one-hot encode `action` column.
 
     KukaSlow has 87 columns (feature + anomaly label); KukaNormal has 86.
-    The `anomaly` column (always 1) is dropped before alignment.  A feature
-    is removed only if it is constant in **both** datasets — a feature that
-    is constant in one but not the other may be discriminative and is kept.
+    The `anomaly` column (always 1) is dropped before alignment.
+    The `action` column (index 0) is one-hot encoded to 32 binary columns.
+    Constant features (in both datasets) are removed from numerical features only.
+    Highly correlated numerical features (Spearman > 0.95) are removed using
+    the train split (first 70%) to avoid leakage — the feature with lower
+    variance in each correlated pair is dropped.
 
     Returns
     -------
-    normal : np.ndarray, shape (233 792, 82), float32
-    slow : np.ndarray, shape (41 538, 82), float32
-    selected_col_names : np.ndarray, shape (82,)
+    normal : np.ndarray, shape (233 792, ~107), float32  (~75 numerical + 32 one-hot)
+    slow : np.ndarray, shape (41 538, ~107), float32
+    selected_col_names : np.ndarray, shape (~107,)  (numerical names + 'action_0'...'action_31')
     """
     data_cfg = config["data"]
     normal_path = Path(data_cfg["normal_data_path"])
@@ -62,7 +83,7 @@ def load_kuka_data(
         normal.shape, slow.shape, col_names.shape,
     )
 
-    # --- Step 2: align columns (drop 'anomaly' from KukaSlow) ---
+    # --- Step 1: align columns (drop 'anomaly' from KukaSlow) ---
     if slow.shape[1] == normal.shape[1] + 1:
         # The 87th column is 'anomaly' — drop it.
         dropped_name = str(col_names[slow.shape[1] - 1])
@@ -77,9 +98,20 @@ def load_kuka_data(
         f"normal={normal.shape[1]}, slow={slow.shape[1]}"
     )
 
-    # --- Step 3: identify zero-variance features ---
-    std_normal = normal.std(axis=0)   # (86,)
-    std_slow = slow.std(axis=0)        # (86,)
+    # --- Step 2: extract action column (index 0) for one-hot encoding ---
+    action_normal = normal[:, ACTION_COL_IDX].astype(int)   # (N,)
+    action_slow = slow[:, ACTION_COL_IDX].astype(int)        # (M,)
+
+    # --- Step 3: work with numerical features only (exclude action column 0) ---
+    # After dropping anomaly, both have 86 columns: action (0) + 85 numerical features
+    # col_names has 87 names: action (0) + 85 numerical (1-85) + anomaly (86)
+    numerical_normal = normal[:, 1:]   # (N, 85) - exclude action
+    numerical_slow = slow[:, 1:]       # (M, 85) - exclude action
+    numerical_names = col_names[1:86]  # 85 names - exclude action (0) and anomaly (86)
+
+    # --- Step 4: identify zero-variance features (numerical only) ---
+    std_normal = numerical_normal.std(axis=0)
+    std_slow = numerical_slow.std(axis=0)
 
     # Only remove if constant in BOTH datasets.
     constant_mask = (std_normal < CONST_STD_THRESHOLD) & (
@@ -88,13 +120,13 @@ def load_kuka_data(
     constant_indices = np.where(constant_mask)[0]
 
     if constant_indices.size > 0:
-        constant_names = [str(col_names[i]) for i in constant_indices]
+        constant_names = [str(numerical_names[i]) for i in constant_indices]
         logger.info(
-            "Removing %d zero-variance feature(s) from both datasets: %s",
+            "Removing %d zero-variance numerical feature(s) from both datasets: %s",
             constant_indices.size, constant_names,
         )
     else:
-        logger.info("No zero-variance features found.")
+        logger.info("No zero-variance numerical features found.")
 
     # Warn if a feature is constant in one dataset but not the other.
     one_only_mask = (std_normal < CONST_STD_THRESHOLD) & (
@@ -102,9 +134,9 @@ def load_kuka_data(
     )
     if one_only_mask.any():
         indices = np.where(one_only_mask)[0]
-        names = [str(col_names[i]) for i in indices]
+        names = [str(numerical_names[i]) for i in indices]
         warnings.warn(
-            f"Feature(s) constant in KukaNormal but NOT in KukaSlow -- kept: {names}. "
+            f"Numerical feature(s) constant in KukaNormal but NOT in KukaSlow -- kept: {names}. "
             "They may be discriminative between normal and anomalous behaviour.",
             UserWarning,
         )
@@ -114,23 +146,71 @@ def load_kuka_data(
     )
     if one_only_mask_2.any():
         indices = np.where(one_only_mask_2)[0]
-        names = [str(col_names[i]) for i in indices]
+        names = [str(numerical_names[i]) for i in indices]
         warnings.warn(
-            f"Feature(s) constant in KukaSlow but NOT in KukaNormal -- kept: {names}.",
+            f"Numerical feature(s) constant in KukaSlow but NOT in KukaNormal -- kept: {names}.",
             UserWarning,
         )
 
-    # --- Step 4: select columns ---
+    # --- Step 5: remove constant features ---
     keep_mask = ~constant_mask
-    keep_indices = np.where(keep_mask)[0]
+    numerical_normal = numerical_normal[:, keep_mask]
+    numerical_slow = numerical_slow[:, keep_mask]
+    numerical_names = numerical_names[keep_mask]  # now 81 names
 
-    normal = normal[:, keep_mask].astype(np.float32)
-    slow = slow[:, keep_mask].astype(np.float32)
-    selected_col_names = col_names[keep_indices]
+    # --- Step 6: remove highly correlated numerical features (Spearman > 0.95) ---
+    # Use train split (first 70%) to avoid data leakage
+    train_split = float(config["training"]["train_split"])
+    n_train = int(train_split * numerical_normal.shape[0])
+    train_numerical = numerical_normal[:n_train]
 
+    logger.info("Computing Spearman correlation on train split (%d samples)...", n_train)
+    corr_matrix, _ = spearmanr(train_numerical)
+    np.fill_diagonal(corr_matrix, 0.0)  # ignore diagonal
+
+    # Find features to remove: for each correlated pair, drop the one with lower variance
+    to_remove = set()
+    n_feat = corr_matrix.shape[0]
+    for i in range(n_feat):
+        if i in to_remove:
+            continue
+        for j in range(i + 1, n_feat):
+            if j in to_remove:
+                continue
+            if abs(corr_matrix[i, j]) > CORR_THRESHOLD:
+                var_i = train_numerical[:, i].var()
+                var_j = train_numerical[:, j].var()
+                to_remove.add(i if var_i < var_j else j)
+
+    if to_remove:
+        # Get removed names before filtering
+        removed_names = [str(numerical_names[i]) for i in sorted(to_remove)]
+        remove_mask = np.ones(numerical_normal.shape[1], dtype=bool)
+        remove_mask[list(to_remove)] = False
+        numerical_normal = numerical_normal[:, remove_mask]
+        numerical_slow = numerical_slow[:, remove_mask]
+        numerical_names = numerical_names[remove_mask]
+        logger.info(
+            "Removed %d highly correlated numerical features (Spearman > %.2f): %s",
+            len(to_remove), CORR_THRESHOLD, removed_names,
+        )
+    else:
+        logger.info("No highly correlated numerical features found (Spearman > %.2f).", CORR_THRESHOLD)
+
+    # --- Step 7: one-hot encode action ---
+    action_onehot_normal = np.eye(N_ACTION_CLASSES, dtype=np.float32)[action_normal]
+    action_onehot_slow = np.eye(N_ACTION_CLASSES, dtype=np.float32)[action_slow]
+    action_names = np.array([f"action_{i}" for i in range(N_ACTION_CLASSES)])
+
+    # --- Step 8: concatenate numerical + one-hot ---
+    normal = np.hstack([numerical_normal, action_onehot_normal]).astype(np.float32)
+    slow = np.hstack([numerical_slow, action_onehot_slow]).astype(np.float32)
+    selected_col_names = np.concatenate([numerical_names, action_names])
+
+    n_numerical = numerical_normal.shape[1]
     logger.info(
-        "After removing %d constant features -> normal=%s, slow=%s",
-        constant_indices.size, normal.shape, slow.shape,
+        "Final features: %d numerical + %d one-hot (action) = %d total",
+        n_numerical, N_ACTION_CLASSES, len(selected_col_names),
     )
 
     return normal, slow, selected_col_names
@@ -207,8 +287,13 @@ def split_temporal_data(
 def normalize_data(
     data: dict[str, np.ndarray],
     config: dict[str, Any],
+    selected_col_names: np.ndarray,
 ) -> tuple[dict[str, np.ndarray], StandardScaler]:
-    """StandardScaler (z-score) fitted on ``train`` only.
+    """StandardScaler (z-score) fitted on ``train`` numerical features only.
+
+    One-hot encoded action columns (prefix 'action_') are excluded from scaling:
+    they are already in [0, 1] range and StandardScaler would distort them
+    (e.g., mean ≈ 0.03 for rare actions → 1 maps to +30, 0 maps to -0.03).
 
     Features have wildly different scales (std 0.01–51.8); without
     normalisation the latent space is dominated by high-variance features.
@@ -219,7 +304,7 @@ def normalize_data(
     Returns
     -------
     scaled : dict[str, np.ndarray] — standardised float32 arrays
-    scaler : StandardScaler — the fitted scaler (save as scaler.pkl)
+    scaler : StandardScaler — the fitted scaler (save as scaler.pkl), fitted on numerical features only
     """
     norm_method = config.get("data", {}).get("normalization", "standard")
     if norm_method != "standard":
@@ -227,19 +312,27 @@ def normalize_data(
             f"Only 'standard' normalization is supported, got '{norm_method}'"
         )
 
-    scaler = StandardScaler()
-    scaler.fit(data["train"])  # fit on train ONLY
+    # Derive numerical vs one-hot indices from column names
+    is_onehot = np.array([_is_onehot_name(n) for n in selected_col_names])
+    numerical_indices = np.where(~is_onehot)[0]
+    onehot_indices = np.where(is_onehot)[0]
 
-    # --- Detect features that are constant within the TRAIN split ---
-    # load_kuka_data checks constants on the FULL dataset, but a feature may
-    # be non-constant globally yet constant within the first 60 % (train).
-    # StandardScaler sets scale_=1 for zero-variance features, so the transform
-    # is safe — we just log a warning so the analyst is aware.
+    n_numerical = len(numerical_indices)
+    n_onehot = len(onehot_indices)
+    logger.info("Normalization: %d numerical features (StandardScaler), %d one-hot action features (kept as 0/1)",
+                n_numerical, n_onehot)
+
+    scaler = StandardScaler()
+    # Fit on train numerical features ONLY
+    train_numerical = data["train"][:, numerical_indices]
+    scaler.fit(train_numerical)
+
+    # --- Detect features that are constant within the TRAIN split (numerical only) ---
     near_zero_var = scaler.var_ < CONST_STD_THRESHOLD
     if near_zero_var.any():
         nz_cols = np.where(near_zero_var)[0]
         logger.warning(
-            "Features with near-zero variance in TRAIN split (indices %s): "
+            "Numerical features with near-zero variance in TRAIN split (indices %s): "
             "these are constant within the first %.0f%% of KukaNormal. "
             "StandardScaler handles them safely (scale set to 1).",
             nz_cols.tolist(),
@@ -248,38 +341,46 @@ def normalize_data(
 
     scaled: dict[str, np.ndarray] = {}
     for key, arr in data.items():
-        scaled[key] = scaler.transform(arr).astype(np.float32)
+        arr_scaled = arr.copy()
+        # Scale only numerical features
+        arr_scaled[:, numerical_indices] = scaler.transform(arr[:, numerical_indices])
+        # One-hot features remain unchanged (already 0/1)
+        scaled[key] = arr_scaled.astype(np.float32)
 
-    # --- Log statistics (train should be ≈0 mean, ≈1 std for non-constant feats) ---
+    # --- Log statistics (separate numerical vs one-hot) ---
     for key in ("train", "val_normal", "val_anomaly", "test_normal", "test_anomaly"):
         arr = scaled[key]
+        num_arr = arr[:, numerical_indices]
+        oh_arr = arr[:, onehot_indices] if n_onehot > 0 else None
         logger.info(
-            "%-14s: mean=%.4f  std=%.4f  min=%.4f  max=%.4f  shape=%s",
-            key, arr.mean(), arr.std(), arr.min(), arr.max(), arr.shape,
+            "%-14s: num[mean=%.4f std=%.4f]  oh[mean=%.4f std=%.4f]  shape=%s",
+            key,
+            num_arr.mean(), num_arr.std(),
+            oh_arr.mean() if oh_arr is not None else 0.0,
+            oh_arr.std() if oh_arr is not None else 0.0,
+            arr.shape,
         )
 
-    # --- Assertions: train is properly standardised ---
-    # Check mean ≈ 0 across all features (this is always exact with StandardScaler).
-    train_mean = scaled["train"].mean(axis=0)
+    # --- Assertions: train numerical features are properly standardised ---
+    train_num = scaled["train"][:, numerical_indices]
+    train_mean = train_num.mean(axis=0)
     assert np.allclose(train_mean, 0, atol=1e-3), (
-        f"Train mean should be ≈0 after StandardScaler; "
+        f"Train numerical mean should be ≈0 after StandardScaler; "
         f"max abs deviation = {np.abs(train_mean).max()}"
     )
 
-    # Check std ≈ 1 for non-constant features only (constant features in train
-    # will have std = 0 after scaling, which is expected and harmless).
     non_const = ~near_zero_var
     if non_const.any():
-        train_std_nonconst = scaled["train"].std(axis=0)[non_const]
+        train_std_nonconst = train_num.std(axis=0)[non_const]
         assert np.all((train_std_nonconst > 0.97) & (train_std_nonconst < 1.03)), (
-            f"Non-constant train std should be ≈1; "
+            f"Non-constant train numerical std should be ≈1; "
             f"min={train_std_nonconst.min():.4f}, max={train_std_nonconst.max():.4f}"
         )
 
-    # --- Assertions: val/test are NOT zero-mean (proves no leakage) ---
-    val_mean_abs = np.abs(scaled["val_normal"].mean(axis=0)).max()
-    assert val_mean_abs > 1e-3, (
-        f"Val mean ~= 0 -- possible scaler leakage (max abs mean={val_mean_abs})"
+    # --- Assertions: val/test numerical features are NOT zero-mean (proves no leakage) ---
+    val_num_mean_abs = np.abs(scaled["val_normal"][:, numerical_indices].mean(axis=0)).max()
+    assert val_num_mean_abs > 1e-3, (
+        f"Val numerical mean ~= 0 -- possible scaler leakage (max abs mean={val_num_mean_abs})"
     )
 
     return scaled, scaler
@@ -329,12 +430,12 @@ def run_preprocessing(config: dict[str, Any]) -> dict[str, np.ndarray]:
     normal, slow, selected_cols = load_kuka_data(config)
 
     # --- Step 2: Split ---
-    logger.info("[2/4] Splitting data (temporal, 60/20/20)...")
+    logger.info("[2/4] Splitting data (temporal, 70/15/15)...")
     data_splits = split_temporal_data(normal, slow, config)
 
     # --- Step 3: Normalize ---
-    logger.info("[3/4] Normalizing (StandardScaler, fit on train only)...")
-    scaled_splits, scaler = normalize_data(data_splits, config)
+    logger.info("[3/4] Normalizing (StandardScaler on numerical only, fit on train)...")
+    scaled_splits, scaler = normalize_data(data_splits, config, selected_cols)
 
     # --- Step 4: Save ---
     logger.info("[4/4] Saving processed data...")
