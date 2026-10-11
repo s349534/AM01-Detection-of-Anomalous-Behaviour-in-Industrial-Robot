@@ -3,7 +3,7 @@
 
 model:
   name: "adversarial_autoencoder"
-  input_dim: 110            # 78 numerical + 32 one-hot action (after preprocessing: 4 constant removed, 3 correlated removed, action one-hot encoded)
+  input_dim: 82            # PLACEHOLDER — overridden at runtime from data/processed/selected_columns.npy
   window_size: 16          # timesteps per sliding window (must be multiple of 4)
   encoding_dim: 32         # intermediate dense layer dimension (unused in conv AE)
   latent_dim: 16           # latent vector dimension

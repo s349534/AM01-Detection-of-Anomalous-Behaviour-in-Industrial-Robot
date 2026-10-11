@@ -6,8 +6,7 @@ Usage:
 
 Actions:
     1. Load the best row from the validation results CSV (produced by Stage 1)
-    2. Load the saved raw errors + labels from the .npz file for the best run
-    3. Report the best configuration and validation error statistics
+    2. Report the best configuration and validation metrics
 
 NOTE:
     The threshold is NO LONGER calibrated here. It is calibrated in Stage 3
@@ -22,8 +21,6 @@ import csv
 import logging
 import sys
 from pathlib import Path
-
-import numpy as np
 
 from src.utils.config import load_config
 
@@ -85,46 +82,6 @@ def load_best_row(csv_path: Path) -> dict:
     return best
 
 
-def find_errors_file(best_row: dict, errors_dir: Path) -> Path:
-    """Locate the .npz file for the best run.
-
-    Tries the `errors_file` column from the CSV first. If not present,
-    reconstructs the filename from run_id, seed, W, latent_dim.
-
-    Parameters
-    ----------
-    best_row : dict
-        Best row from CSV.
-    errors_dir : Path
-        Directory where errors .npz files are stored.
-
-    Returns
-    -------
-    Path
-        Path to the .npz file.
-    """
-    errors_file = best_row.get("errors_file", "").strip()
-    if errors_file:
-        path = Path(errors_file)
-        if path.exists():
-            return path
-        logger.warning("errors_file path in CSV does not exist: %s", path)
-
-    # Fallback: reconstruct from run_id + seed + W + latent_dim
-    run_id = best_row["run_id"]
-    seed = best_row["seed"]
-    W = best_row["W"]
-    latent_dim = best_row["latent_dim"]
-    fallback = errors_dir / f"ae_errors_run{run_id}_seed{seed}_W{W}_latent{latent_dim}.npz"
-    if not fallback.exists():
-        raise FileNotFoundError(
-            f"Could not find errors file for run_id={run_id}. "
-            f"Tried CSV path '{errors_file}' and fallback '{fallback}'."
-        )
-    logger.warning("Using reconstructed errors file: %s", fallback)
-    return fallback
-
-
 def run_threshold_selection(
     csv_path: Path | None = None,
     params_path: Path | None = None,
@@ -147,7 +104,7 @@ def run_threshold_selection(
     Returns
     -------
     dict
-        Summary with best_row info and validation error statistics.
+        Summary with best_row info.
     """
     config = load_config()
 
@@ -168,29 +125,6 @@ def run_threshold_selection(
     logger.info("  val_roc_auc=%.4f, val_pr_auc=%.4f",
                 float(best_row["val_roc_auc"]), float(best_row["val_pr_auc"]))
 
-    # --- Load raw errors + labels for reporting ---
-    errors_dir = Path("reports/errors")
-    if "errors_file" in best_row and best_row["errors_file"].strip():
-        errors_path = Path(best_row["errors_file"])
-    else:
-        errors_path = find_errors_file(best_row, errors_dir)
-
-    if errors_path and errors_path.exists():
-        data = np.load(errors_path)
-        errors = data["errors"]
-        labels = data["labels"]
-        n_normal = int(np.sum(labels == 0))
-        n_anomaly = int(np.sum(labels == 1))
-        logger.info("Validation errors from %s: %d samples "
-                    "(normal=%d, anomaly=%d)", errors_path.name,
-                    len(errors), n_normal, n_anomaly)
-        logger.info("Error distribution: min=%.6f, max=%.6f, mean=%.6f, median=%.6f",
-                    float(np.min(errors)), float(np.max(errors)),
-                    float(np.mean(errors)), float(np.median(errors)))
-    else:
-        errors = None
-        labels = None
-
     # --- Report (threshold is calibrated in Stage 3 / train_ae.py) ---
     logger.info("Threshold is calibrated in Stage 3 (train_ae.py) on the final "
                 "trained model's validation errors, not here.")
@@ -201,14 +135,13 @@ def run_threshold_selection(
         "latent_dim": best_row["latent_dim"],
         "val_roc_auc": float(best_row["val_roc_auc"]),
         "val_pr_auc": float(best_row["val_pr_auc"]),
-        "n_val_errors": len(errors) if errors is not None else 0,
         "params_path": str(params_path) if params_path else "",
     }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stage 2: Calibrate optimal threshold on best AE config (§4.7)"
+        description="Stage 2: Report best AE configuration from validation search"
     )
     parser.add_argument(
         "--input", type=Path, default=None,
@@ -244,7 +177,6 @@ def main() -> None:
                 result["W"], result["latent_dim"], result["run_id"])
     logger.info("  val_roc_auc=%.4f, val_pr_auc=%.4f",
                 result["val_roc_auc"], result["val_pr_auc"])
-    logger.info("  Validation error samples: %d", result["n_val_errors"])
     logger.info("NOTE: Threshold is calibrated in Stage 3 (train_ae.py)")
     logger.info("=" * 60)
 

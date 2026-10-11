@@ -1,0 +1,40 @@
+# .gitattributes — enforce consistent line endings and encoding
+#
+# Bash / SLURM scripts MUST have LF line endings and NO BOM.
+# CRLF line endings cause `sbatch` to fail (carriage return becomes
+# part of #SBATCH directive values → invalid partition/output path).
+# BOM breaks the #!/bin/bash shebang on Linux.
+#
+# `text=true eol=lf` ensures git normalizes to LF on checkout.
+# `* text=auto` catches everything else as a safety net.
+
+* text=auto
+
+# Shell scripts (local runner + HPC job scripts) — LF, no BOM
+*.sh text eol=lf
+
+# Python — LF, no BOM
+*.py text eol=lf
+
+# YAML / JSON / TOML / INI — LF, no BOM
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.cfg text eol=lf
+
+# Markdown — LF
+*.md text eol=lf
+
+# Jupyter notebooks — LF
+*.ipynb text eol=lf
+
+# Exclude binary assets from text handling
+*.npy -text
+*.pth -text
+*.pt -text
+*.pkl -text
+*.npz -text
+*.png -text
+*.jpg -text
+*.pdf -text

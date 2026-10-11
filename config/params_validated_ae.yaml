@@ -22,7 +22,7 @@ logging:
 model:
   name: adversarial_autoencoder
   input_dim: 82
-  window_size: 128
+  window_size: 16
   encoding_dim: 32
   latent_dim: 16
   encoder:
@@ -63,7 +63,7 @@ data:
   normal_data_path: data/raw/KukaNormal.npy
   slow_data_path: data/raw/KukaSlow.npy
   column_names_path: data/raw/KukaColumnNames.npy
-  window_size: 128
+  window_size: 16
   window_stride: 1
   drop_incomplete: true
   normalization: standard

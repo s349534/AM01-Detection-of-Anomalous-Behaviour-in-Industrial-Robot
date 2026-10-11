@@ -163,32 +163,22 @@ uv run python -m src.validation.run_search_ae "${SEARCH_ARGS[@]}"
 echo "=== Phase 3.1b: Analyzing results ==="
 uv run python -m src.validation.analyze_results
 
-# ── Phase 3.2 (Stage 2): Calibrate threshold on best config (§4.7) ────────────
-# Writes model.threshold into config/params_validated_ae.yaml (produced by
-# analyze_results as a placeholder). MUST run on HPC so the calibrated
-# threshold is available when slurm_ae_train.sh syncs params from $HOME.
-echo "=== Phase 3.2 (Stage 2): Threshold calibration ==="
+# ── Phase 3.2 (Stage 2): Report best config (no threshold calibration) ──────────
+# select_threshold now only reports the best config; threshold is calibrated in
+# Stage 3 (slurm_ae_train.sh / train_ae.py) on the final trained model.
+echo "=== Phase 3.2 (Stage 2): Best config report ==="
 uv run python -m src.validation.select_threshold
 
 # ── Verify outputs ──────────────────────────────────────────────────────────
 echo "=== Outputs ==="
 ls -lh reports/tables/validation_results_ae.csv reports/figures/sensitivity_*.png config/params_validated_ae.yaml 2>/dev/null || true
-# Verify .npz error arrays exist (needed by Stage 2 threshold calibration)
-N_NPZ=$(ls reports/errors/ae_errors_run*.npz 2>/dev/null | wc -l)
-if [[ ${N_NPZ} -gt 0 ]]; then
-    ls -lh reports/errors/ae_errors_run*.npz
-    echo "  (${N_NPZ} error array file(s) saved)"
-else
-    echo "WARNING: No .npz error array files found in reports/errors/!"
-    echo "  Stage 2 (threshold calibration) will fail without them."
-fi
 
 # ── Fetch results back to $HOME (so hpc_connect.sh batch can download) ──────
 RESULTS_DIR="${SCRATCH_DIR}/${SCRATCH_PROJECT}"
 HOME_PROJECT="${HOME}/am01_project"
 
 mkdir -p "${HOME_PROJECT}/reports/tables" "${HOME_PROJECT}/reports/figures" "${HOME_PROJECT}/config"
-mkdir -p "${HOME_PROJECT}/reports/errors" "${HOME_PROJECT}/logs"
+mkdir -p "${HOME_PROJECT}/logs"
 
 # Remove stale training residue from previous runs.
 # Validation phase does NOT produce ae_final_metrics.csv — clear it from BOTH
@@ -203,11 +193,7 @@ rsync -a --delete \
 rsync -a --delete \
     "${RESULTS_DIR}/reports/figures/" "${HOME_PROJECT}/reports/figures/" 2>/dev/null || true
 
-# Error arrays (.npz) — needed by Stage 2 threshold calibration
-rsync -a --delete \
-    "${RESULTS_DIR}/reports/errors/" "${HOME_PROJECT}/reports/errors/" 2>/dev/null || true
-
-# params_validated_ae.yaml (produced by analyze_results + select_threshold)
+# params_validated_ae.yaml (produced by analyze_results; no threshold added by select_threshold)
 rsync -a \
     "${RESULTS_DIR}/config/" "${HOME_PROJECT}/config/" 2>/dev/null || true
 

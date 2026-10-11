@@ -46,7 +46,6 @@ CSV_COLUMNS = [
     "best_epoch",
     "train_time_sec",
     "seed",
-    "errors_file",
 ]
 
 
@@ -208,7 +207,6 @@ def run_search(
                 "best_epoch": 0,
                 "train_time_sec": 0.0,
                 "seed": "",
-                "errors_file": "",
             }
             write_result_row_csv(output_csv, fail_row, write_header=write_header)
             write_header = False
@@ -261,7 +259,6 @@ def run_search(
                     "best_epoch": 0,
                     "train_time_sec": 0.0,
                     "seed": val_seed,
-                    "errors_file": "",
                 }
                 write_result_row_csv(output_csv, fail_row, write_header=write_header)
                 write_header = False

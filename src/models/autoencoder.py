@@ -470,16 +470,78 @@ class SequenceAutoencoder(nn.Module):
             f"Unsupported reduction: '{reduction}', must be 'none', 'mean', or 'sample'"
         )
 
+    @staticmethod
+    def _discover_runtime_params(config: dict[str, Any]) -> dict[str, Any]:
+        """Discover model parameters that depend on preprocessed data at runtime.
+
+        Reads ``selected_columns.npy`` from the processed data directory to determine
+        the actual ``input_dim`` (number of features after preprocessing: constant
+        removal, correlation removal, one-hot encoding). This overrides any
+        hardcoded value in the config, ensuring the model always matches the data.
+
+        Parameters
+        ----------
+        config : dict
+            Full config dict (must contain ``paths.data_processed``).
+
+        Returns
+        -------
+        dict
+            Dictionary with discovered runtime parameters (e.g., ``input_dim``).
+            Empty if processed data not found (falls back to config values).
+        """
+        from pathlib import Path
+        import numpy as np
+
+        processed_dir = Path(get_param(config, "paths.data_processed", "data/processed/"))
+        selected_cols_path = processed_dir / "selected_columns.npy"
+
+        discovered = {}
+        if selected_cols_path.exists():
+            try:
+                selected_cols = np.load(selected_cols_path, allow_pickle=True)
+                actual_input_dim = int(selected_cols.shape[0])
+                config_input_dim = int(get_param(config, "model.input_dim", 82))
+
+                if actual_input_dim != config_input_dim:
+                    logger.warning(
+                        "input_dim mismatch: config=%d, discovered from data=%d. "
+                        "Using discovered value (data is source of truth).",
+                        config_input_dim, actual_input_dim,
+                    )
+                discovered["input_dim"] = actual_input_dim
+
+                # Also expose numerical vs one-hot split if needed downstream
+                from src.data.preprocessing import _is_onehot_name
+                is_onehot = np.array([_is_onehot_name(str(n)) for n in selected_cols])
+                discovered["n_numerical"] = int((~is_onehot).sum())
+                discovered["n_onehot"] = int(is_onehot.sum())
+
+            except Exception as e:
+                logger.warning("Could not read selected_columns.npy for runtime param discovery: %s", e)
+        else:
+            logger.debug(
+                "Processed data not found at %s — using config values for input_dim.",
+                processed_dir,
+            )
+
+        return discovered
+
     @classmethod
     def from_config(cls, config: dict[str, Any] | None = None) -> SequenceAutoencoder:
         """Instantiate a SequenceAutoencoder from a configuration dictionary.
 
         If config is None, loads default config via ``src.utils.config.load_config()``.
 
+        Runtime parameter discovery:
+            Automatically detects ``input_dim`` from ``data/processed/selected_columns.npy``
+            if available. This ensures the model architecture always matches the actual
+            preprocessed data, regardless of what the config file says.
+
         Expected config structure:
             model:
-              input_dim: 82
-              window_size: 32          # must be multiple of 4
+              input_dim: 82          # placeholder; overridden at runtime from data
+              window_size: 32        # must be multiple of 4
               latent_dim: 16
               encoder:
                 conv_channels: [64, 32, 16]  # 3 layers, funnel
@@ -491,7 +553,10 @@ class SequenceAutoencoder(nn.Module):
         if config is None:
             config = load_config()
 
-        input_dim = int(get_param(config, "model.input_dim", 82))
+        # Discover runtime parameters from preprocessed data (overrides config)
+        runtime_params = cls._discover_runtime_params(config)
+
+        input_dim = int(runtime_params.get("input_dim", get_param(config, "model.input_dim", 82)))
         window_size = int(get_param(config, "model.window_size", 16))
         latent_dim = int(get_param(config, "model.latent_dim", 16))
 

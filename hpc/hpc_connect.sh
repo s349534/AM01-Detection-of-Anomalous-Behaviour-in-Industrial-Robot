@@ -51,7 +51,6 @@ RSYNC_EXCLUDES=(
     --exclude='*.pth'
     --exclude='*.pt'
     --exclude='*.ckpt'
-    --exclude='*.npz'
     --exclude='outputs/'
     --exclude='reports/figures/'
     --exclude='reports/tables/ae_final_metrics.csv'
@@ -408,7 +407,7 @@ EOFSRIPT
     echo "=== Fetching results to local ==="
     mkdir -p "${PROJECT_ROOT}/data/processed" "${PROJECT_ROOT}/reports/tables" \
              "${PROJECT_ROOT}/reports/figures" "${PROJECT_ROOT}/reports/checkpoints" \
-             "${PROJECT_ROOT}/reports/errors" "${PROJECT_ROOT}/logs" \
+             "${PROJECT_ROOT}/logs" \
              "${PROJECT_ROOT}/config"
 
     # Always clear training-only artefacts first so that stale local copies do
@@ -435,11 +434,6 @@ EOFSRIPT
             "$(ssh_target):~/am01_project/reports/checkpoints/" \
             "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null || true
 
-        # Error arrays (.npz) — needed by Stage 2 threshold calibration
-        rsync -av --progress --delete \
-            "$(ssh_target):~/am01_project/reports/errors/" \
-            "${PROJECT_ROOT}/reports/errors/" 2>/dev/null || true
-
         # Download validated params (produced by analyze_results on the remote)
         scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
             "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null \
@@ -459,23 +453,11 @@ EOFSRIPT
             scp "$(ssh_target):~/am01_project/reports/tables/${f}" \
                 "${PROJECT_ROOT}/reports/tables/" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/reports/tables/${f}" || true
         done
-        # Checkpoints — the scp fallback previously omitted these!
+        # Checkpoints
         for f in ae_baseline.pth aae_final.pth; do
             scp "$(ssh_target):~/am01_project/reports/checkpoints/${f}" \
                 "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/reports/checkpoints/${f}" || true
         done
-        # Error arrays (.npz) — needed by Stage 2 threshold calibration
-        # Use ssh to list remote files, then scp each one
-        local npz_files
-        npz_files=$(ssh_run "$(ssh_target)" "ls ~/am01_project/reports/errors/ae_errors_run*.npz 2>/dev/null" 2>/dev/null || true)
-        if [[ -n "${npz_files}" ]]; then
-            for f in ${npz_files}; do
-                scp "$(ssh_target):~/am01_project/reports/errors/$(basename "${f}")" \
-                    "${PROJECT_ROOT}/reports/errors/" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/reports/errors/$(basename "${f}")" || true
-            done
-        else
-            echo "  NOTE: no .npz error files found on remote reports/errors/"
-        fi
         # Validated params
         scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
             "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/config/params_validated_ae.yaml" || echo "  (params not found or failed)"

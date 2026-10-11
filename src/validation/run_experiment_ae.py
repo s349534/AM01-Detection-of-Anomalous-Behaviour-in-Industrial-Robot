@@ -10,8 +10,7 @@ Workflow per run (Stage 1 - Model Selection):
     4. Train with early stopping on validation normal reconstruction loss
     5. Compute reconstruction errors on val_normal + val_anomaly (HP selection set)
     6. Compute ROC-AUC and PR-AUC on validation (threshold-free, no binarization)
-    7. Save raw errors + labels to .npz for Stage 2 threshold calibration
-    8. Return dict with val_roc_auc, val_pr_auc, errors_file (no test metrics, no threshold)
+    7. Return dict with val_roc_auc, val_pr_auc (no test metrics, no threshold, no errors_file)
 
 Robust hyperparameter selection (§4.8.6):
     ``run_search_ae.py`` invokes this function **3 times per configuration**,
@@ -29,7 +28,6 @@ from __future__ import annotations
 
 import logging
 import time
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -102,10 +100,9 @@ def train_and_evaluate_ae(
                 "best_epoch": int,
                 "train_time_sec": float,
                 "seed": int,
-                "errors_file": str,     # path to .npz with raw errors+labels
             }
 
-        No test metrics, no threshold, no F1.
+        No test metrics, no threshold, no F1, no errors_file.
     """
     set_seed(seed)
 
@@ -188,14 +185,6 @@ def train_and_evaluate_ae(
     # Compute AUC metrics (threshold-free: no binarization, no fixed threshold)
     val_auc = calculate_auc(val_labels, val_errors)   # returns {"roc_auc": ..., "pr_auc": ...}
 
-    # --- Save raw errors + labels for Stage 2 threshold calibration ---
-    errors_dir = Path("reports/errors")
-    errors_dir.mkdir(parents=True, exist_ok=True)
-    errors_filename = f"ae_errors_run{run_id}_seed{seed}_W{window_size}_latent{latent_dim}.npz"
-    errors_path = errors_dir / errors_filename
-    np.savez_compressed(errors_path, errors=val_errors, labels=val_labels)
-    logger.info("Saved validation errors to %s", errors_path)
-
     logger.info(
         "Run %d done: val_roc_auc=%.4f, val_pr_auc=%.4f, best_epoch=%d, time=%.1fs",
         run_id,
@@ -212,7 +201,6 @@ def train_and_evaluate_ae(
         "best_epoch": best_epoch,
         "train_time_sec": round(train_time_sec, 2),
         "seed": seed,
-        "errors_file": str(errors_path),
     }
 
     return result
