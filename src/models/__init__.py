@@ -12,6 +12,11 @@ from src.models.autoencoder import (
     SequenceAutoencoder,
     fit_autoencoder,
 )
+from src.models.adversarial_ae import (
+    AdversarialAutoencoder,
+    Discriminator,
+    fit_aae,
+)
 
 __all__ = [
     "Conv1dEncoder",
@@ -19,4 +24,7 @@ __all__ = [
     "SequenceAutoencoder",
     "EarlyStopping",
     "fit_autoencoder",
+    "AdversarialAutoencoder",
+    "Discriminator",
+    "fit_aae",
 ]

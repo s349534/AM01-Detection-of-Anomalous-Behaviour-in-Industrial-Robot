@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--phase",
-        choices=["preprocess", "train", "evaluate", "all"],
+        choices=["preprocess", "train", "train_aae", "evaluate", "all"],
         default="all",
         help="Which pipeline phase to run (default: all)",
     )
@@ -130,7 +130,63 @@ def run_phase_train(config: dict) -> None:
         device=device,
     )
     print(f"Baseline Autoencoder training complete. Checkpoint: {checkpoint_path}")
-    print("[Pending] Fase 4: Train Adversarial Autoencoder")
+
+
+def run_phase_train_aae(config: dict) -> None:
+    """Run Fase 4 — Train Adversarial Autoencoder with validated HPs."""
+    from src.data.dataset import build_datasets
+    from src.models.adversarial_ae import AdversarialAutoencoder, fit_aae
+    from src.utils.config import get_param
+
+    print("\n=== Fase 4: Train Adversarial Autoencoder ===")
+    processed_dir = Path(config["paths"]["data_processed"])
+    if not (processed_dir / "train.npy").exists():
+        print(f"Processed data not found at {processed_dir}. Running preprocessing first...")
+        from src.data.preprocessing import run_preprocessing
+        run_preprocessing(config)
+
+    window_size = int(get_param(config, "data.window_size", 16))
+    window_stride = int(get_param(config, "data.window_stride", 1))
+    batch_size = int(get_param(config, "training.batch_size", 256))
+    epochs = int(get_param(config, "training.epochs", 100))
+    lr = float(get_param(config, "training.learning_rate", 1e-3))
+    weight_decay = float(get_param(config, "training.weight_decay", 0.0))
+    patience = int(get_param(config, "training.early_stopping.patience", 10))
+    min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
+    reconstruction_weight = float(get_param(config, "training.reconstruction_weight", 1.0))
+    adversarial_weight = float(get_param(config, "training.adversarial_weight", 0.1))
+
+    print(f"Loading datasets from {processed_dir} (W={window_size}, batch_size={batch_size})...")
+    loaders = build_datasets(
+        processed_dir=processed_dir,
+        window_size=window_size,
+        stride=window_stride,
+        batch_size=batch_size,
+        num_workers=0,
+    )
+
+    model = AdversarialAutoencoder.from_config(config)
+    checkpoint_path = Path("reports/checkpoints/aae_final.pth")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Training AAE on device: {device}")
+    print(f"  reconstruction_weight={reconstruction_weight}, adversarial_weight={adversarial_weight}")
+
+    history = fit_aae(
+        model=model,
+        train_loader=loaders["train"],
+        val_loader=loaders["val"],
+        epochs=epochs,
+        learning_rate=lr,
+        weight_decay=weight_decay,
+        reconstruction_weight=reconstruction_weight,
+        adversarial_weight=adversarial_weight,
+        patience=patience,
+        min_delta=min_delta,
+        checkpoint_path=str(checkpoint_path),
+        device=device,
+    )
+    print(f"Adversarial Autoencoder training complete. Checkpoint: {checkpoint_path}")
 
 
 
@@ -175,6 +231,7 @@ def main() -> None:
     phases = {
         "preprocess": run_phase_preprocess,
         "train": run_phase_train,
+        "train_aae": run_phase_train_aae,
         "evaluate": run_phase_evaluate,
     }
 

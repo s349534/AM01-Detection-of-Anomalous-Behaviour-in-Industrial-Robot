@@ -34,6 +34,7 @@ from src.utils.metrics import (
     compute_anomaly_scores,
     percentile_threshold,
 )
+from src.utils.seed import set_seed
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +42,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_SEEDS = [42, 123, 7]
 
 
-def _set_seed(seed: int) -> None:
-    """Set all random seeds for reproducibility."""
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def _build_loader(
@@ -120,7 +113,7 @@ def train_single_seed(
         test_roc_auc, test_f1, test_accuracy, test_precision, test_recall,
         best_epoch, threshold}
     """
-    _set_seed(seed)
+    set_seed(seed)
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"

@@ -375,3 +375,81 @@ class TestAdversarialTraining:
 
             loaded = torch.load(ckpt_path, weights_only=False)
             assert "model_state_dict" in loaded
+
+    def test_fit_aae_with_config(self, default_config):
+        """fit_aae works when model is instantiated from default config."""
+        model = AdversarialAutoencoder.from_config(default_config)
+        w = default_config["model"]["window_size"]
+        input_dim = default_config["model"]["input_dim"]
+        x_dummy = torch.randn(16, w, input_dim)
+        y_dummy = torch.zeros(16, 1)
+        ds = TensorDataset(x_dummy, y_dummy)
+        loader = DataLoader(ds, batch_size=8)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ckpt_path = Path(tmp_dir) / "test_aae_cfg_ckpt.pth"
+            history = fit_aae(
+                model=model,
+                train_loader=loader,
+                val_loader=loader,
+                epochs=1,
+                checkpoint_path=str(ckpt_path),
+                device="cpu",
+            )
+            assert len(history["train_loss"]) == 1
+            assert ckpt_path.exists()
+
+    def test_train_single_seed_integration(self):
+        """Integration test for train_single_seed in src.models.train_aae."""
+        import numpy as np
+        from src.models.train_aae import train_single_seed
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            proc_dir = tmp_path / "processed"
+            proc_dir.mkdir()
+            rep_dir = tmp_path / "reports"
+            rep_dir.mkdir()
+
+            w = 16
+            n_features = 82
+            np.save(proc_dir / "train.npy", np.random.randn(40, n_features).astype(np.float32))
+            np.save(proc_dir / "val.npy", np.random.randn(20, n_features).astype(np.float32))
+            np.save(proc_dir / "test_normal.npy", np.random.randn(20, n_features).astype(np.float32))
+            np.save(proc_dir / "test_anomaly.npy", np.random.randn(20, n_features).astype(np.float32))
+
+            cfg = {
+                "paths": {
+                    "data_processed": str(proc_dir),
+                    "reports": str(rep_dir),
+                },
+                "model": {
+                    "input_dim": n_features,
+                    "window_size": w,
+                    "latent_dim": 8,
+                    "encoder": {"conv_channels": [16, 8]},
+                    "decoder": {"conv_channels": [8, 16]},
+                    "discriminator": {"hidden_layers": [8, 4]},
+                },
+                "training": {
+                    "batch_size": 8,
+                    "epochs": 1,
+                    "learning_rate": 1e-3,
+                    "weight_decay": 0.0,
+                    "early_stopping": {"patience": 2, "min_delta": 1e-4},
+                    "reconstruction_weight": 1.0,
+                    "adversarial_weight": 0.1,
+                    "discriminator_updates_per_gen": 1,
+                    "loss": "mse",
+                },
+            }
+
+            ckpt = rep_dir / "aae_test.pth"
+            metrics = train_single_seed(cfg, seed=42, checkpoint_path=ckpt, device="cpu")
+
+            assert metrics["seed"] == 42
+            assert "test_pr_auc" in metrics
+            assert "test_roc_auc" in metrics
+            assert "test_f1" in metrics
+            assert ckpt.exists()
+
