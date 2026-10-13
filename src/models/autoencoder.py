@@ -326,11 +326,13 @@ class SequenceAutoencoder(nn.Module):
         encoder_kernels: tuple[int, int, int] = (5, 3, 3),
         pool_size: int = 2,
         activation: str = "relu",
+        action_feature_indices: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.window_size = window_size
         self.latent_dim = latent_dim
+        self.action_feature_indices = action_feature_indices
 
         self.encoder = Conv1dEncoder(
             input_dim=input_dim,
@@ -426,6 +428,7 @@ class SequenceAutoencoder(nn.Module):
         x: torch.Tensor,
         reduction: Literal["none", "mean", "sample"] = "sample",
         metric: Literal["mse", "mae"] = "mae",
+        exclude_action_features: bool = True,
     ) -> torch.Tensor:
         """Compute reconstruction error between input and its autoencoder reconstruction.
 
@@ -441,6 +444,13 @@ class SequenceAutoencoder(nn.Module):
         metric : {"mse", "mae"}, default="mae"
             Distance metric used (MAE: absolute difference, MSE: squared difference).
             Default is "mae" for robustness to sensor saturation (see §7 #9).
+        exclude_action_features : bool, default=True
+            If True and ``action_feature_indices`` is configured, exclude the one-hot
+            action features from the error computation. This prevents the ~30% of
+            input dimensions that are action one-hot vectors (which reconstruct with
+            near-zero error on both normal and anomalous data) from diluting the
+            anomaly score. Set to False to compute error on all features (e.g., for
+            training loss monitoring).
 
         Returns
         -------
@@ -456,6 +466,36 @@ class SequenceAutoencoder(nn.Module):
             diff = torch.abs(x - x_hat)
         else:
             raise ValueError(f"Unsupported metric: '{metric}', must be 'mse' or 'mae'")
+
+        # Exclude action features from anomaly score computation if configured
+        # Action features are one-hot encoded PLC commands (exogenous), not robot
+        # physical state. They reconstruct with near-zero error on both normal and
+        # anomalous data, diluting the anomaly score contrast.
+        if exclude_action_features and self.action_feature_indices is not None:
+            # diff shape: (B, W, D) or (B, D, W) depending on input layout
+            # We need to mask along the feature dimension (last or middle)
+            # Determine feature dimension from input layout
+            if x.size(1) == self.window_size and x.size(2) == self.input_dim:
+                # Layout: (B, W, D) - feature dim is 2
+                feature_dim = 2
+            elif x.size(1) == self.input_dim and x.size(2) == self.window_size:
+                # Layout: (B, D, W) - feature dim is 1
+                feature_dim = 1
+            else:
+                # Fallback: assume feature dim is the one matching input_dim
+                feature_dim = 1 if x.size(1) == self.input_dim else 2
+
+            # Create mask for non-action features
+            mask = torch.ones(self.input_dim, dtype=torch.bool, device=diff.device)
+            mask[list(self.action_feature_indices)] = False
+
+            # Apply mask along feature dimension
+            if feature_dim == 1:
+                # (B, D, W) -> (B, D_non_action, W)
+                diff = diff[:, mask, :]
+            else:
+                # (B, W, D) -> (B, W, D_non_action)
+                diff = diff[:, :, mask]
 
         if reduction == "none":
             return diff
@@ -487,8 +527,9 @@ class SequenceAutoencoder(nn.Module):
         Returns
         -------
         dict
-            Dictionary with discovered runtime parameters (e.g., ``input_dim``).
-            Empty if processed data not found (falls back to config values).
+            Dictionary with discovered runtime parameters (e.g., ``input_dim``,
+            ``action_feature_indices``). Empty if processed data not found
+            (falls back to config values).
         """
         from pathlib import Path
         import numpy as np
@@ -517,6 +558,16 @@ class SequenceAutoencoder(nn.Module):
                 discovered["n_numerical"] = int((~is_onehot).sum())
                 discovered["n_onehot"] = int(is_onehot.sum())
 
+                # Discover action feature indices for exclusion from anomaly score
+                # Action features are one-hot encoded PLC commands (prefix 'action_')
+                action_indices = np.where(is_onehot)[0].tolist()
+                if action_indices:
+                    discovered["action_feature_indices"] = tuple(action_indices)
+                    logger.info(
+                        "Discovered %d action feature indices for anomaly score exclusion: %s",
+                        len(action_indices), action_indices[:5] + (["..."] if len(action_indices) > 5 else []),
+                    )
+
             except Exception as e:
                 logger.warning("Could not read selected_columns.npy for runtime param discovery: %s", e)
         else:
@@ -534,9 +585,10 @@ class SequenceAutoencoder(nn.Module):
         If config is None, loads default config via ``src.utils.config.load_config()``.
 
         Runtime parameter discovery:
-            Automatically detects ``input_dim`` from ``data/processed/selected_columns.npy``
-            if available. This ensures the model architecture always matches the actual
-            preprocessed data, regardless of what the config file says.
+            Automatically detects ``input_dim`` and ``action_feature_indices`` from
+            ``data/processed/selected_columns.npy`` if available. This ensures the
+            model architecture always matches the actual preprocessed data, regardless
+            of what the config file says.
 
         Expected config structure:
             model:
@@ -569,6 +621,8 @@ class SequenceAutoencoder(nn.Module):
         pool_size = int(get_param(config, "model.encoder.pool_size", 2))
         activation = str(get_param(config, "model.encoder.activation", "relu"))
 
+        action_feature_indices = runtime_params.get("action_feature_indices")
+
         return cls(
             input_dim=input_dim,
             window_size=window_size,
@@ -577,6 +631,7 @@ class SequenceAutoencoder(nn.Module):
             encoder_kernels=enc_kernels,    # type: ignore[arg-type]
             pool_size=pool_size,
             activation=activation,
+            action_feature_indices=action_feature_indices,
         )
 
 
