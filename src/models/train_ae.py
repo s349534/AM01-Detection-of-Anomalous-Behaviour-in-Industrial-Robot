@@ -149,11 +149,26 @@ def train_single_seed(
     train_time_sec = time.time() - start_time
     best_epoch = history.get("best_epoch", 0) if history else 0
 
+    # --- Compute channel-wise error statistics on training normal data ---
+    # These stats are used for channel-wise standardized MAE scoring at inference.
+    # They are computed on training normal data ONLY (no data leakage).
+    logger.info("Computing channel-wise error statistics on training normal data...")
+    channel_mean, channel_std = model.compute_channel_error_stats(
+        train_loader, dev, metric=loss_name, exclude_action_features=True
+    )
+
     # --- Calibrate threshold on this model's OWN validation errors ---
+    # Using channel-wise standardized MAE scoring (inference only).
     # (val_normal + val_anomaly) — NOT on Stage-1 search model errors.
     # This guarantees the threshold matches the model that will do inference.
-    val_normal_errors = compute_errors_on_loader(model, val_normal_loader, dev, metric=loss_name)
-    val_anomaly_errors = compute_errors_on_loader(model, val_anomaly_loader, dev, metric=loss_name)
+    val_normal_errors = compute_errors_on_loader(
+        model, val_normal_loader, dev, metric=loss_name,
+        channel_mean=channel_mean, channel_std=channel_std
+    )
+    val_anomaly_errors = compute_errors_on_loader(
+        model, val_anomaly_loader, dev, metric=loss_name,
+        channel_mean=channel_mean, channel_std=channel_std
+    )
     val_errors = np.concatenate([val_normal_errors, val_anomaly_errors])
     val_labels = np.concatenate([
         np.zeros(len(val_normal_errors), dtype=np.int32),
@@ -169,8 +184,15 @@ def train_single_seed(
     )
 
     # --- Evaluate on test (normal + anomaly) ---
-    test_normal_errors = compute_errors_on_loader(model, test_normal_loader, dev)
-    test_anomaly_errors = compute_errors_on_loader(model, test_anomaly_loader, dev)
+    # Using channel-wise standardized MAE scoring
+    test_normal_errors = compute_errors_on_loader(
+        model, test_normal_loader, dev, metric=loss_name,
+        channel_mean=channel_mean, channel_std=channel_std
+    )
+    test_anomaly_errors = compute_errors_on_loader(
+        model, test_anomaly_loader, dev, metric=loss_name,
+        channel_mean=channel_mean, channel_std=channel_std
+    )
     test_errors = np.concatenate([test_normal_errors, test_anomaly_errors])
     test_labels = np.concatenate([
         np.zeros(len(test_normal_errors), dtype=np.int32),
@@ -187,6 +209,45 @@ def train_single_seed(
         seed, train_time_sec, best_epoch,
         auc_scores["pr_auc"], auc_scores["roc_auc"], test_metrics["f1"], threshold,
     )
+
+    # --- Save checkpoint with channel stats (only for first seed / baseline) ---
+    if checkpoint_path is not None:
+        ckpt = Path(checkpoint_path)
+        # Load existing checkpoint to get model state and history
+        if ckpt.exists():
+            existing = torch.load(ckpt, map_location="cpu")
+            model_state = existing.get("model_state_dict", model.state_dict())
+            history_dict = existing.get("history", history)
+        else:
+            model_state = model.state_dict()
+            history_dict = history
+
+        # Save enhanced checkpoint with channel stats
+        torch.save(
+            {
+                "model_state_dict": model_state,
+                "history": history_dict,
+                "input_dim": model.input_dim,
+                "window_size": model.window_size,
+                "latent_dim": model.latent_dim,
+                "action_feature_indices": model.action_feature_indices,
+                "channel_mean": channel_mean,
+                "channel_std": channel_std,
+            },
+            ckpt,
+        )
+        logger.info("Saved checkpoint with channel stats to %s", ckpt)
+
+        # Also save channel stats separately for notebook access
+        stats_path = ckpt.parent / "channel_stats.npz"
+        np.savez(
+            stats_path,
+            channel_mean=channel_mean,
+            channel_std=channel_std,
+            input_dim=model.input_dim,
+            action_feature_indices=model.action_feature_indices,
+        )
+        logger.info("Saved channel stats to %s", stats_path)
 
     return {
         "seed": seed,

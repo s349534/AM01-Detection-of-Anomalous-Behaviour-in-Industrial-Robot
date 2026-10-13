@@ -1,5 +1,7 @@
 seed,train_time_sec,best_epoch,test_pr_auc,test_roc_auc,test_f1,test_accuracy,test_precision,test_recall,threshold,val_f1,n_train_windows,n_val_normal_windows,n_val_anomaly_windows,n_test_normal_windows,n_test_anomaly_windows
-42,34.8,2,0.359299,0.505004,0.542142,0.371876,0.371876,1.0,0.160197,0.542156,163639,35053,20754,35055,20754
+42,205.2,50,0.854938,0.860992,0.542142,0.371876,0.371876,1.0,-0.697729,0.542156,163639,35053,20754,35055,20754
+123,284.15,75,0.866941,0.85943,0.542142,0.371876,0.371876,1.0,-0.817172,0.542156,163639,35053,20754,35055,20754
+7,47.04,4,0.280264,0.352457,0.552328,0.397176,0.381528,1.0,-0.76836,0.542156,163639,35053,20754,35055,20754
 
 seed,train_time_sec,best_epoch,test_pr_auc,test_roc_auc,test_f1,test_accuracy,test_precision,test_recall,threshold,val_f1,n_train_windows,n_val_normal_windows,n_val_anomaly_windows,n_test_normal_windows,n_test_anomaly_windows
-MEAN+/-STD,34.80 +/- 0.00,2.0 +/- 0.0,0.3593 +/- 0.0000,0.5050 +/- 0.0000,0.5421 +/- 0.0000,,,,0.160197 +/- 0.000000,0.5422 +/- 0.0000,,,,,
+MEAN+/-STD,178.80 +/- 98.58,43.0 +/- 29.4,0.6674 +/- 0.2738,0.6910 +/- 0.2394,0.5455 +/- 0.0048,,,,-0.761087 +/- 0.049033,0.5422 +/- 0.0000,,,,,

@@ -21,7 +21,7 @@ logging:
   format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 model:
   name: adversarial_autoencoder
-  input_dim: 82
+  input_dim: 109
   window_size: 16
   encoding_dim: 32
   latent_dim: 16
