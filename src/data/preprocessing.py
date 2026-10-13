@@ -20,6 +20,7 @@ from typing import Any
 
 import joblib
 import numpy as np
+import yaml
 from scipy.stats import spearmanr
 from sklearn.preprocessing import StandardScaler
 
@@ -50,17 +51,18 @@ def _is_onehot_name(name: str) -> bool:
 def load_kuka_data(
     config: dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load the three raw .npy files, drop `anomaly`, remove constant features,
+    """Load the three raw .npy files, drop `anomaly`,
     remove highly correlated numerical features (Spearman > 0.95),
     and one-hot encode `action` column.
 
     KukaSlow has 87 columns (feature + anomaly label); KukaNormal has 86.
     The `anomaly` column (always 1) is dropped before alignment.
     The `action` column (index 0) is one-hot encoded to 32 binary columns.
-    Constant features (in both datasets) are removed from numerical features only.
     Highly correlated numerical features (Spearman > 0.95) are removed using
     the train split (first 70%) to avoid leakage — the feature with lower
     variance in each correlated pair is dropped.
+    Constant features (near-zero variance in TRAIN split) are removed
+    in a separate step after splitting (see `remove_constant_features`).
 
     Returns
     -------
@@ -109,56 +111,7 @@ def load_kuka_data(
     numerical_slow = slow[:, 1:]       # (M, 85) - exclude action
     numerical_names = col_names[1:86]  # 85 names - exclude action (0) and anomaly (86)
 
-    # --- Step 4: identify zero-variance features (numerical only) ---
-    std_normal = numerical_normal.std(axis=0)
-    std_slow = numerical_slow.std(axis=0)
-
-    # Only remove if constant in BOTH datasets.
-    constant_mask = (std_normal < CONST_STD_THRESHOLD) & (
-        std_slow < CONST_STD_THRESHOLD
-    )
-    constant_indices = np.where(constant_mask)[0]
-
-    if constant_indices.size > 0:
-        constant_names = [str(numerical_names[i]) for i in constant_indices]
-        logger.info(
-            "Removing %d zero-variance numerical feature(s) from both datasets: %s",
-            constant_indices.size, constant_names,
-        )
-    else:
-        logger.info("No zero-variance numerical features found.")
-
-    # Warn if a feature is constant in one dataset but not the other.
-    one_only_mask = (std_normal < CONST_STD_THRESHOLD) & (
-        std_slow >= CONST_STD_THRESHOLD
-    )
-    if one_only_mask.any():
-        indices = np.where(one_only_mask)[0]
-        names = [str(numerical_names[i]) for i in indices]
-        warnings.warn(
-            f"Numerical feature(s) constant in KukaNormal but NOT in KukaSlow -- kept: {names}. "
-            "They may be discriminative between normal and anomalous behaviour.",
-            UserWarning,
-        )
-
-    one_only_mask_2 = (std_normal >= CONST_STD_THRESHOLD) & (
-        std_slow < CONST_STD_THRESHOLD
-    )
-    if one_only_mask_2.any():
-        indices = np.where(one_only_mask_2)[0]
-        names = [str(numerical_names[i]) for i in indices]
-        warnings.warn(
-            f"Numerical feature(s) constant in KukaSlow but NOT in KukaNormal -- kept: {names}.",
-            UserWarning,
-        )
-
-    # --- Step 5: remove constant features ---
-    keep_mask = ~constant_mask
-    numerical_normal = numerical_normal[:, keep_mask]
-    numerical_slow = numerical_slow[:, keep_mask]
-    numerical_names = numerical_names[keep_mask]  # now 81 names
-
-    # --- Step 6: remove highly correlated numerical features (Spearman > 0.95) ---
+    # --- Step 4: remove highly correlated numerical features (Spearman > 0.95) ---
     # Use train split (first 70%) to avoid data leakage
     train_split = float(config["training"]["train_split"])
     n_train = int(train_split * numerical_normal.shape[0])
@@ -282,6 +235,84 @@ def split_temporal_data(
 
 
 # ---------------------------------------------------------------------------
+# Step 2b — remove constant features (based on TRAIN split only)
+# ---------------------------------------------------------------------------
+def remove_constant_features(
+    data: dict[str, np.ndarray],
+    selected_col_names: np.ndarray,
+    config: dict[str, Any],
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Remove numerical features with near-zero variance in the TRAIN split only.
+
+    This prevents StandardScaler from encountering zero-variance features during
+    fit, which would set scale_=1.0 and cause only mean-centering (no z-scoring).
+    Such features maintain their original magnitude while others are in [-3, 3],
+    creating artificial drift in val/test splits and distorting anomaly detection.
+
+    The threshold CONST_STD_THRESHOLD (1e-8) is deliberately small to catch only
+    truly constant features (e.g., a sensor stuck at its idle reading).
+
+    Parameters
+    ----------
+    data : dict[str, np.ndarray]
+        Dictionary with keys: train, val_normal, val_anomaly, test_normal, test_anomaly.
+    selected_col_names : np.ndarray
+        Array of column names corresponding to data columns.
+    config : dict[str, Any]
+        Configuration dict (used for train_split logging).
+
+    Returns
+    -------
+    tuple[dict[str, np.ndarray], np.ndarray]
+        Updated data dict and selected_col_names with constant features removed.
+    """
+    # Derive numerical vs one-hot indices from column names
+    is_onehot = np.array([_is_onehot_name(n) for n in selected_col_names])
+    numerical_indices = np.where(~is_onehot)[0]
+
+    # Compute variance on train numerical features ONLY
+    train_numerical = data["train"][:, numerical_indices]
+    variances = train_numerical.var(axis=0)  # ddof=0 (population variance)
+
+    # Identify constant features in train split
+    constant_mask = variances < CONST_STD_THRESHOLD
+
+    if not constant_mask.any():
+        logger.info("No constant numerical features found in TRAIN split.")
+        return data, selected_col_names
+
+    # Get names of features to remove
+    removed_indices = np.where(constant_mask)[0]
+    removed_names = [str(selected_col_names[numerical_indices[i]]) for i in removed_indices]
+
+    logger.info(
+        "Removing %d constant numerical feature(s) from TRAIN split (var < %.0e): %s",
+        len(removed_indices), CONST_STD_THRESHOLD, removed_names,
+    )
+
+    # Build keep mask for ALL features (numerical + one-hot)
+    # One-hot features are never removed (they have variance p(1-p) > 0)
+    keep_mask = np.ones(len(selected_col_names), dtype=bool)
+    keep_mask[numerical_indices[constant_mask]] = False
+
+    # Apply to all splits
+    updated_data = {}
+    for key, arr in data.items():
+        updated_data[key] = arr[:, keep_mask]
+
+    updated_names = selected_col_names[keep_mask]
+
+    n_numerical = np.sum(~np.array([_is_onehot_name(n) for n in updated_names]))
+    n_onehot = np.sum(np.array([_is_onehot_name(n) for n in updated_names]))
+    logger.info(
+        "After constant removal: %d numerical + %d one-hot (action) = %d total",
+        n_numerical, n_onehot, len(updated_names),
+    )
+
+    return updated_data, updated_names
+
+
+# ---------------------------------------------------------------------------
 # Step 3 — normalize
 # ---------------------------------------------------------------------------
 def normalize_data(
@@ -327,18 +358,6 @@ def normalize_data(
     train_numerical = data["train"][:, numerical_indices]
     scaler.fit(train_numerical)
 
-    # --- Detect features that are constant within the TRAIN split (numerical only) ---
-    near_zero_var = scaler.var_ < CONST_STD_THRESHOLD
-    if near_zero_var.any():
-        nz_cols = np.where(near_zero_var)[0]
-        logger.warning(
-            "Numerical features with near-zero variance in TRAIN split (indices %s): "
-            "these are constant within the first %.0f%% of KukaNormal. "
-            "StandardScaler handles them safely (scale set to 1).",
-            nz_cols.tolist(),
-            config["training"]["train_split"] * 100,
-        )
-
     scaled: dict[str, np.ndarray] = {}
     for key, arr in data.items():
         arr_scaled = arr.copy()
@@ -369,13 +388,12 @@ def normalize_data(
         f"max abs deviation = {np.abs(train_mean).max()}"
     )
 
-    non_const = ~near_zero_var
-    if non_const.any():
-        train_std_nonconst = train_num.std(axis=0)[non_const]
-        assert np.all((train_std_nonconst > 0.97) & (train_std_nonconst < 1.03)), (
-            f"Non-constant train numerical std should be ≈1; "
-            f"min={train_std_nonconst.min():.4f}, max={train_std_nonconst.max():.4f}"
-        )
+    # All features should have std ≈ 1 (constant features removed upstream)
+    train_std = train_num.std(axis=0)
+    assert np.all((train_std > 0.97) & (train_std < 1.03)), (
+        f"Train numerical std should be ≈1 for all features; "
+        f"min={train_std.min():.4f}, max={train_std.max():.4f}"
+    )
 
     # --- Assertions: val/test numerical features are NOT zero-mean (proves no leakage) ---
     val_num_mean_abs = np.abs(scaled["val_normal"][:, numerical_indices].mean(axis=0)).max()
@@ -415,30 +433,79 @@ def save_processed_data(
     np.save(cols_path, selected_col_names)
     logger.info("Saved %s: %d columns", cols_path, selected_col_names.shape[0])
 
+    # --- Update params.yaml with discovered input_dim ---
+    _update_params_input_dim(config, int(selected_col_names.shape[0]))
+
+
+def _update_params_input_dim(config: dict[str, Any], input_dim: int) -> None:
+    """Update params.yaml with the discovered input_dim from preprocessing.
+
+    The params.yaml file contains a placeholder input_dim (82) that gets
+    overridden at runtime by reading selected_columns.npy. This function
+    writes the actual discovered value back to params.yaml so the config
+    reflects the true data dimensionality.
+
+    Parameters
+    ----------
+    config : dict
+        Full config dict (must contain paths).
+    input_dim : int
+        Actual number of features after preprocessing (numerical + one-hot).
+    """
+    # Project root: this file is src/data/preprocessing.py → parents[2] = project_root
+    project_root = Path(__file__).resolve().parents[2]
+    params_path = project_root / "config" / "params.yaml"
+
+    if not params_path.exists():
+        logger.warning("params.yaml not found at %s, skipping input_dim update", params_path)
+        return
+
+    try:
+        with open(params_path, "r", encoding="utf-8") as f:
+            params = yaml.safe_load(f) or {}
+
+        # Update model.input_dim
+        if "model" not in params:
+            params["model"] = {}
+        old_dim = params["model"].get("input_dim", "unset")
+        params["model"]["input_dim"] = input_dim
+
+        with open(params_path, "w", encoding="utf-8") as f:
+            yaml.dump(params, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+        logger.info("Updated params.yaml: model.input_dim %s → %d", old_dim, input_dim)
+
+    except Exception as e:
+        logger.warning("Failed to update params.yaml with input_dim: %s", e)
+
 
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 def run_preprocessing(config: dict[str, Any]) -> dict[str, np.ndarray]:
-    """Run the full preprocessing pipeline: load → split → normalize → save."""
+    """Run the full preprocessing pipeline: load → split → remove constants → normalize → save."""
     logger.info("=" * 60)
     logger.info("AM01 — Fase 2 Preprocessing Pipeline")
     logger.info("=" * 60)
 
     # --- Step 1: Load ---
-    logger.info("[1/4] Loading Kuka data...")
+    logger.info("[1/5] Loading Kuka data...")
     normal, slow, selected_cols = load_kuka_data(config)
 
     # --- Step 2: Split ---
-    logger.info("[2/4] Splitting data (temporal, 70/15/15)...")
+    logger.info("[2/5] Splitting data (temporal, 70/15/15)...")
     data_splits = split_temporal_data(normal, slow, config)
 
-    # --- Step 3: Normalize ---
-    logger.info("[3/4] Normalizing (StandardScaler on numerical only, fit on train)...")
+    # --- Step 3: Remove constant features (based on TRAIN split only) ---
+    logger.info("[3/5] Removing constant features (train split variance < %.0e)...", CONST_STD_THRESHOLD)
+    data_splits, selected_cols = remove_constant_features(data_splits, selected_cols, config)
+
+    # --- Step 4: Normalize ---
+    logger.info("[4/5] Normalizing (StandardScaler on numerical only, fit on train)...")
     scaled_splits, scaler = normalize_data(data_splits, config, selected_cols)
 
-    # --- Step 4: Save ---
-    logger.info("[4/4] Saving processed data...")
+    # --- Step 5: Save ---
+    logger.info("[5/5] Saving processed data...")
     save_processed_data(scaled_splits, scaler, selected_cols, config)
 
     logger.info("Preprocessing completed successfully.")

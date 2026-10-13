@@ -10,7 +10,7 @@ Workflow per run (Stage 1 - Model Selection):
     4. Train with early stopping on validation normal reconstruction loss
     5. Compute reconstruction errors on val_normal + val_anomaly (HP selection set)
     6. Compute ROC-AUC and PR-AUC on validation (threshold-free, no binarization)
-    7. Return dict with val_roc_auc, val_pr_auc (no test metrics, no threshold, no errors_file)
+    7. Return dict with val_roc_auc, val_pr_auc (no test metrics, no threshold)
 
 Robust hyperparameter selection (§4.8.6):
     ``run_search_ae.py`` invokes this function **3 times per configuration**,
@@ -61,8 +61,7 @@ def train_and_evaluate_ae(
     """Train a single AE configuration and evaluate on validation (Stage 1).
 
     This is the Model Selection stage: computes ROC-AUC and PR-AUC on
-    val_normal + val_anomaly WITHOUT any threshold. Saves raw errors+labels
-    to .npz for Stage 2 threshold calibration.
+    val_normal + val_anomaly WITHOUT any threshold.
 
     Parameters
     ----------
@@ -102,7 +101,7 @@ def train_and_evaluate_ae(
                 "seed": int,
             }
 
-        No test metrics, no threshold, no F1, no errors_file.
+        No test metrics, no threshold, no F1.
     """
     set_seed(seed)
 

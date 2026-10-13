@@ -15,6 +15,7 @@ from src.data.preprocessing import (
     CONST_STD_THRESHOLD,
     load_kuka_data,
     normalize_data,
+    remove_constant_features,
     split_temporal_data,
 )
 from src.utils.config import load_config
@@ -38,15 +39,19 @@ def loaded(config):
 
 @pytest.fixture(scope="module")
 def splits(loaded, config):
-    """Split the loaded data temporally (60/20/20)."""
-    normal, slow, _ = loaded
-    return split_temporal_data(normal, slow, config)
+    """Split the loaded data temporally (70/15/15)."""
+    normal, slow, selected_cols = loaded
+    data_splits = split_temporal_data(normal, slow, config)
+    # Also remove constant features based on train split
+    data_splits, selected_cols = remove_constant_features(data_splits, selected_cols, config)
+    return data_splits, selected_cols
 
 
 @pytest.fixture(scope="module")
 def normalised(splits, config):
     """StandardScale the splits and return (scaled_dict, scaler)."""
-    return normalize_data(splits, config)
+    data_splits, selected_cols = splits
+    return normalize_data(data_splits, config, selected_cols)
 
 
 # ---------------------------------------------------------------------------
@@ -55,50 +60,38 @@ def normalised(splits, config):
 class TestLoadKukaData:
     def test_normal_shape(self, loaded):
         normal, _, _ = loaded
-        assert normal.shape == (233792, 82), f"Expected (233792, 82), got {normal.shape}"
+        # After load: 82 numerical + 32 one-hot = 114 (after correlated removal)
+        assert normal.shape == (233792, 114), f"Expected (233792, 114), got {normal.shape}"
 
     def test_slow_shape(self, loaded):
         _, slow, _ = loaded
-        assert slow.shape == (41538, 82), f"Expected (41538, 82), got {slow.shape}"
+        assert slow.shape == (41538, 114), f"Expected (41538, 114), got {slow.shape}"
 
     def test_selected_cols_shape(self, loaded):
         _, _, cols = loaded
-        assert cols.shape == (82,), f"Expected (82,), got {cols.shape}"
+        assert cols.shape == (114,), f"Expected (114,), got {cols.shape}"
 
     def test_columns_aligned(self, loaded):
         """Both arrays must have the same number of features."""
         normal, slow, cols = loaded
-        assert normal.shape[1] == slow.shape[1] == 82
-        assert len(cols) == 82
+        assert normal.shape[1] == slow.shape[1] == 114
+        assert len(cols) == 114
 
     def test_anomaly_dropped(self, loaded):
         """The 'anomaly' column must not be among the retained columns."""
         _, _, cols = loaded
         assert "anomaly" not in cols
 
-    def test_constant_features_removed(self, loaded):
-        """The 4 sensor_id{2,5,6,7}_temp columns must be removed."""
+    def test_highly_correlated_removed(self, loaded):
+        """The 3 highly correlated features must be removed."""
         _, _, cols = loaded
         removed = {
-            "sensor_id2_temp",
-            "sensor_id5_temp",
-            "sensor_id6_temp",
-            "sensor_id7_temp",
+            "machine_nameKuka Robot_apparent_power",
+            "machine_nameKuka Robot_power_factor",
+            "sensor_id7_q2",
         }
         assert removed.isdisjoint(set(cols.tolist())), (
             f"Found removed features in selected columns: {removed & set(cols.tolist())}"
-        )
-
-    def test_no_constant_features_remaining(self, loaded):
-        """No remaining feature should be (near-)constant across BOTH datasets."""
-        normal, slow, _ = loaded
-        std_normal = normal.std(axis=0)
-        std_slow = slow.std(axis=0)
-        constant_both = (std_normal < CONST_STD_THRESHOLD) & (
-            std_slow < CONST_STD_THRESHOLD
-        )
-        assert not constant_both.any(), (
-            f"Found constant features in both datasets: {np.where(constant_both)[0]}"
         )
 
     def test_dtype(self, loaded):
@@ -112,51 +105,55 @@ class TestLoadKukaData:
 # ---------------------------------------------------------------------------
 class TestSplitTemporal:
     def test_proportions(self, splits):
+        data_splits, _ = splits
         n_total = 233792
-        train = splits["train"]
-        val = splits["val"]
-        test_normal = splits["test_normal"]
-        expected_train = int(0.60 * n_total)  # 140275
-        expected_val = int(0.20 * n_total)   # 46758
+        train = data_splits["train"]
+        val_normal = data_splits["val_normal"]
+        test_normal = data_splits["test_normal"]
+        expected_train = int(0.70 * n_total)  # 163654
+        expected_val = int(0.15 * n_total)    # 35068
 
         assert train.shape[0] == expected_train
-        assert val.shape[0] == expected_val
-        assert train.shape[0] + val.shape[0] + test_normal.shape[0] == n_total
+        assert val_normal.shape[0] == expected_val
+        assert train.shape[0] + val_normal.shape[0] + test_normal.shape[0] == n_total
 
     def test_no_shuffle(self, loaded, config):
         """train[0] must equal the first row of the full normal array."""
         normal, slow, _ = loaded
-        splits = split_temporal_data(normal, slow, config)
+        data_splits = split_temporal_data(normal, slow, config)
         np.testing.assert_array_equal(
-            splits["train"][0], normal[0],
+            data_splits["train"][0], normal[0],
             err_msg="First train row must match first normal row (no shuffle)",
         )
 
-    def test_test_anomaly_is_full_slow(self, loaded, config):
-        """test_anomaly must contain exactly all of KukaSlow."""
+    def test_val_anomaly_is_half_slow(self, loaded, config):
+        """val_anomaly must contain 50% of KukaSlow."""
         normal, slow, _ = loaded
-        splits = split_temporal_data(normal, slow, config)
-        assert splits["test_anomaly"].shape[0] == slow.shape[0]
+        data_splits = split_temporal_data(normal, slow, config)
+        assert data_splits["val_anomaly"].shape[0] == int(0.5 * slow.shape[0])
 
     def test_temporal_continuity(self, loaded, config):
-        """train is the first 60%, val the next 20%, test_normal the last 20%."""
+        """train is the first 70%, val the next 15%, test_normal the last 15%."""
         normal, slow, _ = loaded
         n_total = normal.shape[0]
-        n_train = int(0.60 * n_total)
+        n_train = int(0.70 * n_total)
+        n_val = int(0.15 * n_total)
 
-        splits = split_temporal_data(normal, slow, config)
+        data_splits = split_temporal_data(normal, slow, config)
 
         # train[0] == normal[0], train[-1] == normal[n_train-1]
-        np.testing.assert_array_equal(splits["train"][0], normal[0])
-        np.testing.assert_array_equal(splits["train"][-1], normal[n_train - 1])
+        np.testing.assert_array_equal(data_splits["train"][0], normal[0])
+        np.testing.assert_array_equal(data_splits["train"][-1], normal[n_train - 1])
         # val[0] == normal[n_train], val[-1] == normal[n_train+n_val-1]
-        np.testing.assert_array_equal(splits["val"][0], normal[n_train])
+        np.testing.assert_array_equal(data_splits["val_normal"][0], normal[n_train])
         # test_normal[-1] == normal[-1]
-        np.testing.assert_array_equal(splits["test_normal"][-1], normal[-1])
+        np.testing.assert_array_equal(data_splits["test_normal"][-1], normal[-1])
 
     def test_feature_dim_consistency(self, splits):
-        for key in ("train", "val", "test_normal", "test_anomaly"):
-            assert splits[key].shape[1] == 82
+        data_splits, selected_cols = splits
+        expected_dim = len(selected_cols)  # 109 after constant removal
+        for key in ("train", "val_normal", "val_anomaly", "test_normal", "test_anomaly"):
+            assert data_splits[key].shape[1] == expected_dim
 
 
 # ---------------------------------------------------------------------------
@@ -165,42 +162,49 @@ class TestSplitTemporal:
 class TestNormalizeData:
     def test_train_zero_mean(self, normalised):
         scaled, _ = normalised
-        train_mean = scaled["train"].mean(axis=0)
+        # Check only numerical features (exclude one-hot action columns)
+        is_oh = np.array([str(c).startswith('action_') for c in scaled["train"].dtype.names]) if scaled["train"].dtype.names else np.zeros(scaled["train"].shape[1], dtype=bool)
+        # Since we don't have column names here, we know first N are numerical, last 32 are one-hot
+        n_numerical = scaled["train"].shape[1] - 32
+        train_num = scaled["train"][:, :n_numerical]
+        train_mean = train_num.mean(axis=0)
         np.testing.assert_allclose(
             train_mean, 0, atol=1e-3,
-            err_msg="train mean should be ≈0 after StandardScaler",
+            err_msg="train numerical mean should be ≈0 after StandardScaler",
         )
 
-    def test_train_unit_std_nonconst(self, normalised):
-        """Non-constant features should have std ≈1 after StandardScaler."""
-        scaled, scaler = normalised
-        train = scaled["train"]
-        nonconst = scaler.var_ >= CONST_STD_THRESHOLD
-        if nonconst.any():
-            train_std = train.std(axis=0)[nonconst]
-            np.testing.assert_allclose(
-                train_std, 1, atol=0.03,
-                err_msg="Non-constant train std should be ≈1 after StandardScaler",
-            )
+    def test_train_unit_std(self, normalised):
+        """All numerical features should have std ≈1 after StandardScaler (constants removed upstream)."""
+        scaled, _ = normalised
+        n_numerical = scaled["train"].shape[1] - 32
+        train_num = scaled["train"][:, :n_numerical]
+        train_std = train_num.std(axis=0)
+        np.testing.assert_allclose(
+            train_std, 1, atol=0.03,
+            err_msg="Train numerical std should be ≈1 after StandardScaler",
+        )
 
     def test_no_leakage(self, normalised):
         """Val mean must NOT be ≈0 (proves scaler was fit on train only)."""
         scaled, _ = normalised
-        val_mean_abs = np.abs(scaled["val"].mean(axis=0)).max()
+        n_numerical = scaled["val_normal"].shape[1] - 32
+        val_num = scaled["val_normal"][:, :n_numerical]
+        val_mean_abs = np.abs(val_num.mean(axis=0)).max()
         assert val_mean_abs > 1e-3, (
-            f"val mean ≈ 0 — scaler may have been fit on val (max abs={val_mean_abs})"
+            f"val numerical mean ≈ 0 — scaler may have been fit on val (max abs={val_mean_abs})"
         )
 
     def test_scaler_is_fitted(self, normalised):
         _, scaler = normalised
         assert hasattr(scaler, "mean_"), "Scaler must be fitted"
         assert hasattr(scaler, "scale_")
-        assert scaler.mean_.shape == (82,)
-        assert scaler.scale_.shape == (82,)
+        # Scaler is fitted on numerical features only (77)
+        assert scaler.mean_.shape == (77,)
+        assert scaler.scale_.shape == (77,)
 
     def test_all_splits_finite(self, normalised):
         scaled, _ = normalised
-        for key in ("train", "val", "test_normal", "test_anomaly"):
+        for key in ("train", "val_normal", "val_anomaly", "test_normal", "test_anomaly"):
             assert scaled[key].dtype == np.float32
             assert np.all(np.isfinite(scaled[key])), f"{key} contains inf/nan"
 
@@ -307,6 +311,7 @@ class TestKukaDataset:
         train = np.load(Path("data/processed/train.npy"))
         ds = KukaDataset(train, window_size=16, label=0)
         window, label = ds[0]
-        assert window.shape == (16, 82)
+        # After preprocessing: 77 numerical + 32 one-hot = 109
+        assert window.shape == (16, 109), f"Expected (16, 109), got {window.shape}"
         assert label.item() == 0.0
-        assert len(ds) == 140275 - 16 + 1  # 140260
+        assert len(ds) == train.shape[0] - 16 + 1
