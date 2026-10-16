@@ -170,24 +170,10 @@ def train_and_evaluate_ae(
     train_time_sec = time.time() - start_time
     best_epoch = history.get("best_epoch", 0) if history else 0
 
-    # --- Compute channel-wise error statistics on training normal data ---
-    # These stats are used for channel-wise standardized MAE scoring at inference.
-    # They are computed on training normal data ONLY (no data leakage).
-    logger.info("Computing channel-wise error statistics on training normal data...")
-    channel_mean, channel_std = model.compute_channel_error_stats(
-        train_loader, dev, metric=loss_name, exclude_action_features=True
-    )
-
     # --- HP Selection: ROC-AUC + PR-AUC on Validation (val_normal + val_anomaly) ---
-    # Using channel-wise standardized MAE scoring (inference only).
-    val_normal_errors = compute_errors_on_loader(
-        model, val_normal_loader, dev, metric=metric,
-        channel_mean=channel_mean, channel_std=channel_std
-    )
-    val_anomaly_errors = compute_errors_on_loader(
-        model, val_anomaly_loader, dev, metric=metric,
-        channel_mean=channel_mean, channel_std=channel_std
-    )
+    # Using classic MAE scoring (inference only).
+    val_normal_errors = compute_errors_on_loader(model, val_normal_loader, dev, metric=metric)
+    val_anomaly_errors = compute_errors_on_loader(model, val_anomaly_loader, dev, metric=metric)
 
     # Concatenate errors and create labels (0 = normal, 1 = anomaly)
     val_errors = np.concatenate([val_normal_errors, val_anomaly_errors])

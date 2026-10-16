@@ -1,6 +1,6 @@
 model:
   name: adversarial_autoencoder
-  input_dim: 109
+  input_dim: 86
   window_size: 16
   encoding_dim: 32
   latent_dim: 16
@@ -45,5 +45,5 @@ data:
   window_size: 16
   window_stride: 1
   drop_incomplete: true
-  normalization: standard
+  normalization: minmax
   augmentation: false

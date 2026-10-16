@@ -130,8 +130,8 @@ class TestSequenceAutoencoder:
 
     def test_from_config(self, default_config):
         model = SequenceAutoencoder.from_config(default_config)
-        # After preprocessing, params.yaml is updated with the actual input_dim (109 = 77 numerical + 32 one-hot)
-        assert model.input_dim == 109
+        # After preprocessing, params.yaml is updated with the actual input_dim (86 = 85 numerical + 1 action)
+        assert model.input_dim == 86
         assert model.window_size == 16
         assert model.latent_dim == 16
 

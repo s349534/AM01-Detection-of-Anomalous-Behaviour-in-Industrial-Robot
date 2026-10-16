@@ -21,10 +21,10 @@ logging:
   format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 model:
   name: adversarial_autoencoder
-  input_dim: 109
-  window_size: 16
+  input_dim: 86
+  window_size: 256
   encoding_dim: 32
-  latent_dim: 16
+  latent_dim: 32
   encoder:
     conv_channels:
     - 64
@@ -66,5 +66,5 @@ data:
   window_size: 16
   window_stride: 1
   drop_incomplete: true
-  normalization: standard
+  normalization: minmax
   augmentation: false

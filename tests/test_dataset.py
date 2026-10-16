@@ -12,10 +12,8 @@ import torch
 
 from src.data.dataset import KukaDataset
 from src.data.preprocessing import (
-    CONST_STD_THRESHOLD,
     load_kuka_data,
     normalize_data,
-    remove_constant_features,
     split_temporal_data,
 )
 from src.utils.config import load_config
@@ -42,14 +40,12 @@ def splits(loaded, config):
     """Split the loaded data temporally (70/15/15)."""
     normal, slow, selected_cols = loaded
     data_splits = split_temporal_data(normal, slow, config)
-    # Also remove constant features based on train split
-    data_splits, selected_cols = remove_constant_features(data_splits, selected_cols, config)
     return data_splits, selected_cols
 
 
 @pytest.fixture(scope="module")
 def normalised(splits, config):
-    """StandardScale the splits and return (scaled_dict, scaler)."""
+    """MinMaxScaler the splits and return (scaled_dict, scaler)."""
     data_splits, selected_cols = splits
     return normalize_data(data_splits, config, selected_cols)
 
@@ -60,39 +56,27 @@ def normalised(splits, config):
 class TestLoadKukaData:
     def test_normal_shape(self, loaded):
         normal, _, _ = loaded
-        # After load: 82 numerical + 32 one-hot = 114 (after correlated removal)
-        assert normal.shape == (233792, 114), f"Expected (233792, 114), got {normal.shape}"
+        # After load: 86 features (1 action + 85 numerical)
+        assert normal.shape == (233792, 86), f"Expected (233792, 86), got {normal.shape}"
 
     def test_slow_shape(self, loaded):
         _, slow, _ = loaded
-        assert slow.shape == (41538, 114), f"Expected (41538, 114), got {slow.shape}"
+        assert slow.shape == (41538, 86), f"Expected (41538, 86), got {slow.shape}"
 
     def test_selected_cols_shape(self, loaded):
         _, _, cols = loaded
-        assert cols.shape == (114,), f"Expected (114,), got {cols.shape}"
+        assert cols.shape == (86,), f"Expected (86,), got {cols.shape}"
 
     def test_columns_aligned(self, loaded):
         """Both arrays must have the same number of features."""
         normal, slow, cols = loaded
-        assert normal.shape[1] == slow.shape[1] == 114
-        assert len(cols) == 114
+        assert normal.shape[1] == slow.shape[1] == 86
+        assert len(cols) == 86
 
     def test_anomaly_dropped(self, loaded):
         """The 'anomaly' column must not be among the retained columns."""
         _, _, cols = loaded
         assert "anomaly" not in cols
-
-    def test_highly_correlated_removed(self, loaded):
-        """The 3 highly correlated features must be removed."""
-        _, _, cols = loaded
-        removed = {
-            "machine_nameKuka Robot_apparent_power",
-            "machine_nameKuka Robot_power_factor",
-            "sensor_id7_q2",
-        }
-        assert removed.isdisjoint(set(cols.tolist())), (
-            f"Found removed features in selected columns: {removed & set(cols.tolist())}"
-        )
 
     def test_dtype(self, loaded):
         normal, slow, _ = loaded
@@ -151,7 +135,7 @@ class TestSplitTemporal:
 
     def test_feature_dim_consistency(self, splits):
         data_splits, selected_cols = splits
-        expected_dim = len(selected_cols)  # 109 after constant removal
+        expected_dim = len(selected_cols)  # 86 after preprocessing
         for key in ("train", "val_normal", "val_anomaly", "test_normal", "test_anomaly"):
             assert data_splits[key].shape[1] == expected_dim
 
@@ -160,47 +144,33 @@ class TestSplitTemporal:
 # normalize_data
 # ---------------------------------------------------------------------------
 class TestNormalizeData:
-    def test_train_zero_mean(self, normalised):
+    def test_train_in_range(self, normalised):
+        """All train features must be in [-1, 1] after MinMaxScaler."""
         scaled, _ = normalised
-        # Check only numerical features (exclude one-hot action columns)
-        is_oh = np.array([str(c).startswith('action_') for c in scaled["train"].dtype.names]) if scaled["train"].dtype.names else np.zeros(scaled["train"].shape[1], dtype=bool)
-        # Since we don't have column names here, we know first N are numerical, last 32 are one-hot
-        n_numerical = scaled["train"].shape[1] - 32
-        train_num = scaled["train"][:, :n_numerical]
-        train_mean = train_num.mean(axis=0)
-        np.testing.assert_allclose(
-            train_mean, 0, atol=1e-3,
-            err_msg="train numerical mean should be ≈0 after StandardScaler",
+        train = scaled["train"]
+        assert np.all(train >= -1 - 1e-6), (
+            f"Train min below -1 after MinMaxScaler; max deviation = {np.abs(train.min() + 1).max()}"
         )
-
-    def test_train_unit_std(self, normalised):
-        """All numerical features should have std ≈1 after StandardScaler (constants removed upstream)."""
-        scaled, _ = normalised
-        n_numerical = scaled["train"].shape[1] - 32
-        train_num = scaled["train"][:, :n_numerical]
-        train_std = train_num.std(axis=0)
-        np.testing.assert_allclose(
-            train_std, 1, atol=0.03,
-            err_msg="Train numerical std should be ≈1 after StandardScaler",
+        assert np.all(train <= 1 + 1e-6), (
+            f"Train max above 1 after MinMaxScaler; max deviation = {np.abs(train.max() - 1).max()}"
         )
 
     def test_no_leakage(self, normalised):
-        """Val mean must NOT be ≈0 (proves scaler was fit on train only)."""
+        """Val range must differ from train range (proves scaler was fit on train only)."""
         scaled, _ = normalised
-        n_numerical = scaled["val_normal"].shape[1] - 32
-        val_num = scaled["val_normal"][:, :n_numerical]
-        val_mean_abs = np.abs(val_num.mean(axis=0)).max()
-        assert val_mean_abs > 1e-3, (
-            f"val numerical mean ≈ 0 — scaler may have been fit on val (max abs={val_mean_abs})"
+        train_range = scaled["train"].max(axis=0) - scaled["train"].min(axis=0)
+        val_range = scaled["val_normal"].max(axis=0) - scaled["val_normal"].min(axis=0)
+        assert not np.allclose(train_range, val_range, atol=1e-3), (
+            "val feature range ~= train feature range — scaler may have been fit on val"
         )
 
     def test_scaler_is_fitted(self, normalised):
         _, scaler = normalised
-        assert hasattr(scaler, "mean_"), "Scaler must be fitted"
-        assert hasattr(scaler, "scale_")
-        # Scaler is fitted on numerical features only (77)
-        assert scaler.mean_.shape == (77,)
-        assert scaler.scale_.shape == (77,)
+        assert hasattr(scaler, "data_min_"), "Scaler must be fitted"
+        assert hasattr(scaler, "data_max_")
+        # Scaler is fitted on all 86 features
+        assert scaler.data_min_.shape == (86,)
+        assert scaler.data_max_.shape == (86,)
 
     def test_all_splits_finite(self, normalised):
         scaled, _ = normalised
@@ -311,7 +281,7 @@ class TestKukaDataset:
         train = np.load(Path("data/processed/train.npy"))
         ds = KukaDataset(train, window_size=16, label=0)
         window, label = ds[0]
-        # After preprocessing: 77 numerical + 32 one-hot = 109
-        assert window.shape == (16, 109), f"Expected (16, 109), got {window.shape}"
+        # After preprocessing: 86 features (1 action + 85 numerical)
+        assert window.shape == (16, 86), f"Expected (16, 86), got {window.shape}"
         assert label.item() == 0.0
         assert len(ds) == train.shape[0] - 16 + 1

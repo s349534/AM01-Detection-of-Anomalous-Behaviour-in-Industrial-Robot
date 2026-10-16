@@ -41,13 +41,8 @@ Fixed Architecture Parameters:
     - Pooling: 2 stages of MaxPool1d(2) after conv layers 1 and 2
     - Window size must be a multiple of 4
 
-Channel-wise Standardized MAE (Inference Only):
-    After training, per-channel error statistics (mean μ_err,d, std σ_err,d) are
-    computed on training normal data. At inference, the anomaly score applies
-    diagonal Mahalanobis standardization:
-        score_d = (|x_d - x̂_d| - μ_err,d) / (σ_err,d + ε)
-    This neutralizes dispersive channels (high σ) and amplifies precise channels
-    (low σ). Training loss remains classic MAE (unchanged).
+Anomaly Scoring:
+    Classic mean absolute error (MAE) across all sensor channels.
 """
 from __future__ import annotations
 
@@ -65,9 +60,6 @@ from torch.utils.data import DataLoader
 from src.utils.config import get_param, load_config
 
 logger = logging.getLogger(__name__)
-
-# Constant for channel-wise standardization (not configurable)
-CHANNEL_STD_EPS = 1e-8
 
 
 # ---------------------------------------------------------------------------
@@ -337,13 +329,11 @@ class SequenceAutoencoder(nn.Module):
         encoder_kernels: tuple[int, int, int] = (5, 3, 3),
         pool_size: int = 2,
         activation: str = "relu",
-        action_feature_indices: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.window_size = window_size
         self.latent_dim = latent_dim
-        self.action_feature_indices = action_feature_indices
 
         self.encoder = Conv1dEncoder(
             input_dim=input_dim,
@@ -439,9 +429,6 @@ class SequenceAutoencoder(nn.Module):
         x: torch.Tensor,
         reduction: Literal["none", "mean", "sample"] = "sample",
         metric: Literal["mse", "mae"] = "mae",
-        exclude_action_features: bool = True,
-        channel_mean: np.ndarray | None = None,
-        channel_std: np.ndarray | None = None,
     ) -> torch.Tensor:
         """Compute reconstruction error between input and its autoencoder reconstruction.
 
@@ -457,26 +444,11 @@ class SequenceAutoencoder(nn.Module):
         metric : {"mse", "mae"}, default="mae"
             Distance metric used (MAE: absolute difference, MSE: squared difference).
             Default is "mae" for robustness to sensor saturation (see §7 #9).
-        exclude_action_features : bool, default=True
-            If True and ``action_feature_indices`` is configured, exclude the one-hot
-            action features from the error computation. This prevents the ~30% of
-            input dimensions that are action one-hot vectors (which reconstruct with
-            near-zero error on both normal and anomalous data) from diluting the
-            anomaly score. Set to False to compute error on all features (e.g., for
-            training loss monitoring).
-        channel_mean : np.ndarray, optional
-            Per-channel mean of absolute errors (from training normal data).
-            If provided along with ``channel_std``, applies channel-wise standardization:
-            ``(abs_err - channel_mean) / (channel_std + eps)``.
-        channel_std : np.ndarray, optional
-            Per-channel std of absolute errors (from training normal data).
-            If provided along with ``channel_mean``, applies channel-wise standardization.
 
         Returns
         -------
         torch.Tensor
             Reconstruction error tensor according to requested reduction.
-            When channel stats provided and reduction="sample", returns standardized MAE score.
         """
         with torch.no_grad():
             x_hat = self.forward(x)
@@ -487,63 +459,6 @@ class SequenceAutoencoder(nn.Module):
             diff = torch.abs(x - x_hat)
         else:
             raise ValueError(f"Unsupported metric: '{metric}', must be 'mse' or 'mae'")
-
-        # Exclude action features from anomaly score computation if configured
-        # Action features are one-hot encoded PLC commands (exogenous), not robot
-        # physical state. They reconstruct with near-zero error on both normal and
-        # anomalous data, diluting the anomaly score contrast.
-        if exclude_action_features and self.action_feature_indices is not None:
-            # diff shape: (B, W, D) or (B, D, W) depending on input layout
-            # We need to mask along the feature dimension (last or middle)
-            # Determine feature dimension from input layout
-            if x.size(1) == self.window_size and x.size(2) == self.input_dim:
-                # Layout: (B, W, D) - feature dim is 2
-                feature_dim = 2
-            elif x.size(1) == self.input_dim and x.size(2) == self.window_size:
-                # Layout: (B, D, W) - feature dim is 1
-                feature_dim = 1
-            else:
-                # Fallback: assume feature dim is the one matching input_dim
-                feature_dim = 1 if x.size(1) == self.input_dim else 2
-
-            # Create mask for non-action features
-            mask = torch.ones(self.input_dim, dtype=torch.bool, device=diff.device)
-            mask[list(self.action_feature_indices)] = False
-
-            # Apply mask along feature dimension
-            if feature_dim == 1:
-                # (B, D, W) -> (B, D_non_action, W)
-                diff = diff[:, mask, :]
-            else:
-                # (B, W, D) -> (B, W, D_non_action)
-                diff = diff[:, :, mask]
-
-        # Apply channel-wise standardization if stats provided
-        # This implements: (|x - x̂| - μ_err) / (σ_err + ε) per channel
-        if channel_mean is not None and channel_std is not None:
-            # channel_mean/std are for non-action channels only (length D_non_action)
-            # diff is either (B, W, D_non_action) or (B, D_non_action, W)
-            # Need to broadcast along feature dimension
-            device = diff.device
-            mean_tensor = torch.from_numpy(channel_mean).to(device, dtype=diff.dtype)
-            std_tensor = torch.from_numpy(channel_std).to(device, dtype=diff.dtype)
-
-            # Add epsilon to std for numerical stability
-            std_tensor = std_tensor + CHANNEL_STD_EPS
-
-            if feature_dim == 1:
-                # (B, D_non_action, W) -> broadcast mean/std over (B, W)
-                # Reshape to (1, D_non_action, 1) for broadcasting
-                mean_tensor = mean_tensor.view(1, -1, 1)
-                std_tensor = std_tensor.view(1, -1, 1)
-            else:
-                # (B, W, D_non_action) -> broadcast mean/std over (B, W)
-                # Reshape to (1, 1, D_non_action) for broadcasting
-                mean_tensor = mean_tensor.view(1, 1, -1)
-                std_tensor = std_tensor.view(1, 1, -1)
-
-            # Apply standardization: (diff - mean) / (std + eps)
-            diff = (diff - mean_tensor) / std_tensor
 
         if reduction == "none":
             return diff
@@ -558,100 +473,14 @@ class SequenceAutoencoder(nn.Module):
             f"Unsupported reduction: '{reduction}', must be 'none', 'mean', or 'sample'"
         )
 
-    def compute_channel_error_stats(
-        self,
-        loader: DataLoader,
-        device: torch.device,
-        metric: Literal["mae", "mse"] = "mae",
-        exclude_action_features: bool = True,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Compute per-channel mean and std of absolute reconstruction errors on normal data.
-
-        This is used for channel-wise standardized MAE scoring at inference time.
-        The statistics are computed on training normal data ONLY (no leakage).
-
-        Parameters
-        ----------
-        loader : DataLoader
-            DataLoader for training normal data (label=0).
-        device : torch.device
-            Device for inference.
-        metric : {"mae", "mse"}, default="mae"
-            Metric for per-element error computation.
-        exclude_action_features : bool, default=True
-            Whether to exclude action one-hot features from statistics.
-
-        Returns
-        -------
-        channel_mean : np.ndarray, shape (D_non_action,)
-            Mean absolute error per channel across windows and timesteps.
-        channel_std : np.ndarray, shape (D_non_action,)
-            Standard deviation of absolute error per channel across windows.
-        """
-        self.eval()
-        all_channel_errors: list[np.ndarray] = []
-
-        with torch.no_grad():
-            for batch in loader:
-                x = batch[0] if isinstance(batch, (list, tuple)) else batch
-                x = x.to(device)
-
-                # Get per-element absolute errors: (B, W, D_non_action) or (B, D_non_action, W)
-                diff = self.compute_reconstruction_error(
-                    x,
-                    reduction="none",
-                    metric=metric,
-                    exclude_action_features=exclude_action_features,
-                )
-                diff_np = diff.cpu().numpy()
-
-                # Average over timestep dimension to get per-channel error per window
-                # diff shape depends on input layout: (B, W, D) or (B, D, W)
-                if diff_np.shape[1] == self.window_size:
-                    # Layout: (B, W, D_non_action) → average over W (axis=1)
-                    channel_err = diff_np.mean(axis=1)  # (B, D_non_action)
-                else:
-                    # Layout: (B, D_non_action, W) → average over W (axis=2)
-                    channel_err = diff_np.mean(axis=2)  # (B, D_non_action)
-
-                all_channel_errors.append(channel_err)
-
-        if not all_channel_errors:
-            raise ValueError("No batches yielded from DataLoader — dataset may be empty.")
-
-        # Concatenate all windows: (N_windows, D_non_action)
-        all_errors = np.concatenate(all_channel_errors, axis=0)
-
-        # Compute mean and std across windows for each channel
-        channel_mean = all_errors.mean(axis=0)  # (D_non_action,)
-        channel_std = all_errors.std(axis=0, ddof=0)  # (D_non_action,) population std
-
-        # Log warnings for near-zero variance channels
-        near_zero = np.sum(channel_std < 1e-6)
-        if near_zero > 0:
-            logger.warning(
-                "%d channel(s) have near-zero std (< 1e-6) in error distribution. "
-                "These will receive large weights in standardized scoring (capped by eps=%.0e).",
-                near_zero, CHANNEL_STD_EPS,
-            )
-
-        logger.info(
-            "Computed channel error stats: mean range [%.4f, %.4f], std range [%.4f, %.4f]",
-            channel_mean.min(), channel_mean.max(),
-            channel_std.min(), channel_std.max(),
-        )
-
-        return channel_mean, channel_std
-
     @staticmethod
     def _discover_runtime_params(config: dict[str, Any]) -> dict[str, Any]:
         """Discover model parameters that depend on preprocessed data at runtime.
 
         Reads ``selected_columns.npy`` from the processed data directory to determine
-        the actual ``input_dim`` (number of features after preprocessing: constant
-        removal, correlation removal, one-hot encoding). This overrides any
-        hardcoded value in the config, ensuring the model always matches the data.
+        the actual ``input_dim`` (number of features after preprocessing). This
+        overrides any hardcoded value in the config, ensuring the model always
+        matches the data.
 
         Parameters
         ----------
@@ -661,9 +490,8 @@ class SequenceAutoencoder(nn.Module):
         Returns
         -------
         dict
-            Dictionary with discovered runtime parameters (e.g., ``input_dim``,
-            ``action_feature_indices``). Empty if processed data not found
-            (falls back to config values).
+            Dictionary with discovered runtime parameters (e.g., ``input_dim``).
+            Empty if processed data not found (falls back to config values).
         """
         from pathlib import Path
         import numpy as np
@@ -686,22 +514,6 @@ class SequenceAutoencoder(nn.Module):
                     )
                 discovered["input_dim"] = actual_input_dim
 
-                # Also expose numerical vs one-hot split if needed downstream
-                from src.data.preprocessing import _is_onehot_name
-                is_onehot = np.array([_is_onehot_name(str(n)) for n in selected_cols])
-                discovered["n_numerical"] = int((~is_onehot).sum())
-                discovered["n_onehot"] = int(is_onehot.sum())
-
-                # Discover action feature indices for exclusion from anomaly score
-                # Action features are one-hot encoded PLC commands (prefix 'action_')
-                action_indices = np.where(is_onehot)[0].tolist()
-                if action_indices:
-                    discovered["action_feature_indices"] = tuple(action_indices)
-                    logger.info(
-                        "Discovered %d action feature indices for anomaly score exclusion: %s",
-                        len(action_indices), action_indices[:5] + (["..."] if len(action_indices) > 5 else []),
-                    )
-
             except Exception as e:
                 logger.warning("Could not read selected_columns.npy for runtime param discovery: %s", e)
         else:
@@ -719,14 +531,14 @@ class SequenceAutoencoder(nn.Module):
         If config is None, loads default config via ``src.utils.config.load_config()``.
 
         Runtime parameter discovery:
-            Automatically detects ``input_dim`` and ``action_feature_indices`` from
+            Automatically detects ``input_dim`` from
             ``data/processed/selected_columns.npy`` if available. This ensures the
             model architecture always matches the actual preprocessed data, regardless
             of what the config file says.
 
         Expected config structure:
             model:
-              input_dim: 82          # placeholder; overridden at runtime from data
+              input_dim: 86          # placeholder; overridden at runtime from data
               window_size: 32        # must be multiple of 4
               latent_dim: 16
               encoder:
@@ -755,8 +567,6 @@ class SequenceAutoencoder(nn.Module):
         pool_size = int(get_param(config, "model.encoder.pool_size", 2))
         activation = str(get_param(config, "model.encoder.activation", "relu"))
 
-        action_feature_indices = runtime_params.get("action_feature_indices")
-
         return cls(
             input_dim=input_dim,
             window_size=window_size,
@@ -765,7 +575,6 @@ class SequenceAutoencoder(nn.Module):
             encoder_kernels=enc_kernels,    # type: ignore[arg-type]
             pool_size=pool_size,
             activation=activation,
-            action_feature_indices=action_feature_indices,
         )
 
 
@@ -828,8 +637,6 @@ def compute_errors_on_loader(
     metric: str = "mae",
     *,
     collect_labels: bool = False,
-    channel_mean: np.ndarray | None = None,
-    channel_std: np.ndarray | None = None,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Compute per-sample reconstruction errors from a DataLoader.
 
@@ -851,18 +658,11 @@ def compute_errors_on_loader(
     collect_labels : bool, default=False
         If ``True``, also return per-sample labels alongside errors.
         If ``False`` (default), return only the error array.
-    channel_mean : np.ndarray, optional
-        Per-channel mean of absolute errors (from training normal data).
-        If provided with ``channel_std``, applies channel-wise standardization.
-    channel_std : np.ndarray, optional
-        Per-channel std of absolute errors (from training normal data).
-        If provided with ``channel_mean``, applies channel-wise standardization.
 
     Returns
     -------
     np.ndarray
         Per-sample mean reconstruction errors of shape ``(n_samples,)``.
-        When channel stats provided, returns standardized MAE scores.
     tuple[np.ndarray, np.ndarray]
         ``(errors, labels)`` when ``collect_labels=True``.
     """
@@ -880,8 +680,6 @@ def compute_errors_on_loader(
                 x,
                 reduction="sample",
                 metric=cast("Literal['mae', 'mse']", metric),
-                channel_mean=channel_mean,
-                channel_std=channel_std,
             )
             all_errors.append(errors.cpu().numpy())
             if collect_labels and y is not None:
