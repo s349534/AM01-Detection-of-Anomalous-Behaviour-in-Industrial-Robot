@@ -110,11 +110,11 @@ if torch.cuda.is_available():
 "
 fi
 
-# ── Preprocess if data/processed/ is missing ──────────────────────────────────
-if [[ ! -f "data/processed/train.npy" ]]; then
-    echo "=== data/processed/ missing — running preprocessing from data/raw/ ==="
-    uv run python -m src.data.preprocessing
-fi
+# ── Preprocessing (always executed) ──────────────────────────────────────────
+# data/processed/ may be stale from a previous run (different hyperparameters,
+# window size, or scaler), so re-generate it every time to guarantee consistency.
+echo "=== Running preprocessing from data/raw/ ==="
+uv run python -m src.data.preprocessing
 
 # ── Run your training script ────────────────────────────────────────────────
 # Replace with your actual training command when the pipeline is implemented.

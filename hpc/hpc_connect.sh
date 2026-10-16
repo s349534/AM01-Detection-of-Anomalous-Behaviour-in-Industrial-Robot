@@ -344,56 +344,34 @@ cmd_batch() {
     echo ""
     # Run log streaming on HPC via a single ssh_run invocation.
     # Use a temp script to avoid fragile quoting of variables inside a nested string.
+    # The stream script polls every 60s for the log file to appear (the cluster
+    # may still be starting the job, so the log does not exist yet) and retries
+    # indefinitely — it does not stop after the first 60s window.
     local _stream_script="/tmp/am01_stream_${jid}.sh"
     cat > "${_stream_script}.base" <<'EOFSRIPT'
 #!/bin/bash
 set +e
 JID="$1"
-LOG_PATTERN="~/jobs/logs/am01_*_${JID}.log"
-# Wait for log file to appear (job may be PENDING)
+# Poll every 60s for the log file. The cluster may still be starting the job
+# (PENDING/QUEUED), so the log does not exist yet; keep retrying indefinitely
+# instead of giving up after the first 60s window.
 log_file=""
-for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+while [[ -z "$log_file" ]]; do
     log_file=$(ls ~/jobs/logs/am01_*_${JID}.log 2>/dev/null | head -1)
-    [[ -n "$log_file" ]] && break
-    sleep 5
+    sleep 60
 done
-if [[ -z "$log_file" ]]; then
-    echo "WARNING: Log file not found after 60s. Checking sinfo..."
-    sinfo -p ${SLURM_PARTITION:-gpu_a40} 2>/dev/null || true
-fi
 # Stream live (use resolved log_file, not the glob)
-if [[ -n "$log_file" ]]; then
-    tail -n +1 -f "$log_file" 2>/dev/null &
-    TAIL_PID=$!
-    # Poll every 15s until the job leaves the queue
-    while squeue -j ${JID} -h -o '%T' 2>/dev/null | grep -q .; do
-        sleep 15
-    done
-    kill $TAIL_PID 2>/dev/null || true
-    wait $TAIL_PID 2>/dev/null || true
-    echo ''
-    echo "=== Job ${JID} completed ==="
-    tail -8 "$log_file" 2>/dev/null || true
-else
-    # Log not found within 60s -- job likely PENDING/queued on SLURM.
-    # Wait for job to finish BEFORE fetching so we do not fetch
-    # stale results from a previous run.
-    echo "WARNING: Log not found within 60s — job ${JID} is likely PENDING (queued on SLURM)."
-    while squeue -j ${JID} -h -o '%T' 2>/dev/null | grep -q .; do
-        sleep 30
-    done
-    echo "Job ${JID} completed."
-    # Re-check for log now that job has finished
-    log_file=$(ls ~/jobs/logs/am01_*_${JID}.log 2>/dev/null | head -1)
-    if [[ -n "$log_file" ]]; then
-        echo ''
-        echo "=== Job ${JID} completed ==="
-        tail -n 80 "$log_file" 2>/dev/null || true
-    else
-        echo ''
-        echo "=== Job ${JID} completed (no log file found) ==="
-    fi
-fi
+tail -n +1 -f "$log_file" 2>/dev/null &
+TAIL_PID=$!
+# Poll every 15s until the job leaves the queue
+while squeue -j ${JID} -h -o '%T' 2>/dev/null | grep -q .; do
+    sleep 15
+done
+kill $TAIL_PID 2>/dev/null || true
+wait $TAIL_PID 2>/dev/null || true
+echo ''
+echo "=== Job ${JID} completed ==="
+tail -8 "$log_file" 2>/dev/null || true
 EOFSRIPT
     # JID is passed as $1 to the stream script (no sed substitution needed)
     cp "${_stream_script}.base" "${_stream_script}"
