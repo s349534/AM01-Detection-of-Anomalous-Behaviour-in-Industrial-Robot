@@ -6,25 +6,23 @@ Kuka industrial robot time-series dataset.
 Architecture overview (see docs/project_plan.md §4.1.2):
 ---------------------------------------------------------
 Encoder (1D-Conv, 3 layers, 2 pooling stages):
-    Input:  (B, input_dim=82, W)  with W multiple of 4
-       ↓    Conv1d(82 → 64, kernel=5, padding=2) + ReLU
+    Input:  (B, input_dim=86, W)  with W multiple of 4
+       ↓    Conv1d(input_dim → 64, kernel=5, padding=2) + ReLU
             MaxPool1d(kernel_size=2) → (B, 64, W/2)
        ↓    Conv1d(64 → 32, kernel=3, padding=1) + ReLU
             MaxPool1d(kernel_size=2) → (B, 32, W/4)
        ↓    Conv1d(32 → 16, kernel=3, padding=1) + ReLU
             → (B, 16, W/4)
-       ↓    Flatten → (B, 16 * W/4) = (B, 4W)
-            Linear(4W → latent_dim)
-    Output: z ∈ ℝ^(B, latent_dim)
+       ↓    Conv1d(16 → latent_dim, kernel_size=1)
+    Output: z ∈ ℝ^(B, latent_dim, W/4) — temporal structure preserved
 
 Decoder (Auto-derived symmetric 1D-ConvTranspose):
-    Input:  z ∈ ℝ^(B, latent_dim)
-       ↓    Linear(latent_dim → 16 * (W/4)) + ReLU
-            Reshape → (B, 16, W/4)
+    Input:  z ∈ ℝ^(B, latent_dim, W/4)
+       ↓    Conv1d(latent_dim → 16, kernel_size=1) (channel projection)
        ↓    ConvTranspose1d(16 → 32, kernel=4, stride=2, padding=1) + ReLU → (B, 32, W/2)
        ↓    ConvTranspose1d(32 → 64, kernel=4, stride=2, padding=1) + ReLU → (B, 64, W)
-       ↓    Conv1d(64 → input_dim=82, kernel=3, padding=1)
-    Output: x̂ ∈ ℝ^(B, input_dim=82, W)
+       ↓    Conv1d(64 → input_dim=86, kernel=3, padding=1)
+    Output: x̂ ∈ ℝ^(B, input_dim=86, W)
 
     Decoder channels are automatically derived as the reverse of encoder
     conv_channels (excluding input_dim). No separate decoder_channels config.
@@ -69,14 +67,14 @@ class Conv1dEncoder(nn.Module):
     """1D-Convolutional Encoder for multivariate time-series windows.
 
     Compresses an input tensor of shape ``(B, input_dim, W)`` into a latent
-    vector ``z`` of shape ``(B, latent_dim)``.
+    tensor ``z`` of shape ``(B, latent_dim, W/4)`` preserving the temporal
+    dimension at the bottleneck.
 
     Architecture (fixed 3-layer funnel with 2 pooling stages):
         Conv1d(input_dim → 64, k=5) + ReLU + MaxPool1d(2)  → (B, 64, W/2)
         Conv1d(64 → 32, k=3) + ReLU + MaxPool1d(2)        → (B, 32, W/4)
         Conv1d(32 → 16, k=3) + ReLU                       → (B, 16, W/4)
-        Flatten                                            → (B, 16 * W/4)
-        Linear(16 * W/4 → latent_dim)
+        Conv1d(16 → latent_dim, kernel_size=1)            → (B, latent_dim, W/4)
 
     Parameters
     ----------
@@ -91,7 +89,7 @@ class Conv1dEncoder(nn.Module):
     pool_size : int, default=2
         Kernel size and stride for the two MaxPool1d layers (after conv 1 & 2).
     latent_dim : int, default=16
-        Dimension of the compressed latent representation z.
+        Dimension of the latent bottleneck representation per timestep.
     activation : str, default="relu"
         Activation function ("relu" or "leaky_relu").
     """
@@ -129,8 +127,6 @@ class Conv1dEncoder(nn.Module):
 
         # Temporal length after two pooling stages
         self.reduced_temporal_len = window_size // (pool_size * pool_size)
-        # Flattened feature size before the final Linear layer
-        self.flattened_size = c3 * self.reduced_temporal_len
 
         self.net = nn.Sequential(
             # Layer 1: preserves temporal length L=W
@@ -146,14 +142,12 @@ class Conv1dEncoder(nn.Module):
             # Layer 3: preserves final reduced length (no pooling after)
             nn.Conv1d(c2, c3, kernel_size=k3, padding=k3 // 2),
             act_cls(),
-            # Flatten entire sequence (no AdaptiveAvgPool1d)
-            nn.Flatten(),
-            # Dense projection to latent bottleneck
-            nn.Linear(self.flattened_size, latent_dim),
+            # Channel projection to latent dimension (preserves temporal length)
+            nn.Conv1d(c3, latent_dim, kernel_size=1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode sequence tensor to latent vector.
+        """Encode sequence tensor to latent tensor.
 
         Parameters
         ----------
@@ -163,7 +157,7 @@ class Conv1dEncoder(nn.Module):
         Returns
         -------
         torch.Tensor
-            Latent representation z of shape ``(B, latent_dim)``.
+            Latent representation z of shape ``(B, latent_dim, W/4)``.
         """
         return self.net(x)
 
@@ -175,7 +169,8 @@ class Conv1dDecoder(nn.Module):
     """Auto-derived Symmetric 1D-Transposed Convolutional Decoder.
 
     Reconstructs the original sequence window ``(B, input_dim, W)`` from a
-    latent vector ``z`` of shape ``(B, latent_dim)``.
+    latent tensor ``z`` of shape ``(B, latent_dim, W/4)`` preserving the
+    temporal dimension at the bottleneck.
 
     The decoder architecture is automatically derived from the encoder's
     ``conv_channels`` by reversing the channel progression (excluding input_dim):
@@ -185,16 +180,15 @@ class Conv1dDecoder(nn.Module):
     - Final Conv1d projects c1 → input_dim
 
     Architecture (for encoder conv_channels=(64, 32, 16), 2 pooling stages):
-        Linear(latent_dim → 16 * (W/4)) + ReLU
-        Reshape → (B, 16, W/4)
-        ConvTranspose1d(16 → 32, k=4, s=2, p=1) + ReLU → (B, 32, W/2)
-        ConvTranspose1d(32 → 64, k=4, s=2, p=1) + ReLU → (B, 64, W)
-        Conv1d(64 → input_dim, k=3, p=1) → (B, input_dim, W)
+        Conv1d(latent_dim → 16, kernel_size=1)              → (B, 16, W/4)
+        ConvTranspose1d(16 → 32, k=4, s=2, p=1) + ReLU      → (B, 32, W/2)
+        ConvTranspose1d(32 → 64, k=4, s=2, p=1) + ReLU      → (B, 64, W)
+        Conv1d(64 → input_dim, k=3, p=1)                    → (B, input_dim, W)
 
     Parameters
     ----------
     latent_dim : int, default=16
-        Dimension of the input latent representation z.
+        Dimension of the input latent representation z per timestep.
     input_dim : int, default=82
         Number of output sensor channels.
     window_size : int, default=16
@@ -238,13 +232,12 @@ class Conv1dDecoder(nn.Module):
 
         # Temporal length at the bottleneck (after encoder's 2 pooling stages)
         self.bottleneck_temporal_len = window_size // (pool_size * pool_size)
-        # Flattened size at bottleneck = c3 * bottleneck_temporal_len
-        self.bottleneck_flat_size = c3 * self.bottleneck_temporal_len
 
-        # Project latent vector to flat bottleneck feature map
-        self.fc = nn.Sequential(
-            nn.Linear(latent_dim, self.bottleneck_flat_size),
-            act_cls(),
+        # Channel projection from latent_dim to c3 (preserves temporal length)
+        self.channel_proj = (
+            nn.Conv1d(latent_dim, c3, kernel_size=1)
+            if latent_dim != c3
+            else nn.Identity()
         )
 
         # Two upsampling stages (matching encoder's two pooling stages)
@@ -262,22 +255,19 @@ class Conv1dDecoder(nn.Module):
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode latent vector back to sequence tensor.
+        """Decode latent tensor back to sequence tensor.
 
         Parameters
         ----------
         z : torch.Tensor
-            Latent tensor of shape ``(B, latent_dim)``.
+            Latent tensor of shape ``(B, latent_dim, W/4)``.
 
         Returns
         -------
         torch.Tensor
             Reconstructed sequence tensor of shape ``(B, input_dim, W)``.
         """
-        batch_size = z.size(0)
-        h = self.fc(z)
-        # Reshape to (B, c3, bottleneck_temporal_len)
-        h = h.view(batch_size, self.encoder_channels[2], self.bottleneck_temporal_len)
+        h = self.channel_proj(z)
         x_rec = self.deconv(h)
 
         # Safety adjustment if window_size doesn't match exactly
@@ -309,7 +299,7 @@ class SequenceAutoencoder(nn.Module):
     window_size : int, default=16
         Number of consecutive timesteps per window (W). Must be multiple of 4.
     latent_dim : int, default=16
-        Dimension of latent bottleneck vector z.
+        Dimension of the latent bottleneck per timestep (z shape: (B, latent_dim, W/4)).
     encoder_channels : tuple[int, int, int], default=(64, 32, 16)
         Conv channels in encoder (3 layers, funnel: decreasing).
     encoder_kernels : tuple[int, int, int], default=(5, 3, 3)
@@ -398,7 +388,7 @@ class SequenceAutoencoder(nn.Module):
         )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode sequence to latent vector z.
+        """Encode sequence to latent tensor z of shape ``(B, latent_dim, W/4)``.
 
         Accepts both ``(B, input_dim, W)`` and ``(B, W, input_dim)``.
         """
@@ -406,7 +396,7 @@ class SequenceAutoencoder(nn.Module):
         return self.encoder(x_conv)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode latent vector z to reconstructed sequence ``(B, input_dim, W)``."""
+        """Decode latent tensor z of shape ``(B, latent_dim, W/4)`` to reconstructed sequence ``(B, input_dim, W)``."""
         return self.decoder(z)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

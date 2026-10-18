@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.utils.metrics import (
+from src.evaluation.metrics import (
     calculate_auc,
     calculate_metrics,
     compute_anomaly_scores,

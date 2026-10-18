@@ -137,8 +137,22 @@ def run_phase_train(config: dict) -> None:
 
 
 def run_phase_evaluate(config: dict) -> None:
-    """Fase 5 placeholder (model comparison + metrics)."""
-    print("\n[Not yet implemented] Fase 5: Evaluate and compare models")
+    """Fase 5 — Evaluate trained model on test set."""
+    from src.evaluation.evaluate import run_evaluation
+    from pathlib import Path
+
+    checkpoint_path = Path("reports/checkpoints/ae_baseline.pth")
+    if not checkpoint_path.exists():
+        print(f"Checkpoint not found: {checkpoint_path}. Train first with --phase train")
+        return
+
+    print("\n=== Fase 5: Evaluate Model ===")
+    result = run_evaluation(
+        checkpoint_path=checkpoint_path,
+        processed_dir=Path(config["paths"]["data_processed"]),
+        config=config,
+    )
+    # Results printed by run_evaluation
 
 
 def main() -> None:

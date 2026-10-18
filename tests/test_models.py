@@ -52,18 +52,18 @@ class TestConv1dEncoder:
     def test_default_output_shape(self, batch_conv_format):
         encoder = Conv1dEncoder(input_dim=82, window_size=16, latent_dim=16)
         z = encoder(batch_conv_format)
-        assert z.shape == (4, 16), f"Expected shape (4, 16), got {z.shape}"
+        assert z.shape == (4, 16, 4), f"Expected shape (4, 16, 4), got {z.shape}"
 
     def test_custom_latent_dim(self, batch_conv_format):
         encoder = Conv1dEncoder(input_dim=82, window_size=16, latent_dim=32)
         z = encoder(batch_conv_format)
-        assert z.shape == (4, 32)
+        assert z.shape == (4, 32, 4)
 
     def test_single_sample_batch(self):
         encoder = Conv1dEncoder(input_dim=82, window_size=16, latent_dim=16)
         x = torch.randn(1, 82, 16)
         z = encoder(x)
-        assert z.shape == (1, 16)
+        assert z.shape == (1, 16, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -72,14 +72,14 @@ class TestConv1dEncoder:
 class TestConv1dDecoder:
     def test_default_output_shape(self):
         decoder = Conv1dDecoder(latent_dim=16, input_dim=82, window_size=16)
-        z = torch.randn(4, 16)
+        z = torch.randn(4, 16, 4)
         x_rec = decoder(z)
         assert x_rec.shape == (4, 82, 16), f"Expected (4, 82, 16), got {x_rec.shape}"
 
     @pytest.mark.parametrize("w", [8, 16, 32, 64])
     def test_variable_window_sizes(self, w):
         decoder = Conv1dDecoder(latent_dim=16, input_dim=82, window_size=w)
-        z = torch.randn(2, 16)
+        z = torch.randn(2, 16, w // 4)
         x_rec = decoder(z)
         assert x_rec.shape == (2, 82, w), f"Window size {w} produced shape {x_rec.shape}"
 
@@ -102,7 +102,7 @@ class TestSequenceAutoencoder:
     def test_encode_decode_methods(self, batch_conv_format):
         model = SequenceAutoencoder(input_dim=82, window_size=16, latent_dim=16)
         z = model.encode(batch_conv_format)
-        assert z.shape == (4, 16)
+        assert z.shape == (4, 16, 4)
         x_rec = model.decode(z)
         assert x_rec.shape == (4, 82, 16)
 
@@ -132,8 +132,8 @@ class TestSequenceAutoencoder:
         model = SequenceAutoencoder.from_config(default_config)
         # After preprocessing, params.yaml is updated with the actual input_dim (86 = 85 numerical + 1 action)
         assert model.input_dim == 86
-        assert model.window_size == 16
-        assert model.latent_dim == 16
+        assert model.window_size == 256
+        assert model.latent_dim == 32
 
 
 # ---------------------------------------------------------------------------

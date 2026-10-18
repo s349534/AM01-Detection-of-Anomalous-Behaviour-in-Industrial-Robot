@@ -323,12 +323,34 @@ cmd_batch() {
             sbatch_env="${sbatch_env} ${_v}='${!_v}'"
         fi
     done
+    # Use --parsable so sbatch outputs ONLY the job ID (no extra text).
+    # This makes extraction robust against cluster-specific message formats
+    # that broke the classic "Submitted batch job N" sed pattern.
+    local sbatch_cmd="sbatch --parsable ${basename_script}"
+    if [[ -n "${sbatch_env}" ]]; then
+        sbatch_cmd="env ${sbatch_env} ${sbatch_cmd}"
+    fi
     set +e
-    jid=$(ssh_run "$(ssh_target)" "cd ~/jobs && env ${sbatch_env} sbatch ${basename_script}" 2>&1 \
-          | sed -n 's/.*Submitted batch job \([0-9]*\).*/\1/p')
+    local sbatch_out
+    sbatch_out=$(ssh_run "$(ssh_target)" "cd ~/jobs && ${sbatch_cmd}" 2>&1)
+    local sbatch_rc=$?
     set -e
+    if [[ ${sbatch_rc} -ne 0 ]]; then
+        echo "ERROR: sbatch failed (rc=${sbatch_rc}). Output:"
+        echo "${sbatch_out}"
+        echo "Try manually: ssh $(ssh_target) 'cd ~/jobs && sbatch ${basename_script}'"
+        return 1
+    fi
+    # --parsable prints just the JID, but fall back to the classic pattern
+    # in case this SLURM version ignores --parsable.
+    jid=$(echo "${sbatch_out}" | sed -n 's/.*Submitted batch job \([0-9]*\).*/\1/p')
+    if [[ -z "${jid:-}" ]]; then
+        jid=$(echo "${sbatch_out}" | grep -oE '[0-9]+' | head -1)
+    fi
     if [[ -z "${jid:-}" ]]; then
         echo "ERROR: could not extract job ID from sbatch output."
+        echo "Raw sbatch output:"
+        echo "${sbatch_out}"
         echo "Try manually: ssh $(ssh_target) 'cd ~/jobs && sbatch ${basename_script}'"
         return 1
     fi

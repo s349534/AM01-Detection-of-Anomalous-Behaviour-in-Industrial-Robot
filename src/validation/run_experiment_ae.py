@@ -41,7 +41,7 @@ from src.models.autoencoder import (
     fit_autoencoder,
 )
 from src.utils.config import get_param
-from src.utils.metrics import calculate_auc
+from src.evaluation.metrics import calculate_auc
 from src.utils.seed import set_seed
 
 logger = logging.getLogger(__name__)

@@ -36,17 +36,15 @@ import torch
 from src.data.dataset import build_loader
 from src.models.autoencoder import (
     SequenceAutoencoder,
-    compute_errors_on_loader,
     fit_autoencoder,
 )
 from src.utils.config import get_param, load_config
-from src.utils.metrics import (
-    calculate_auc,
-    calculate_metrics,
-    compute_anomaly_scores,
-    find_optimal_threshold,
-)
 from src.utils.seed import set_seed
+from src.evaluation import (
+    calibrate_threshold,
+    evaluate_on_splits,
+    compute_errors_on_loader,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,43 +147,34 @@ def train_single_seed(
     train_time_sec = time.time() - start_time
     best_epoch = history.get("best_epoch", 0) if history else 0
 
-    # --- Calibrate threshold on this model's OWN validation errors ---
-    # (val_normal + val_anomaly) — NOT on Stage-1 search model errors.
-    # This guarantees the threshold matches the model that will do inference.
-    val_normal_errors = compute_errors_on_loader(model, val_normal_loader, dev, metric=loss_name)
-    val_anomaly_errors = compute_errors_on_loader(model, val_anomaly_loader, dev, metric=loss_name)
-    val_errors = np.concatenate([val_normal_errors, val_anomaly_errors])
-    val_labels = np.concatenate([
-        np.zeros(len(val_normal_errors), dtype=np.int32),
-        np.ones(len(val_anomaly_errors), dtype=np.int32),
-    ])
+    # --- Evaluate using the new evaluation module ---
+    # This delegates threshold calibration and test evaluation to src.evaluation
+    eval_result = evaluate_on_splits(
+        model=model,
+        processed_dir=processed_dir,
+        window_size=window_size,
+        batch_size=batch_size,
+        threshold=None,  # calibrate on validation
+        device=dev,
+        metric=loss_name,
+    )
 
-    threshold, val_metrics = find_optimal_threshold(val_labels, val_errors)
+    threshold = eval_result["threshold"]
+    val_metrics = eval_result["val_metrics"]
+    test_metrics = eval_result["test_metrics"]
+
     logger.info(
         "Seed %d: calibrated threshold=%.6f (val F1=%.4f, precision=%.4f, recall=%.4f, "
         "val_normal_samples=%d, val_anomaly_samples=%d)",
         seed, threshold, val_metrics["f1"], val_metrics["precision"], val_metrics["recall"],
-        len(val_normal_errors), len(val_anomaly_errors),
+        len(val_normal_loader.dataset), len(val_anomaly_loader.dataset),  # type: ignore[arg-type]
     )
-
-    # --- Evaluate on test (normal + anomaly) ---
-    test_normal_errors = compute_errors_on_loader(model, test_normal_loader, dev)
-    test_anomaly_errors = compute_errors_on_loader(model, test_anomaly_loader, dev)
-    test_errors = np.concatenate([test_normal_errors, test_anomaly_errors])
-    test_labels = np.concatenate([
-        np.zeros(len(test_normal_errors), dtype=np.int32),
-        np.ones(len(test_anomaly_errors), dtype=np.int32),
-    ])
-
-    auc_scores = calculate_auc(test_labels, test_errors)
-    test_pred = compute_anomaly_scores(test_errors, threshold)
-    test_metrics = calculate_metrics(test_labels, test_pred)
 
     logger.info(
         "Seed %d: train_time=%.1fs, best_epoch=%d, "
         "PR-AUC=%.4f, ROC-AUC=%.4f, F1=%.4f, threshold=%.6f",
         seed, train_time_sec, best_epoch,
-        auc_scores["pr_auc"], auc_scores["roc_auc"], test_metrics["f1"], threshold,
+        test_metrics["pr_auc"], test_metrics["roc_auc"], test_metrics["f1"], threshold,
     )
 
     # --- Save checkpoint (only for first seed / baseline) ---
@@ -217,8 +206,8 @@ def train_single_seed(
         "seed": seed,
         "train_time_sec": round(train_time_sec, 2),
         "best_epoch": best_epoch,
-        "test_pr_auc": round(auc_scores["pr_auc"], 6),
-        "test_roc_auc": round(auc_scores["roc_auc"], 6),
+        "test_pr_auc": round(test_metrics["pr_auc"], 6),
+        "test_roc_auc": round(test_metrics["roc_auc"], 6),
         "test_f1": round(test_metrics["f1"], 6),
         "test_accuracy": round(test_metrics["accuracy"], 6),
         "test_precision": round(test_metrics["precision"], 6),

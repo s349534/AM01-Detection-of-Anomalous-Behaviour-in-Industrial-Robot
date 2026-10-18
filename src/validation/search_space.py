@@ -18,9 +18,9 @@ def get_search_space_ae() -> dict[str, Any]:
         Dict with dot-notation keys compatible with ``ParameterSampler``
         and the config structure in ``params.yaml``::
 
-            {
-                "model.window_size": [16, 32, 64, 128],
-                "model.latent_dim": [8, 12, 16, 24, 32],
+{
+                "model.window_size": [32, 64, 128, 256],
+                "model.latent_dim": [16, 32, 64],
             }
 
     Notes
@@ -29,14 +29,14 @@ def get_search_space_ae() -> dict[str, Any]:
       The ``encoder_channels`` hyperparameter has been removed from the search space.
     - Decoder is auto-derived from encoder channels (reversed), not configured separately.
     - Window size must be a multiple of 4 (due to 2 pooling stages = factor 4 reduction).
-      All values in the search space (16, 32, 64, 128) satisfy this constraint.
-    - Total grid: 4 × 5 = 20 combinations. All can be sampled exhaustively.
-    - W range: powers of 2 from 16 to 128, default 16. Covers short windows (local patterns)
-      to long windows (slow trends). Default 16 aligned with params.yaml.
+      All values in the search space (32, 64, 128, 256) satisfy this constraint.
+    - Total grid: 3 × 3 = 9 combinations. All can be sampled exhaustively.
+    - W range: powers of 2 from 32 to 256, default 256. Covers short windows (local patterns)
+      to long windows (slow trends). Default 256 aligned with params.yaml.
     """
     return {
-        "model.window_size": [16, 32, 64, 128],  # all multiples of 4
-        "model.latent_dim": [8, 12, 16, 24, 32],
+        "model.window_size": [32, 64, 128, 256],  # all multiples of 4
+        "model.latent_dim": [16, 32, 64],
         # encoder_channels REMOVED - fixed architecture (64, 32, 16)
     }
 

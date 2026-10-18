@@ -124,12 +124,6 @@ uv run python -m src.validation.run_search_ae "${SEARCH_ARGS[@]}"
 echo "=== Phase 3.1b: Analyzing results ==="
 uv run python -m src.validation.analyze_results
 
-# ── Phase 3.2 (Stage 2): Report best config (no threshold calibration) ──────────
-# select_threshold now only reports the best config; threshold is calibrated in
-# Stage 3 (slurm_ae_train.sh / train_ae.py) on the final trained model.
-echo "=== Phase 3.2 (Stage 2): Best config report ==="
-uv run python -m src.validation.select_threshold
-
 # ── Verify outputs ──────────────────────────────────────────────────────────
 echo "=== Outputs ==="
 ls -lh reports/tables/validation_results_ae.csv reports/figures/sensitivity_*.png config/params_validated_ae.yaml 2>/dev/null || true
@@ -154,7 +148,7 @@ rsync -a --delete \
 rsync -a --delete \
     "${RESULTS_DIR}/reports/figures/" "${HOME_PROJECT}/reports/figures/" 2>/dev/null || true
 
-# params_validated_ae.yaml (produced by analyze_results; no threshold added by select_threshold)
+# params_validated_ae.yaml (produced by analyze_results)
 rsync -a \
     "${RESULTS_DIR}/config/" "${HOME_PROJECT}/config/" 2>/dev/null || true
 
