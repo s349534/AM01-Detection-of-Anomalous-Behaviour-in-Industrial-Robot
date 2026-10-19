@@ -22,9 +22,9 @@ logging:
 model:
   name: adversarial_autoencoder
   input_dim: 86
-  window_size: 256
+  window_size: 64
   encoding_dim: 32
-  latent_dim: 32
+  latent_dim: 8
   encoder:
     conv_channels:
     - 64
@@ -44,7 +44,7 @@ model:
 training:
   batch_size: 256
   epochs: 100
-  learning_rate: 0.001
+  learning_rate: 0.0001
   weight_decay: 0.0001
   beta1: 0.5
   beta2: 0.999
@@ -63,7 +63,7 @@ data:
   normal_data_path: data/raw/KukaNormal.npy
   slow_data_path: data/raw/KukaSlow.npy
   column_names_path: data/raw/KukaColumnNames.npy
-  window_size: 16
+  window_size: 64
   window_stride: 1
   drop_incomplete: true
   normalization: minmax

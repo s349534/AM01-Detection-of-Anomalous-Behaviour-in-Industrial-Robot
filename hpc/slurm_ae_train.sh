@@ -102,7 +102,11 @@ if [[ -n "${MAX_EPOCHS}" ]]; then
 fi
 eval "${TRAIN_CMD}"
 
-# ── Verify outputs ──────────────────────────────────────────────────────────
+# ── Phase 3.3: Evaluation sul test set ─────────────────────────────────────────
+echo "=== Phase 3.3: Evaluation on test set ==="
+uv run python -m src.evaluation --checkpoint reports/checkpoints/ae_baseline.pth --data-dir data/processed
+
+# ── Verify outputs ─────────────────────────────────────────────────────────────
 echo "=== Outputs ==="
 ls -lh reports/checkpoints/ae_baseline.pth reports/tables/ae_final_metrics.csv 2>/dev/null || true
 

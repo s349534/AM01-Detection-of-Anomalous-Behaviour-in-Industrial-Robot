@@ -100,7 +100,7 @@ print(f'sklearn={sklearn.__version__}')
 print(f'torch={torch.__version__}')
 from src.data import dataset, preprocessing
 from src.models import autoencoder, adversarial_ae
-from src.utils import metrics, visualization
+from src.utils import visualization
 print('All project modules import successfully!')
 "
 
