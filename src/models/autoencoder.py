@@ -78,7 +78,7 @@ class Conv1dEncoder(nn.Module):
 
     Parameters
     ----------
-    input_dim : int, default=82
+    input_dim : int, default=86
         Number of sensor channels (features).
     window_size : int, default=16
         Number of timesteps per window (W). Must be a multiple of 4.
@@ -96,7 +96,7 @@ class Conv1dEncoder(nn.Module):
 
     def __init__(
         self,
-        input_dim: int = 82,
+        input_dim: int = 86,
         window_size: int = 16,
         conv_channels: tuple[int, int, int] = (64, 32, 16),
         conv_kernels: tuple[int, int, int] = (5, 3, 3),
@@ -189,7 +189,7 @@ class Conv1dDecoder(nn.Module):
     ----------
     latent_dim : int, default=16
         Dimension of the input latent representation z per timestep.
-    input_dim : int, default=82
+    input_dim : int, default=86
         Number of output sensor channels.
     window_size : int, default=16
         Target temporal length (W) to reconstruct. Must be multiple of 4.
@@ -204,7 +204,7 @@ class Conv1dDecoder(nn.Module):
     def __init__(
         self,
         latent_dim: int = 16,
-        input_dim: int = 82,
+        input_dim: int = 86,
         window_size: int = 16,
         encoder_channels: tuple[int, int, int] = (64, 32, 16),
         pool_size: int = 2,
@@ -294,7 +294,7 @@ class SequenceAutoencoder(nn.Module):
 
     Parameters
     ----------
-    input_dim : int, default=82
+    input_dim : int, default=86
         Number of input channels (sensor features).
     window_size : int, default=16
         Number of consecutive timesteps per window (W). Must be multiple of 4.
@@ -312,7 +312,7 @@ class SequenceAutoencoder(nn.Module):
 
     def __init__(
         self,
-        input_dim: int = 82,
+        input_dim: int = 86,
         window_size: int = 16,
         latent_dim: int = 16,
         encoder_channels: tuple[int, int, int] = (64, 32, 16),
@@ -324,6 +324,10 @@ class SequenceAutoencoder(nn.Module):
         self.input_dim = input_dim
         self.window_size = window_size
         self.latent_dim = latent_dim
+        self.encoder_channels = encoder_channels
+        self.encoder_kernels = encoder_kernels
+        self.pool_size = pool_size
+        self.activation = activation
 
         self.encoder = Conv1dEncoder(
             input_dim=input_dim,
@@ -463,6 +467,50 @@ class SequenceAutoencoder(nn.Module):
             f"Unsupported reduction: '{reduction}', must be 'none', 'mean', or 'sample'"
         )
 
+    def architecture_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable dictionary with the full architecture parameters.
+        
+        Used for checkpoint serialization so the model can be rebuilt exactly
+        from the checkpoint without needing the original config.
+        """
+        return {
+            "input_dim": self.input_dim,
+            "window_size": self.window_size,
+            "latent_dim": self.latent_dim,
+            "encoder_channels": list(self.encoder_channels),
+            "encoder_kernels": list(self.encoder_kernels),
+            "pool_size": self.pool_size,
+            "activation": self.activation,
+        }
+
+    @classmethod
+    def from_architecture(cls, arch: dict[str, Any]) -> SequenceAutoencoder:
+        """Instantiate a SequenceAutoencoder directly from architecture dict.
+        
+        Used when loading from a checkpoint that contains the full architecture
+        metadata, avoiding any config dependency.
+        
+        Parameters
+        ----------
+        arch : dict
+            Dictionary with keys: input_dim, window_size, latent_dim,
+            encoder_channels, encoder_kernels, pool_size, activation.
+        
+        Returns
+        -------
+        SequenceAutoencoder
+            Model instance with the exact architecture from the checkpoint.
+        """
+        return cls(
+            input_dim=arch["input_dim"],
+            window_size=arch["window_size"],
+            latent_dim=arch["latent_dim"],
+            encoder_channels=tuple(arch["encoder_channels"]),
+            encoder_kernels=tuple(arch["encoder_kernels"]),
+            pool_size=arch["pool_size"],
+            activation=arch["activation"],
+        )
+
     @staticmethod
     def _discover_runtime_params(config: dict[str, Any]) -> dict[str, Any]:
         """Discover model parameters that depend on preprocessed data at runtime.
@@ -494,7 +542,7 @@ class SequenceAutoencoder(nn.Module):
             try:
                 selected_cols = np.load(selected_cols_path, allow_pickle=True)
                 actual_input_dim = int(selected_cols.shape[0])
-                config_input_dim = int(get_param(config, "model.input_dim", 82))
+                config_input_dim = int(get_param(config, "model.input_dim", 86))
 
                 if actual_input_dim != config_input_dim:
                     logger.warning(
@@ -527,9 +575,10 @@ class SequenceAutoencoder(nn.Module):
             of what the config file says.
 
         Expected config structure:
+            data:
+              window_size: 32        # must be multiple of 4
             model:
               input_dim: 86          # placeholder; overridden at runtime from data
-              window_size: 32        # must be multiple of 4
               latent_dim: 16
               encoder:
                 conv_channels: [64, 32, 16]  # 3 layers, funnel
@@ -544,8 +593,9 @@ class SequenceAutoencoder(nn.Module):
         # Discover runtime parameters from preprocessed data (overrides config)
         runtime_params = cls._discover_runtime_params(config)
 
-        input_dim = int(runtime_params.get("input_dim", get_param(config, "model.input_dim", 82)))
-        window_size = int(get_param(config, "model.window_size", 16))
+        input_dim = int(runtime_params.get("input_dim", get_param(config, "model.input_dim", 86)))
+        # Read window_size from data.window_size (single source of truth)
+        window_size = int(get_param(config, "data.window_size", 256))
         latent_dim = int(get_param(config, "model.latent_dim", 16))
 
         enc_channels = tuple(

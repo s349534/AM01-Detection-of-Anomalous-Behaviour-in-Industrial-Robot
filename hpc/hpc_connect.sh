@@ -211,6 +211,22 @@ cmd_keycopy() {
     echo "Key registered. Verify with: ./hpc_connect.sh keycheck"
 }
 
+# ── Code fingerprint (content-based, immune to timestamp drift) ───────────────
+# rsync's default "quick check" (size + mtime) can SKIP a file whose local
+# timestamp was not bumped (e.g. restored by OneDrive) -> the HPC would keep
+# running a STALE copy of the code. The fingerprint compares file CONTENTS.
+code_fingerprint() {
+    local root="$1"
+    (
+        cd "${root}" 2>/dev/null || exit 1
+        find src config hpc -type f \( -name '*.py' -o -name '*.yaml' -o -name '*.sh' \) 2>/dev/null \
+            | sort \
+            | xargs -r sha256sum 2>/dev/null \
+            | sha256sum \
+            | cut -d' ' -f1
+    )
+}
+
 # ── Upload the whole project (idempotent: rsync, excludes large/secret) ──────
 #   usage:  ./hpc_connect.sh upload-project [--dry-run]
 cmd_upload_project() {
@@ -235,6 +251,32 @@ cmd_upload_project() {
     ssh_run "$(ssh_target)" "mkdir -p ${PROJECT_DIR_REMOTE}"
     if command -v rsync >/dev/null 2>&1; then
         rsync -avz -e "ssh ${SSH_OPTS}" "${RSYNC_EXCLUDES[@]}" "${PROJECT_ROOT}/" "${target}:${PROJECT_DIR_REMOTE}"
+
+        # ── Code-only sync with --checksum (content-based) ──────────────────
+        # Guarantees the HPC runs byte-identical sources even if the quick
+        # check above skipped a file because of a stale timestamp.
+        rsync -avz --checksum -e "ssh ${SSH_OPTS}" \
+            --include='*/' --include='*.py' --include='*.yaml' --include='*.sh' --exclude='*' \
+            "${PROJECT_ROOT}/src/" "${target}:${PROJECT_DIR_REMOTE}/src/"
+        rsync -avz --checksum -e "ssh ${SSH_OPTS}" \
+            --include='*/' --include='*.yaml' --include='*.sh' --exclude='*' \
+            "${PROJECT_ROOT}/config/" "${target}:${PROJECT_DIR_REMOTE}/config/"
+        rsync -avz --checksum -e "ssh ${SSH_OPTS}" \
+            --include='*/' --include='*.sh' --exclude='*' \
+            "${PROJECT_ROOT}/hpc/" "${target}:${PROJECT_DIR_REMOTE}/hpc/"
+
+        # ── Verify the deployed code matches the local code ────────────────
+        local local_fp remote_fp
+        local_fp="$(code_fingerprint "${PROJECT_ROOT}")"
+        remote_fp="$(ssh_run "$(ssh_target)" "cd ${PROJECT_DIR_REMOTE} && find src config hpc -type f \( -name '*.py' -o -name '*.yaml' -o -name '*.sh' \) 2>/dev/null | sort | xargs -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1" 2>/dev/null | tr -d '\r\n')"
+        if [[ -n "${local_fp}" && -n "${remote_fp}" && "${local_fp}" != "${remote_fp}" ]]; then
+            echo "ERROR: deployed code does NOT match the local code (fingerprint mismatch)."
+            echo "  local : ${local_fp}"
+            echo "  remote: ${remote_fp}"
+            echo "  The HPC would run a STALE copy — aborting to avoid a broken job."
+            exit 1
+        fi
+        echo "Code fingerprint verified: ${local_fp}"
     else
         # Fallback: pipe a tar stream over ssh so the EXCLUDES are still honoured
         # (plain scp has no --exclude support and would upload .venv/.git).
@@ -415,7 +457,9 @@ EOFSRIPT
     # If the SLURM job DID produce them, they will be re-downloaded below.
     rm -f "${PROJECT_ROOT}/reports/tables/ae_final_metrics.csv" \
           "${PROJECT_ROOT}/reports/tables/aae_final_metrics.csv" \
+          "${PROJECT_ROOT}/reports/tables/ae_test_metrics.csv" \
           "${PROJECT_ROOT}/reports/checkpoints/ae_baseline.pth" \
+          "${PROJECT_ROOT}/reports/checkpoints/ae_baseline_seed*.pth" \
           "${PROJECT_ROOT}/reports/checkpoints/aae_final.pth" 2>/dev/null || true
 
     if command -v rsync >/dev/null 2>&1; then
@@ -442,19 +486,20 @@ EOFSRIPT
     else
         # Fallback: scp individual files (no rsync → no --delete, so we must
         # proactively remove stale files above and overwrite unconditionally)
-        for f in train.npy val_normal.npy val_anomaly.npy test_normal.npy test_anomaly.npy \
-                 scaler.pkl selected_columns.npy; do
+        for f in normal_scaled.npy slow_scaled.npy \
+                     plan_train.npy plan_val_normal.npy plan_val_anomaly.npy plan_test_normal.npy plan_test_anomaly.npy \
+                     scaler.pkl selected_columns.npy manifest.json; do
             scp "$(ssh_target):~/am01_project/data/processed/${f}" \
                 "${PROJECT_ROOT}/data/processed/" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/data/processed/${f}" || true
         done
         # CSV results — fetch whatever exists on the remote
-        for f in validation_results_ae.csv ae_final_metrics.csv \
+        for f in validation_results_ae.csv ae_final_metrics.csv ae_test_metrics.csv \
                  validation_results_aae.csv aae_final_metrics.csv; do
             scp "$(ssh_target):~/am01_project/reports/tables/${f}" \
                 "${PROJECT_ROOT}/reports/tables/" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/reports/tables/${f}" || true
         done
         # Checkpoints
-        for f in ae_baseline.pth aae_final.pth; do
+        for f in ae_baseline.pth ae_baseline_seed*.pth aae_final.pth; do
             scp "$(ssh_target):~/am01_project/reports/checkpoints/${f}" \
                 "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/reports/checkpoints/${f}" || true
         done

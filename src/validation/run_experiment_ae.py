@@ -5,7 +5,7 @@ This module provides :func:`train_and_evaluate_ae`, the atomic unit invoked by
 
 Workflow per run (Stage 1 - Model Selection):
     1. Set seed for reproducibility (one of VALIDATION_SEEDS: 7, 42, 123)
-    2. Build DataLoaders from processed .npy files (3 loaders: train, val_normal, val_anomaly)
+    2. Build DataLoaders from processed artifacts (train, val_normal, val_anomaly)
     3. Instantiate ``SequenceAutoencoder`` from config
     4. Train with early stopping on validation normal reconstruction loss
     5. Compute reconstruction errors on val_normal + val_anomaly (HP selection set)
@@ -19,8 +19,8 @@ Robust hyperparameter selection (§4.8.6):
     best-config selection.
 
 Validation set composition (HP selection):
-    - val_normal: 15% of KukaNormal (early stopping)
-    - val_anomaly: 50% of KukaSlow (anomalies for AUC calculation)
+    - val_normal: interleaved chunks from normal recording
+    - val_anomaly: interleaved chunks from slow recording
 
 Test set is NOT accessed in this stage.
 """
@@ -28,13 +28,12 @@ from __future__ import annotations
 
 import logging
 import time
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
-from src.data.dataset import build_loader
+from src.data.dataset import build_dataloaders
 from src.models.autoencoder import (
     SequenceAutoencoder,
     compute_errors_on_loader,
@@ -67,7 +66,7 @@ def train_and_evaluate_ae(
     Parameters
     ----------
     config : dict
-        Full config dict.  Must contain ``model.window_size``,
+        Full config dict.  Must contain ``data.window_size``,
         ``training.batch_size``, ``paths.data_processed``, plus the
         ``model.*`` keys that may have been overwritten by a
         ParameterSampler sample.
@@ -111,7 +110,7 @@ def train_and_evaluate_ae(
     dev = torch.device(device)
 
     # --- Extract hyperparameters from config ---
-    window_size = int(get_param(config, "model.window_size", 16))
+    window_size = int(get_param(config, "data.window_size", 256))
     latent_dim = int(get_param(config, "model.latent_dim", 16))
     enc_channels = tuple(get_param(config, "model.encoder.conv_channels", [64, 32, 16]))
     batch_size = int(get_param(config, "training.batch_size", 256))
@@ -123,7 +122,6 @@ def train_and_evaluate_ae(
     )
     min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
     num_workers = int(get_param(config, "training.num_workers", num_workers))
-    processed_dir = Path(get_param(config, "paths.data_processed", "data/processed/"))
     loss_name = get_param(config, "training.loss", "mae")
     metric = get_param(config, "training.reconstruction_metric", "mae")
 
@@ -133,16 +131,16 @@ def train_and_evaluate_ae(
     )
 
     # --- Build dataloaders (3 loaders only: train, val_normal, val_anomaly) ---
-    train_data = np.load(processed_dir / "train.npy")
-    val_normal_data = np.load(processed_dir / "val_normal.npy")
-    val_anomaly_data = np.load(processed_dir / "val_anomaly.npy")
+    loaders = build_dataloaders(
+        config,
+        partitions=["train", "val_normal", "val_anomaly"],
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
 
-    train_loader = build_loader(train_data, window_size=window_size,
-                                batch_size=batch_size, label=0, shuffle=True, num_workers=num_workers)
-    val_normal_loader = build_loader(val_normal_data, window_size=window_size,
-                                     batch_size=batch_size, label=0, num_workers=num_workers)
-    val_anomaly_loader = build_loader(val_anomaly_data, window_size=window_size,
-                                      batch_size=batch_size, label=1, num_workers=num_workers)
+    train_loader = loaders["train"]
+    val_normal_loader = loaders["val_normal"]
+    val_anomaly_loader = loaders["val_anomaly"]
 
     # --- Instantiate model ---
     model = SequenceAutoencoder.from_config(config)

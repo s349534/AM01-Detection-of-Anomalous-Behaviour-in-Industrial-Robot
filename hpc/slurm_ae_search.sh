@@ -33,6 +33,11 @@ export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=0
 export SCRATCH_PROJECT="am01"
+# The project is an APPLICATION run from the project root (`python -m src...`):
+# it is not installed into the venv. Building it would require downloading
+# setuptools from PyPI, which fails on the cluster (no PyPI access).
+# UV_NO_SYNC=1 keeps the `uv run` calls from re-syncing (and re-building).
+export UV_NO_SYNC=1
 
 # Resolve N_ITER / MAX_VAL_EPOCHS from env (with defaults)
 # N_ITER: if not set, runs exhaustive search (all combinations)
@@ -63,6 +68,17 @@ if [[ -d "${HOME}/am01_project" ]]; then
         --exclude='reports/tables/ae_final_metrics.csv' \
         "${HOME}/am01_project/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/"
     echo "Synced project to scratch."
+
+    # Content-based re-sync of the sources (--checksum): the quick check
+    # (size+mtime) above can skip files whose timestamp did not change,
+    # leaving a STALE copy of the code on scratch.
+    rsync -a --checksum \
+        --include='*/' --include='*.py' --include='*.yaml' --include='*.sh' --exclude='*' \
+        "${HOME}/am01_project/src/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/src/"
+    rsync -a --checksum \
+        --include='*/' --include='*.yaml' --include='*.sh' --exclude='*' \
+        "${HOME}/am01_project/config/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/config/"
+    echo "Sources re-synced with --checksum."
 fi
 
 # ── Activate uv environment ─────────────────────────────────────────────────
@@ -72,7 +88,7 @@ unset VIRTUAL_ENV 2>/dev/null || true
 
 if command -v uv &>/dev/null; then
     echo "--- Syncing frozen deps on scratch ---"
-    uv sync --frozen --quiet
+    uv sync --frozen --no-install-project --quiet
     echo "--- PyTorch / device check ---"
     uv run python -c "
 import torch
@@ -82,6 +98,7 @@ if torch.cuda.is_available():
     print(f'GPU: {torch.cuda.get_device_name(0)}')
 "
 fi
+
 
 # ── Phase 3.1: Validation search (§4.8.6) ───────────────────────────────────
 # Preprocessing is ALWAYS executed: data/processed/ may be stale from a previous
@@ -105,7 +122,7 @@ print(f"KukaNormal: {normal.shape}")
 print(f"KukaSlow: {slow.shape}")
 print(f"ColumnNames: {cols.shape}")
 '
-uv run python -m src.data.preprocessing
+uv run python -m src.data.preprocessing --config config/params.yaml
 
 # Build command args for run_search_ae
 # --seed is for ParameterSampler sampling only; training seeds are fixed: [7, 42, 123]

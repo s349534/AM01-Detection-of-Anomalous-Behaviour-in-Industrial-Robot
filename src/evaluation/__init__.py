@@ -8,20 +8,15 @@ Public API:
     - calculate_auc: ROC-AUC, PR-AUC
     - run_evaluation: Full evaluation pipeline (CLI-compatible)
 """
-
 from .evaluate import evaluate_model, evaluate_on_splits, run_evaluation
 from .threshold import calibrate_threshold, find_optimal_threshold, percentile_threshold
-from .scoring import (
-    compute_reconstruction_errors,
-    compute_errors_on_loader,
-    compute_errors_from_arrays,
-)
 from .metrics import (
     calculate_metrics,
     calculate_auc,
     compute_anomaly_scores,
     evaluate_threshold,
 )
+from src.models.autoencoder import compute_errors_on_loader
 
 __all__ = [
     "evaluate_model",
@@ -30,11 +25,9 @@ __all__ = [
     "calibrate_threshold",
     "find_optimal_threshold",
     "percentile_threshold",
-    "compute_reconstruction_errors",
-    "compute_errors_on_loader",
-    "compute_errors_from_arrays",
-    "calculate_metrics",
-    "calculate_auc",
     "compute_anomaly_scores",
     "evaluate_threshold",
+    "calculate_metrics",
+    "calculate_auc",
+    "compute_errors_on_loader",
 ]

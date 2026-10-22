@@ -1,12 +1,12 @@
 """High-level evaluation pipeline for trained models.
 
 This is the main entry point for evaluating a trained model on test/validation data.
-Can be used as a library function or via CLI.
+Can be used as a library function or via CLI (python -m src.evaluation).
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import logging
 
@@ -15,11 +15,10 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.models.autoencoder import SequenceAutoencoder
-from src.data.dataset import build_loader
+from src.data.dataset import build_dataloaders
 from src.evaluation.threshold import calibrate_threshold
-from src.evaluation.metrics import (
-    calculate_auc, calculate_metrics, compute_anomaly_scores, evaluate_threshold
-)
+from src.evaluation.metrics import evaluate_threshold
+from src.utils.config import get_param, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +51,10 @@ def evaluate_model(
     Returns
     -------
     dict with keys: test_pr_auc, test_roc_auc, test_f1, test_accuracy,
-                    test_precision, test_recall, threshold, confusion_matrix
+                    test_precision, test_recall, threshold, confusion_matrix,
+                    confusion_matrix_array
     """
-    from src.evaluation.scoring import compute_errors_on_loader
+    from src.models.autoencoder import compute_errors_on_loader
 
     test_normal_errors = compute_errors_on_loader(model, test_normal_loader, device, metric=metric)
     test_anomaly_errors = compute_errors_on_loader(model, test_anomaly_loader, device, metric=metric)
@@ -70,36 +70,27 @@ def evaluate_model(
 
 def evaluate_on_splits(
     model: SequenceAutoencoder,
-    processed_dir: str | Path,
-    window_size: int,
-    batch_size: int,
+    config: dict[str, Any],
     threshold: float | None,
     device: torch.device,
     metric: str = "mae",
-    stride: int = 1,
-    num_workers: int = 0,
     calibration_method: str = "f1_optimal",
 ) -> dict[str, Any]:
-    """Evaluate model on all splits (val + test) from processed data directory.
+    """Evaluate model on all splits (val + test) using build_dataloaders.
 
-    Loads data from processed_dir, builds loaders, calibrates threshold on validation,
+    Loads data via build_dataloaders, calibrates threshold on validation,
     then evaluates on test. Returns comprehensive metrics.
-
-    This is the function that train_ae.py should call instead of embedding evaluation logic.
     """
-    processed_dir = Path(processed_dir)
+    # Build loaders for val and test partitions
+    loaders = build_dataloaders(
+        config,
+        partitions=["val_normal", "val_anomaly", "test_normal", "test_anomaly"],
+    )
 
-    # Load data
-    val_normal_data = np.load(processed_dir / "val_normal.npy")
-    val_anomaly_data = np.load(processed_dir / "val_anomaly.npy")
-    test_normal_data = np.load(processed_dir / "test_normal.npy")
-    test_anomaly_data = np.load(processed_dir / "test_anomaly.npy")
-
-    # Build loaders
-    val_normal_loader = build_loader(val_normal_data, window_size=window_size, batch_size=batch_size, label=0, num_workers=num_workers)
-    val_anomaly_loader = build_loader(val_anomaly_data, window_size=window_size, batch_size=batch_size, label=1, num_workers=num_workers)
-    test_normal_loader = build_loader(test_normal_data, window_size=window_size, batch_size=batch_size, label=0, num_workers=num_workers)
-    test_anomaly_loader = build_loader(test_anomaly_data, window_size=window_size, batch_size=batch_size, label=1, num_workers=num_workers)
+    val_normal_loader = loaders["val_normal"]
+    val_anomaly_loader = loaders["val_anomaly"]
+    test_normal_loader = loaders["test_normal"]
+    test_anomaly_loader = loaders["test_anomaly"]
 
     # Calibrate threshold on validation (if not provided)
     if threshold is None:
@@ -122,8 +113,7 @@ def evaluate_on_splits(
 
 def run_evaluation(
     checkpoint_path: str | Path,
-    processed_dir: str | Path,
-    config: dict | None = None,
+    config: dict[str, Any] | None = None,
     device: str | torch.device | None = None,
     threshold: float | None = None,
     metric: str = "mae",
@@ -131,13 +121,12 @@ def run_evaluation(
 ) -> dict[str, Any]:
     """Full evaluation pipeline from checkpoint.
 
-    Loads model from checkpoint, builds data loaders from processed data,
+    Loads model from checkpoint, builds data loaders via build_dataloaders,
     calibrates threshold on validation (or uses provided), evaluates on test.
 
-    This is the CLI-compatible entry point.
+    This is the library API entry point. The checkpoint's architecture metadata
+    (model_config) is used to build the model, ensuring no mismatch.
     """
-    from src.utils.config import load_config, get_param
-
     if config is None:
         config = load_config()
 
@@ -147,21 +136,151 @@ def run_evaluation(
 
     # Load model from checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=dev)
-    model = SequenceAutoencoder.from_config(config)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(dev)
-    model.eval()
 
-    window_size = int(get_param(config, "model.window_size", 16))
-    batch_size = int(get_param(config, "training.batch_size", 256))
+    # Extract architecture from checkpoint (model_config takes precedence)
+    model_config = checkpoint.get("model_config")
+    if model_config is None:
+        # Legacy checkpoint without architecture metadata
+        raise RuntimeError(
+            "Checkpoint does not contain 'model_config' metadata. "
+            "Please retrain the model with the current codebase (which saves "
+            "architecture metadata) or use a compatible checkpoint."
+        )
+
+    # Build effective config: use checkpoint's architecture for model,
+    # and config for data/partitioning/training params
+    effective_config = {
+        **config,
+        "data": {**config.get("data", {}), "window_size": model_config["window_size"]},
+        "model": {
+            **config.get("model", {}),
+            "window_size": model_config["window_size"],
+            "latent_dim": model_config["latent_dim"],
+            "input_dim": model_config["input_dim"],
+            "encoder_channels": tuple(model_config["encoder_channels"]),
+            "encoder_kernels": tuple(model_config["encoder_kernels"]),
+            "pool_size": model_config["pool_size"],
+            "activation": model_config["activation"],
+        },
+    }
+
+    # Validate checkpoint window_size matches config (warn, don't fail)
+    config_window_size = int(get_param(config, "data.window_size", 256))
+    checkpoint_window_size = model_config["window_size"]
+    if checkpoint_window_size != config_window_size:
+        logger.warning(
+            "Checkpoint window_size (%d) != config data.window_size (%d). "
+            "Using checkpoint's window_size for model and loaders.",
+            checkpoint_window_size, config_window_size
+        )
+
+    # Verify manifest if present
+    manifest_path = Path(get_param(config, "paths.data_processed", "data/processed/")) / "manifest.json"
+    if manifest_path.exists():
+        import json
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        m_window = manifest.get("window_size")
+        if m_window and m_window != checkpoint_window_size:
+            logger.warning(
+                "Manifest window_size (%d) != checkpoint window_size (%d). "
+                "Partition plan may differ from what was used during training.",
+                m_window, checkpoint_window_size
+            )
+        # Check partitioning parameters
+        part_cfg = config.get("data", {}).get("partitioning", {})
+        manifest_part = manifest.get("partitioning", {})
+        if manifest_part:
+            for key in ("chunk_size", "gap", "quotas", "stride_multipliers"):
+                if key in manifest_part and key in part_cfg:
+                    if manifest_part[key] != part_cfg[key]:
+                        logger.warning(
+                            "Manifest partitioning '%s' (%s) != config (%s). "
+                            "The evaluation may use a different partition plan.",
+                            key, manifest_part[key], part_cfg[key]
+                        )
+
+    # Build model from checkpoint's architecture
+    model = SequenceAutoencoder.from_architecture(model_config)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device)
+    model.eval()
 
     return evaluate_on_splits(
         model=model,
-        processed_dir=processed_dir,
-        window_size=window_size,
-        batch_size=batch_size,
+        config=effective_config,
         threshold=threshold,
         device=dev,
         metric=metric,
         calibration_method=calibration_method,
     )
+
+
+def evaluate_checkpoints(
+    checkpoint_paths: list[str | Path],
+    config: dict[str, Any] | None = None,
+    device: str | torch.device | None = None,
+    threshold: float | None = None,
+    metric: str = "mae",
+    calibration_method: str = "f1_optimal",
+) -> dict[str, Any]:
+    """Evaluate multiple checkpoints and aggregate results (mean +/- std).
+
+    Parameters
+    ----------
+    checkpoint_paths : list[str | Path]
+        Paths to checkpoint files.
+    config : dict | None
+        Configuration dict (merged config + params).
+    device : str | torch.device | None
+        Device for inference.
+    threshold : float | None
+        Fixed threshold (if None, calibrated on validation).
+    metric : str
+        Reconstruction metric (mae/mse).
+    calibration_method : str
+        Threshold calibration method.
+
+    Returns
+    -------
+    dict with keys:
+        - "per_seed": list of per-seed result dicts
+        - "aggregate": dict with mean/std for each metric
+    """
+    from src.evaluation.metrics import aggregate_metrics
+
+    if config is None:
+        config = load_config()
+
+    per_seed_results = []
+
+    for ckpt_path in checkpoint_paths:
+        result = run_evaluation(
+            checkpoint_path=ckpt_path,
+            config=config,
+            device=device,
+            threshold=threshold,
+            metric=metric,
+            calibration_method=calibration_method,
+        )
+        # Add seed info from checkpoint
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        seed = ckpt.get("seed", "unknown")
+        per_seed_results.append({
+            "seed": seed,
+            **result["test_metrics"],
+        })
+
+    # Aggregate metrics
+    aggregate = aggregate_metrics(per_seed_results)
+
+    return {
+        "per_seed": per_seed_results,
+        "aggregate": aggregate,
+    }
+
+
+if __name__ == "__main__":
+    # This module is not intended to be run directly.
+    # Use `python -m src.evaluation` instead (see src/evaluation/cli.py).
+    pass

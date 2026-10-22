@@ -82,7 +82,7 @@ def load_results_csv(csv_path: Path) -> list[dict[str, Any]]:
             try:
                 row_data["run_id"] = int(row_data["run_id"])
                 # config_id is optional (legacy CSVs don't have it)
-                if "config_id" in row_data and row_data["config_id"]:
+                if row_data.get("config_id"):
                     row_data["config_id"] = int(row_data["config_id"])
                 row_data["W"] = int(row_data["W"])
                 row_data["latent_dim"] = int(row_data["latent_dim"])
@@ -96,7 +96,7 @@ def load_results_csv(csv_path: Path) -> list[dict[str, Any]]:
                     n_failed += 1
                     continue
                 rows.append(row_data)
-            except (ValueError, KeyError) as e:
+            except (ValueError, KeyError):
                 n_malformed += 1
                 continue
 
@@ -327,15 +327,12 @@ def write_validated_params(
 
     # Override validated hyperparameters (Stage 1: model selection)
     w_val = best.W
-    validated["model"]["window_size"] = w_val
+    # Single source of truth: data.window_size
+    validated["data"]["window_size"] = w_val
     validated["model"]["latent_dim"] = best.latent_dim
 
     # Threshold is calibrated per-seed in Stage 3 (train_ae.py),
     # NOT in Stage 2 (select_threshold.py). No placeholder here.
-
-    # Sincronizza anche data.window_size con model.window_size (§4.8.2)
-    if "data" in validated and "window_size" in validated["data"]:
-        validated["data"]["window_size"] = w_val
 
     # Keep training settings from base config
     # (epochs, batch_size, learning_rate, etc. stay as defaults for final training)

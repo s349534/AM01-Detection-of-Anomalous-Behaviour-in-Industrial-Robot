@@ -4,8 +4,9 @@ After Fase 3.1 validation selects HP_AE_best and writes
 ``config/params_validated_ae.yaml``, this script performs the final training:
 
     - 3 runs with different seeds (nested validation, §4.8.1)
+    - Selects best model by validation AUC (val_roc_auc)
     - Saves best checkpoint to reports/checkpoints/ae_baseline.pth
-    - Writes reports/tables/ae_final_metrics.csv with mean +/- std
+    - Writes reports/tables/ae_final_metrics.csv with per-seed metrics + best flag
 
 Usage:
     python -m src.models.train_ae --config config/params_validated_ae.yaml
@@ -16,6 +17,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -24,8 +26,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from src.data.dataset import build_loader
-from src.models.autoencoder import SequenceAutoencoder, fit_autoencoder
+from src.data.dataset import build_dataloaders
+from src.models.autoencoder import SequenceAutoencoder, fit_autoencoder, compute_errors_on_loader
+from src.evaluation.metrics import calculate_auc, evaluate_threshold
+from src.evaluation.threshold import calibrate_threshold
 from src.utils.config import get_param, load_config
 from src.utils.seed import set_seed
 
@@ -33,6 +37,45 @@ logger = logging.getLogger(__name__)
 
 # Nested validation: 3 runs with different seeds (§3.2)
 DEFAULT_SEEDS = [42, 123, 7]
+
+# Schema of reports/tables/ae_final_metrics.csv — TEST metrics only (the
+# validation metrics live in reports/tables/validation_results_ae.csv).
+FINAL_METRICS_COLUMNS = [
+    "seed",
+    "train_time_sec",
+    "best_epoch",
+    "threshold",
+    "test_pr_auc",
+    "test_roc_auc",
+    "test_f1",
+    "test_accuracy",
+    "test_precision",
+    "test_recall",
+    "test_specificity",
+    "test_fpr",
+    "test_fnr",
+    "test_balanced_accuracy",
+    "test_mcc",
+    "test_cohen_kappa",
+    "test_npv",
+    "test_jaccard",
+    "test_tn",
+    "test_fp",
+    "test_fn",
+    "test_tp",
+    "n_train_windows",
+    "n_val_normal_windows",
+    "n_val_anomaly_windows",
+    "n_test_normal_windows",
+    "n_test_anomaly_windows",
+]
+
+# Decimal places used in the MEAN+/-STD summary row
+_MEAN_PRECISION = {
+    "train_time_sec": 2,
+    "best_epoch": 1,
+    "threshold": 6,
+}
 
 
 def train_single_seed(
@@ -57,8 +100,11 @@ def train_single_seed(
     Returns
     -------
     dict
-        Training info for this run: {seed, train_time_sec, best_epoch,
-        n_train_windows, n_val_normal_windows, n_val_anomaly_windows}
+        Training info for this run: {seed, train_time_sec, best_epoch, threshold,
+        test_* metrics (incl. the confusion matrix counts), n_* window counts}.
+        The validation metrics are kept under a leading underscore: they are
+        used only to select the best seed and are NOT written to the CSV
+        (they live in validation_results_ae.csv).
     """
     set_seed(seed)
 
@@ -66,28 +112,28 @@ def train_single_seed(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     dev = torch.device(device)
 
-    window_size = int(get_param(config, "model.window_size", 16))
+    window_size = int(get_param(config, "data.window_size", 256))
     batch_size = int(get_param(config, "training.batch_size", 256))
-    epochs = int(get_param(config, "training.epochs", 100))
+    epochs = int(get_param(config, "training.epochs", 200))
     lr = float(get_param(config, "training.learning_rate", 1e-3))
     weight_decay = float(get_param(config, "training.weight_decay", 0.0))
-    patience = int(get_param(config, "training.early_stopping.patience", 10))
+    patience = int(get_param(config, "training.early_stopping.patience", 15))
     min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
-    processed_dir = Path(get_param(config, "paths.data_processed", "data/processed/"))
 
     logger.info("Training AE (seed=%d) on %s, epochs=%d, patience=%d", seed, dev, epochs, patience)
 
-    # --- Build dataloaders via shared build_loader ---
-    train_data = np.load(processed_dir / "train.npy")
-    val_normal_data = np.load(processed_dir / "val_normal.npy")
-    val_anomaly_data = np.load(processed_dir / "val_anomaly.npy")
+    # --- Build dataloaders via shared build_dataloaders ---
+    loaders = build_dataloaders(
+        config,
+        partitions=["train", "val_normal", "val_anomaly", "test_normal", "test_anomaly"],
+        batch_size=batch_size,
+    )
 
-    train_loader = build_loader(train_data, window_size=window_size,
-                                batch_size=batch_size, label=0, shuffle=True)
-    val_normal_loader = build_loader(val_normal_data, window_size=window_size,
-                                     batch_size=batch_size, label=0)
-    val_anomaly_loader = build_loader(val_anomaly_data, window_size=window_size,
-                                      batch_size=batch_size, label=1)
+    train_loader = loaders["train"]
+    val_normal_loader = loaders["val_normal"]
+    val_anomaly_loader = loaders["val_anomaly"]
+    test_normal_loader = loaders["test_normal"]
+    test_anomaly_loader = loaders["test_anomaly"]
 
     # --- Instantiate model ---
     model = SequenceAutoencoder.from_config(config)
@@ -96,6 +142,12 @@ def train_single_seed(
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("Model parameters: %d total, %d trainable", total_params, trainable_params)
+
+    # Validate checkpoint window_size matches config
+    # (will be validated after model load if checkpoint exists, but warn here)
+    if model.window_size != window_size:
+        logger.warning("Model window_size (%d) != config data.window_size (%d)",
+                       model.window_size, window_size)
 
     # --- Read loss config ---
     loss_name = get_param(config, "training.loss", "mae")
@@ -118,7 +170,48 @@ def train_single_seed(
     train_time_sec = time.time() - start_time
     best_epoch = history.get("best_epoch", 0) if history else 0
 
-    # --- Save checkpoint (only for first seed / baseline) ---
+    # --- Compute validation AUC (val_normal + val_anomaly) for model selection ---
+    val_normal_errors = compute_errors_on_loader(model, val_normal_loader, dev, metric="mae")
+    val_anomaly_errors = compute_errors_on_loader(model, val_anomaly_loader, dev, metric="mae")
+    val_errors = np.concatenate([val_normal_errors, val_anomaly_errors])
+    val_labels = np.concatenate([
+        np.zeros(len(val_normal_errors), dtype=np.int32),
+        np.ones(len(val_anomaly_errors), dtype=np.int32)
+    ])
+    val_auc = calculate_auc(val_labels, val_errors)
+    val_roc_auc = val_auc["roc_auc"]
+    val_pr_auc = val_auc["pr_auc"]
+    val_loss = min(history["val_loss"]) if history else float("inf")
+
+    logger.info("Validation metrics (seed=%d): ROC-AUC=%.4f, PR-AUC=%.4f, loss=%.6f",
+                seed, val_roc_auc, val_pr_auc, val_loss)
+
+    # --- Evaluate on the TEST set (threshold calibrated on validation) ---
+    # This is the "final metrics" reported per seed: the decision threshold is
+    # calibrated on validation (val_normal + val_anomaly) and then applied
+    # unchanged to the test set. The test set never influences the model
+    # selection (that is done on the validation ROC-AUC above).
+    threshold, _val_metrics = calibrate_threshold(
+        model, val_normal_loader, val_anomaly_loader, dev, metric="mae", method="f1_optimal"
+    )
+    test_normal_errors = compute_errors_on_loader(model, test_normal_loader, dev, metric="mae")
+    test_anomaly_errors = compute_errors_on_loader(model, test_anomaly_loader, dev, metric="mae")
+    test_errors = np.concatenate([test_normal_errors, test_anomaly_errors])
+    test_labels = np.concatenate([
+        np.zeros(len(test_normal_errors), dtype=np.int32),
+        np.ones(len(test_anomaly_errors), dtype=np.int32),
+    ])
+    test_metrics = evaluate_threshold(test_labels, test_errors, threshold)
+    cm = test_metrics["confusion_matrix"]
+
+    logger.info(
+        "Test metrics (seed=%d): ROC-AUC=%.4f, PR-AUC=%.4f, F1=%.4f, acc=%.4f "
+        "[TN=%d FP=%d FN=%d TP=%d]",
+        seed, test_metrics["roc_auc"], test_metrics["pr_auc"], test_metrics["f1"],
+        test_metrics["accuracy"], cm["tn"], cm["fp"], cm["fn"], cm["tp"],
+    )
+
+    # --- Save checkpoint with model_config and seed ---
     if checkpoint_path is not None:
         ckpt = Path(checkpoint_path)
         # Load existing checkpoint to get model state and history
@@ -130,7 +223,7 @@ def train_single_seed(
             model_state = model.state_dict()
             history_dict = history
 
-        # Save checkpoint (no channel stats — using classic MAE scoring)
+        # Save checkpoint with model_config and seed
         torch.save(
             {
                 "model_state_dict": model_state,
@@ -138,6 +231,8 @@ def train_single_seed(
                 "input_dim": model.input_dim,
                 "window_size": model.window_size,
                 "latent_dim": model.latent_dim,
+                "model_config": model.architecture_dict(),
+                "seed": seed,
             },
             ckpt,
         )
@@ -147,9 +242,35 @@ def train_single_seed(
         "seed": seed,
         "train_time_sec": round(train_time_sec, 2),
         "best_epoch": best_epoch,
-        "n_train_windows": len(train_loader.dataset),  # type: ignore[arg-type]
-        "n_val_normal_windows": len(val_normal_loader.dataset),  # type: ignore[arg-type]
-        "n_val_anomaly_windows": len(val_anomaly_loader.dataset),  # type: ignore[arg-type]
+        "threshold": round(float(threshold), 6),
+        # Test-set metrics (threshold calibrated on validation)
+        "test_pr_auc": round(test_metrics["pr_auc"], 6),
+        "test_roc_auc": round(test_metrics["roc_auc"], 6),
+        "test_f1": round(test_metrics["f1"], 6),
+        "test_accuracy": round(test_metrics["accuracy"], 6),
+        "test_precision": round(test_metrics["precision"], 6),
+        "test_recall": round(test_metrics["recall"], 6),
+        "test_specificity": round(test_metrics["specificity"], 6),
+        "test_fpr": round(test_metrics["false_positive_rate"], 6),
+        "test_fnr": round(test_metrics["false_negative_rate"], 6),
+        "test_balanced_accuracy": round(test_metrics["balanced_accuracy"], 6),
+        "test_mcc": round(test_metrics["mcc"], 6),
+        "test_cohen_kappa": round(test_metrics["cohen_kappa"], 6),
+        "test_npv": round(test_metrics["npv"], 6),
+        "test_jaccard": round(test_metrics["jaccard"], 6),
+        "test_tn": cm["tn"],
+        "test_fp": cm["fp"],
+        "test_fn": cm["fn"],
+        "test_tp": cm["tp"],
+        "n_train_windows": len(train_loader.dataset),
+        "n_val_normal_windows": len(val_normal_loader.dataset),
+        "n_val_anomaly_windows": len(val_anomaly_loader.dataset),
+        "n_test_normal_windows": len(test_normal_loader.dataset),
+        "n_test_anomaly_windows": len(test_anomaly_loader.dataset),
+        # Internal (not written to the CSV): model selection on the validation set
+        "_val_roc_auc": round(val_roc_auc, 6),
+        "_val_pr_auc": round(val_pr_auc, 6),
+        "_val_loss": round(val_loss, 6),
     }
 
 
@@ -175,7 +296,7 @@ def run_final_training(
     Returns
     -------
     list[dict]
-        List of training info dicts, one per seed.
+        List of training info dicts, one per seed (with val AUC, PR-AUC, loss, is_best).
     """
     if seeds is None:
         seeds = DEFAULT_SEEDS
@@ -195,11 +316,10 @@ def run_final_training(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     tables_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = ckpt_dir / "ae_baseline.pth"
     metrics_path = tables_dir / "ae_final_metrics.csv"
 
     # Read model HP for logging
-    window_size = int(get_param(config, "model.window_size", 16))
+    window_size = int(get_param(config, "data.window_size", 256))
     latent_dim = int(get_param(config, "model.latent_dim", 16))
     enc_channels = list(get_param(config, "model.encoder.conv_channels", [64, 32, 16]))
 
@@ -220,22 +340,60 @@ def run_final_training(
                                    checkpoint_path=save_ckpt, device=device)
         all_results.append(result)
 
-    # --- Write training metrics CSV ---
-    csv_columns = [
-        "seed", "train_time_sec", "best_epoch", "n_train_windows",
-        "n_val_normal_windows", "n_val_anomaly_windows",
-    ]
+    # --- Select best seed by validation ROC-AUC (tie-break: PR-AUC, then val_loss) ---
+    best_result = max(all_results, key=lambda r: (
+        r["_val_roc_auc"], r["_val_pr_auc"], -r["_val_loss"]
+    ))
+    best_seed = best_result["seed"]
+    logger.info("Best seed by validation ROC-AUC: %d (AUC=%.4f, PR-AUC=%.4f, loss=%.6f)",
+                best_seed, best_result["_val_roc_auc"], best_result["_val_pr_auc"],
+                best_result["_val_loss"])
 
+    # --- Copy best seed checkpoint to canonical ae_baseline.pth and remove per-seed checkpoints ---
+    best_ckpt_src = ckpt_dir / f"ae_baseline_seed{best_seed}.pth"
+    best_ckpt_dst = ckpt_dir / "ae_baseline.pth"
+    shutil.copy2(best_ckpt_src, best_ckpt_dst)
+    logger.info("Copied best checkpoint to %s", best_ckpt_dst)
+
+    # Remove per-seed checkpoints
+    for seed in seeds:
+        seed_ckpt = ckpt_dir / f"ae_baseline_seed{seed}.pth"
+        if seed_ckpt.exists():
+            seed_ckpt.unlink()
+            logger.debug("Removed per-seed checkpoint %s", seed_ckpt)
+
+    # --- Write the final metrics CSV: one row per trained seed + MEAN+/-STD row ---
+    # TEST metrics only — the validation metrics are in validation_results_ae.csv.
     with open(metrics_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=csv_columns)
+        writer = csv.DictWriter(f, fieldnames=FINAL_METRICS_COLUMNS)
         writer.writeheader()
         for row in all_results:
-            writer.writerow({col: row.get(col, "") for col in csv_columns})
+            writer.writerow({col: row.get(col, "") for col in FINAL_METRICS_COLUMNS})
+        writer.writerow(_mean_std_row(all_results))
 
-    logger.info("Checkpoints saved in: %s", ckpt_dir)
+    logger.info("Best checkpoint saved to: %s", best_ckpt_dst)
     logger.info("Metrics written to: %s", metrics_path)
 
     return all_results
+
+
+def _mean_std_row(results: list[dict[str, Any]]) -> dict[str, str]:
+    """Build the MEAN+/-STD summary row from the per-seed rows."""
+    row: dict[str, str] = {"seed": "MEAN+/-STD"}
+    for col in FINAL_METRICS_COLUMNS[1:]:
+        values = [r[col] for r in results if isinstance(r.get(col), (int, float))]
+        if not values:
+            row[col] = ""
+            continue
+        if col.startswith("n_"):
+            # Window counts are identical across seeds — keep the column empty
+            row[col] = ""
+            continue
+        mean = sum(values) / len(values)
+        std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+        prec = _MEAN_PRECISION.get(col, 4)
+        row[col] = f"{mean:.{prec}f} +/- {std:.{prec}f}"
+    return row
 
 
 def parse_args() -> argparse.Namespace:

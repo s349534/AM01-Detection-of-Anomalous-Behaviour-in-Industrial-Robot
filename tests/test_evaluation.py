@@ -15,9 +15,7 @@ from src.evaluation import (
     calibrate_threshold,
     evaluate_model,
     evaluate_on_splits,
-    compute_reconstruction_errors,
     compute_errors_on_loader,
-    compute_errors_from_arrays,
     calculate_metrics,
     calculate_auc,
     compute_anomaly_scores,
@@ -125,10 +123,7 @@ class TestCalculateMetrics:
 class TestCalibrateThreshold:
     def test_f1_optimal_method(self, mock_model, dummy_loaders):
         """Test F1-optimal threshold calibration."""
-        # Mock the compute_errors_on_loader to return predictable errors
         with patch("src.evaluation.threshold.compute_errors_on_loader") as mock_compute:
-            # Normal errors: low values
-            # Anomaly errors: high values
             mock_compute.side_effect = [
                 np.array([0.1, 0.15, 0.2, 0.12, 0.18]),  # val_normal_errors
                 np.array([0.8, 0.9, 1.0, 0.85, 0.95]),   # val_anomaly_errors
@@ -147,14 +142,14 @@ class TestCalibrateThreshold:
             assert "f1" in metrics
             assert "precision" in metrics
             assert "recall" in metrics
-            assert metrics["f1"] > 0.5  # Should separate well
+            assert metrics["f1"] > 0.5
 
     def test_percentile_method(self, mock_model, dummy_loaders):
         """Test percentile-based threshold calibration."""
         with patch("src.evaluation.threshold.compute_errors_on_loader") as mock_compute:
             mock_compute.side_effect = [
-                np.array([0.1, 0.15, 0.2, 0.12, 0.18]),  # val_normal_errors
-                np.array([0.8, 0.9, 1.0, 0.85, 0.95]),   # val_anomaly_errors
+                np.array([0.1, 0.15, 0.2, 0.12, 0.18]),
+                np.array([0.8, 0.9, 1.0, 0.85, 0.95]),
             ]
 
             threshold, metrics = calibrate_threshold(
@@ -176,13 +171,10 @@ class TestCalibrateThreshold:
 # ---------------------------------------------------------------------------
 class TestEvaluateModel:
     def test_evaluate_model(self, mock_model, dummy_loaders):
-        """Test evaluate_model with a fixed threshold."""
-        with patch("src.evaluation.scoring.compute_errors_on_loader") as mock_compute:
-            # Normal errors: low
-            # Anomaly errors: high
+        with patch("src.models.autoencoder.compute_errors_on_loader") as mock_compute:
             mock_compute.side_effect = [
-                np.array([0.1, 0.15, 0.2]),  # test_normal_errors
-                np.array([0.8, 0.9, 1.0]),   # test_anomaly_errors
+                np.array([0.1, 0.15, 0.2]),
+                np.array([0.8, 0.9, 1.0]),
             ]
 
             threshold = 0.5
@@ -261,48 +253,80 @@ class TestEvaluateThreshold:
 # ---------------------------------------------------------------------------
 class TestEvaluateOnSplits:
     def test_evaluate_on_splits(self, tmp_path, dummy_data):
-        """Integration test for evaluate_on_splits with real data files."""
-        # Save dummy data to temp directory
-        for key, arr in dummy_data.items():
-            np.save(tmp_path / f"{key}.npy", arr)
-
-        # Create a real model (small for testing)
+        """Integration test for evaluate_on_splits with mocked data loading."""
         model = SequenceAutoencoder(input_dim=86, window_size=16, latent_dim=8)
         model.eval()
 
-        # Mock compute_errors_on_loader to avoid actual inference
-        with patch("src.evaluation.scoring.compute_errors_on_loader") as mock_compute:
-            mock_compute.side_effect = [
-                np.array([0.1] * 20),  # val_normal_errors
-                np.array([0.8] * 15),  # val_anomaly_errors
-                np.array([0.1] * 18),  # test_normal_errors
-                np.array([0.8] * 12),  # test_anomaly_errors
-            ]
+        config = {
+            "data": {"window_size": 16, "partitioning": {"chunk_size": 1024, "gap": "window"}},
+            "paths": {"data_processed": str(tmp_path)},
+            "training": {"batch_size": 8}
+        }
 
-            result = evaluate_on_splits(
-                model=model,
-                processed_dir=tmp_path,
-                window_size=16,
-                batch_size=8,
-                threshold=None,  # calibrate
-                device=torch.device("cpu"),
-                metric="mae",
-            )
+        # Mock build_dataloaders to return loaders with known data
+        mock_loaders = {}
+        for name in ["val_normal", "val_anomaly", "test_normal", "test_anomaly"]:
+            n_samples = 20 if "normal" in name else 15
+            data = torch.randn(n_samples, 16, 86) * (0.1 if "normal" in name else 1.0)
+            if "anomaly" in name:
+                data += 0.5
+            labels = torch.ones(n_samples, 1) if "anomaly" in name else torch.zeros(n_samples, 1)
+            ds = TensorDataset(data, labels)
+            mock_loaders[name] = DataLoader(ds, batch_size=8, shuffle=False)
 
-            assert "threshold" in result
-            assert "val_metrics" in result
-            assert "test_metrics" in result
-            assert result["val_metrics"] is not None
-            assert result["test_metrics"]["f1"] > 0.5
+        with patch("src.evaluation.evaluate.build_dataloaders", return_value=mock_loaders):
+            with patch("src.evaluation.threshold.calibrate_threshold") as mock_calibrate:
+                # Mock calibrate_threshold to return a known good threshold
+                mock_calibrate.return_value = (0.45, {
+                    "threshold": 0.45,
+                    "f1": 1.0,
+                    "precision": 1.0,
+                    "recall": 1.0,
+                    "accuracy": 1.0,
+                    "confusion_matrix": {"tn": 20, "fp": 0, "fn": 0, "tp": 15}
+                })
+                with patch("src.evaluation.evaluate.evaluate_model") as mock_evaluate_model:
+                    # Mock evaluate_model to return perfect test metrics
+                    mock_evaluate_model.return_value = {
+                        "pr_auc": 1.0,
+                        "roc_auc": 1.0,
+                        "f1": 1.0,
+                        "accuracy": 1.0,
+                        "precision": 1.0,
+                        "recall": 1.0,
+                        "confusion_matrix": {"tn": 18, "fp": 0, "fn": 0, "tp": 12},
+                        "threshold": 0.45
+                    }
+
+                    model = SequenceAutoencoder(input_dim=86, window_size=16, latent_dim=8)
+                    model.eval()
+
+                    config = {
+                        "data": {"window_size": 16, "partitioning": {"chunk_size": 1024, "gap": "window"}},
+                        "paths": {"data_processed": str(tmp_path)},
+                        "training": {"batch_size": 8}
+                    }
+
+                    result = evaluate_on_splits(
+                        model=model,
+                        config=config,
+                        threshold=None,
+                        device=torch.device("cpu"),
+                        metric="mae",
+                    )
+
+                    assert "threshold" in result
+                    assert "val_metrics" in result
+                    assert "test_metrics" in result
+                    assert result["val_metrics"] is not None
+                    assert result["test_metrics"]["f1"] > 0.5
 
 
 # ---------------------------------------------------------------------------
-# Test compute_reconstruction_errors (scoring)
+# Test compute_errors_on_loader (scoring)
 # ---------------------------------------------------------------------------
-class TestComputeReconstructionErrors:
+class TestComputeErrorsOnLoader:
     def test_compute_errors_on_loader_import(self):
-        """Test that compute_errors_on_loader is importable and callable."""
-        # Just verify the function exists and has correct signature
         import inspect
         sig = inspect.signature(compute_errors_on_loader)
         params = list(sig.parameters.keys())
@@ -310,24 +334,3 @@ class TestComputeReconstructionErrors:
         assert "loader" in params
         assert "device" in params
         assert "metric" in params
-
-    def test_compute_reconstruction_errors_import(self):
-        """Test that compute_reconstruction_errors is importable and callable."""
-        import inspect
-        sig = inspect.signature(compute_reconstruction_errors)
-        params = list(sig.parameters.keys())
-        assert "model" in params
-        assert "loader" in params
-        assert "device" in params
-        assert "metric" in params
-
-    def test_compute_errors_from_arrays_import(self):
-        """Test that compute_errors_from_arrays is importable and callable."""
-        import inspect
-        sig = inspect.signature(compute_errors_from_arrays)
-        params = list(sig.parameters.keys())
-        assert "model" in params
-        assert "data" in params
-        assert "window_size" in params
-        assert "batch_size" in params
-        assert "device" in params

@@ -28,6 +28,7 @@ from sklearn.model_selection import ParameterGrid, ParameterSampler
 from src.utils.config import load_config
 from src.validation.run_experiment_ae import train_and_evaluate_ae
 from src.validation.search_space import get_search_space_ae, merge_search_sample
+from src.data.partitioning import plan_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -170,16 +171,19 @@ def run_search(
     # --- Run experiments ---
     # Pre-load validation data shape for window_size validation
     processed_dir = Path(base_config.get("paths", {}).get("data_processed", "data/processed/"))
-    val_data_path = processed_dir / "val_normal.npy"
-    val_samples = None
-    if val_data_path.exists():
-        val_samples = np.load(val_data_path, mmap_mode="r").shape[0]
-        logger.info("Validation set size: %d samples", val_samples)
+    normal_path = processed_dir / "normal_scaled.npy"
+    val_windows = None
+    if normal_path.exists():
+        # Use the new partitioning to check planned val windows
+        normal_n = np.load(normal_path, mmap_mode="r").shape[0]
+        slow_path = processed_dir / "slow_scaled.npy"
+        slow_n = np.load(slow_path, mmap_mode="r").shape[0] if slow_path.exists() else 0
+        base_plan = plan_from_config(base_config, "normal", normal_n, slow_n)
+        val_windows = len(base_plan.get("val_normal", []))
+        logger.info("Planned val_normal windows: %d", val_windows)
     else:
-        logger.warning("Validation data not found at %s -- cannot validate window_size", val_data_path)
+        logger.warning("Validation data not found at %s -- cannot validate window_size", normal_path)
 
-    # Each configuration gets len(val_seeds) runs with fixed seeds (§4.8.6)
-    n_seeds = len(val_seeds)
     global_run_id = 0
 
     for config_idx, sample in enumerate(samples):
@@ -188,14 +192,13 @@ def run_search(
         # Merge sampled HP into config (shared across all seeds for this config)
         run_config = merge_search_sample(base_config, sample)
 
-        # --- Validate window_size against validation set size ---
-        window_size = int(run_config.get("model", {}).get("window_size", 16))
-        if val_samples is not None and window_size > val_samples:
+        # --- Validate window_size against planned validation windows ---
+        window_size = int(run_config.get("data", {}).get("window_size", 256))
+        if val_windows is not None and val_windows == 0:
             logger.warning(
-                "Skipping config_id=%d: window_size=%d > val_samples=%d would produce empty validation set",
-                config_id, window_size, val_samples
+                "Skipping config_id=%d: window_size=%d yields 0 validation windows",
+                config_id, window_size
             )
-            # Write a failure row to maintain CSV continuity (one row for this config)
             global_run_id += 1
             fail_row = {
                 "run_id": global_run_id,
@@ -252,7 +255,7 @@ def run_search(
                 fail_row = {
                     "run_id": run_id,
                     "config_id": config_id,
-                    "W": sample.get("model.window_size", ""),
+                    "W": sample.get("data.window_size", ""),
                     "latent_dim": sample.get("model.latent_dim", ""),
                     "val_roc_auc": -1.0,  # sentinel for failure
                     "val_pr_auc": -1.0,

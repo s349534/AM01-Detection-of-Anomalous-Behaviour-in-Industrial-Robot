@@ -30,6 +30,11 @@ export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=0
 export SCRATCH_PROJECT="am01"
+# The project is an APPLICATION run from the project root (`python -m src...`):
+# it is not installed into the venv. Building it would require downloading
+# setuptools from PyPI, which fails on the cluster (no PyPI access).
+# UV_NO_SYNC=1 keeps the `uv run` calls from re-syncing (and re-building).
+export UV_NO_SYNC=1
 
 echo "=== SLURM job started: $(date) ==="
 echo "Job ID: ${SLURM_JOB_ID:-unknown}"
@@ -52,6 +57,18 @@ if [[ -d "${HOME}/am01_project" ]]; then
         --exclude='*.pth' --exclude='*.pt' --exclude='*.ckpt' \
         "${HOME}/am01_project/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/"
     echo "Synced project to scratch."
+
+    # ── Content-based re-sync of the sources (--checksum) ───────────────────
+    # The quick check above (size+mtime) can skip files whose timestamp did
+    # not change, leaving a STALE copy on scratch. This guarantees the code
+    # that runs is byte-identical to the one deployed in ~/am01_project.
+    rsync -a --checksum \
+        --include='*/' --include='*.py' --include='*.yaml' --include='*.sh' --exclude='*' \
+        "${HOME}/am01_project/src/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/src/"
+    rsync -a --checksum \
+        --include='*/' --include='*.yaml' --include='*.sh' --exclude='*' \
+        "${HOME}/am01_project/config/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/config/"
+    echo "Sources re-synced with --checksum."
 fi
 
 # ── Activate uv environment ─────────────────────────────────────────────────
@@ -61,8 +78,10 @@ unset VIRTUAL_ENV 2>/dev/null || true
 
 if command -v uv &>/dev/null; then
     echo "--- Syncing frozen deps on scratch ---"
-    uv sync --frozen --quiet
+    uv sync --frozen --no-install-project --quiet
 fi
+
+
 
 # ── Phase 3.2: Final AE training with validated HPs (3 seeds) ───────────────
 # Preprocessing is ALWAYS executed: data/processed/ may be stale from a previous
@@ -86,7 +105,7 @@ print(f"KukaNormal: {normal.shape}")
 print(f"KukaSlow: {slow.shape}")
 print(f"ColumnNames: {cols.shape}")
 '
-uv run python -m src.data.preprocessing
+uv run python -m src.data.preprocessing --config config/params_validated_ae.yaml
 
 # Resolve SEEDS default BEFORE first use (fixes "unbound variable" error)
 SEEDS="${SEEDS:-42 123 7}"
@@ -104,23 +123,26 @@ eval "${TRAIN_CMD}"
 
 # ── Phase 3.3: Evaluation sul test set ─────────────────────────────────────────
 echo "=== Phase 3.3: Evaluation on test set ==="
-uv run python -m src.evaluation --checkpoint reports/checkpoints/ae_baseline.pth --data-dir data/processed
+uv run python -m src.evaluation --checkpoint reports/checkpoints/ae_baseline.pth --config config/params_validated_ae.yaml --data-dir data/processed
 
 # ── Verify outputs ─────────────────────────────────────────────────────────────
 echo "=== Outputs ==="
-ls -lh reports/checkpoints/ae_baseline.pth reports/tables/ae_final_metrics.csv 2>/dev/null || true
+ls -lh reports/checkpoints/ae_baseline.pth reports/tables/ae_final_metrics.csv reports/figures/ae_confusion_matrix.png 2>/dev/null || true
 
 # ── Fetch results back to $HOME ─────────────────────────────────────────────
 RESULTS_DIR="${SCRATCH_DIR}/${SCRATCH_PROJECT}"
 HOME_PROJECT="${HOME}/am01_project"
 
-mkdir -p "${HOME_PROJECT}/reports/checkpoints" "${HOME_PROJECT}/reports/tables" "${HOME_PROJECT}/logs"
+mkdir -p "${HOME_PROJECT}/reports/checkpoints" "${HOME_PROJECT}/reports/tables" \
+         "${HOME_PROJECT}/reports/figures" "${HOME_PROJECT}/logs"
 
 # No --ignore-existing: new results must overwrite stale ones
 rsync -a \
     "${RESULTS_DIR}/reports/checkpoints/" "${HOME_PROJECT}/reports/checkpoints/" 2>/dev/null || true
 rsync -a \
     "${RESULTS_DIR}/reports/tables/" "${HOME_PROJECT}/reports/tables/" 2>/dev/null || true
+rsync -a \
+    "${RESULTS_DIR}/reports/figures/" "${HOME_PROJECT}/reports/figures/" 2>/dev/null || true
 
 # Log — SLURM writes to ~/jobs/logs/ (relative to sbatch submission dir), not to scratch
 cp ~/jobs/logs/am01_ae_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true

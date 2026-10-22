@@ -5,18 +5,21 @@ separate from training. This enables re-calibration on new data without retraini
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from src.evaluation.metrics import find_optimal_threshold, percentile_threshold, calculate_auc
-from src.evaluation.scoring import compute_errors_on_loader
+from src.models.autoencoder import compute_errors_on_loader
+
+if TYPE_CHECKING:  # pragma: no cover - import only for type checkers
+    from src.models.autoencoder import SequenceAutoencoder
 
 
 def calibrate_threshold(
-    model: "SequenceAutoencoder",
+    model: SequenceAutoencoder,
     val_normal_loader: DataLoader,
     val_anomaly_loader: DataLoader,
     device: torch.device,

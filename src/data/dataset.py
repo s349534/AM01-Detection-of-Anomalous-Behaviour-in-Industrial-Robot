@@ -1,44 +1,45 @@
 """PyTorch ``Dataset`` for Kuka robot time-series data.
 
-:class:`KukaDataset` wraps a 2-D array and extracts sliding windows of
-``W`` consecutive timesteps **on the fly** in ``__getitem__``.
+:class:`KukaDataset` wraps a 2-D array and extracts windows at specified
+start indices **on the fly** in ``__getitem__``.
 
-Why on-the-fly (see §4.1): pre-computing all windows at W=16 costs ~2.9 GB;
-slicing views costs ~0.18 GB.  Separate instances per split prevent windows
-from straddling the normal/anomaly boundary.  The training loop must transpose
-the returned ``(W, n_features)`` → ``(B, n_features, W)`` for ``Conv1d``.
+Why on-the-fly (see §4.1): pre-computing all windows costs GB;
+slicing views costs ~0.18 GB.  The start indices are precomputed by
+:mod:`src.data.partitioning` to enforce:
+  - no overlap between partitions (R2a)
+  - guard band gap ≥ W between partitions (R2b)
+  - controlled stride within each partition (R1)
 """
+
 from __future__ import annotations
 
 import logging
-import warnings
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset
+
+from src.data.partitioning import plan_from_config
 
 logger = logging.getLogger(__name__)
 
 
 class KukaDataset(Dataset):
-    """Sliding-window ``Dataset`` for Kuka robot data.
+    """Window-index-based ``Dataset`` for Kuka robot data.
 
     Each ``__getitem__`` returns ``(window, label)`` where window has
     shape ``(window_size, n_features)``.  The model transposes to
     ``(B, n_features, W)`` for ``Conv1d``.  ``label`` is implicit:
-    ``0 = normal``, ``1 = anomaly`` — alignment guaranteed at construction.
-
-    The number of windows is ``(n_samples - window_size) // stride + 1``.
+    ``0 = normal``, ``1 = anomaly`` — alignment guaranteed by the partition plan.
     """
 
     def __init__(
         self,
         data: np.ndarray | torch.Tensor,
-        window_size: int = 16,
-        stride: int = 1,
-        drop_incomplete: bool = True,
+        start_indices: np.ndarray,
+        window_size: int,
         label: int = 0,
         dtype: torch.dtype = torch.float32,
     ) -> None:
@@ -59,36 +60,30 @@ class KukaDataset(Dataset):
         if window_size <= 0:
             raise ValueError(f"window_size must be > 0, got {window_size}")
 
-        if stride <= 0:
-            raise ValueError(f"stride must be > 0, got {stride}")
+        if start_indices.ndim != 1:
+            raise ValueError("start_indices must be 1-D array")
+
+        if len(start_indices) > 0:
+            max_start = int(start_indices.max())
+            if max_start + window_size > n_samples:
+                raise ValueError(
+                    f"start_indices + window_size exceeds data length: "
+                    f"max start={max_start}, W={window_size}, n_samples={n_samples}"
+                )
 
         self.data = torch.from_numpy(np.ascontiguousarray(data)).to(dtype)
+        self.start_indices = torch.from_numpy(start_indices.astype(np.int64))
         self.n_features = n_features
         self.window_size = window_size
-        self.stride = stride
         self.label = label
         self.dtype = dtype
-
-        # --- Compute number of windows ---
-        if not drop_incomplete:
-            warnings.warn(
-                "drop_incomplete=False is not fully supported yet — "
-                "partial windows would need padding. Falling back to "
-                "drop_incomplete=True behaviour.",
-                UserWarning,
-            )
-
-        if n_samples < window_size:
-            self.n_windows = 0
-        else:
-            # Number of full windows that fit with the given stride.
-            self.n_windows = (n_samples - window_size) // stride + 1
+        self.n_windows = len(start_indices)
 
         if self.n_windows == 0:
             logger.warning(
-                "KukaDataset created with 0 windows: n_samples=%d < window_size=%d (stride=%d). "
+                "KukaDataset created with 0 windows: data length=%d, window_size=%d. "
                 "DataLoader will yield no batches.",
-                n_samples, window_size, stride
+                n_samples, window_size
             )
 
     def __len__(self) -> int:
@@ -104,107 +99,114 @@ class KukaDataset(Dataset):
                 f"index {idx} is out of range for {self.n_windows} windows"
             )
 
-        start = idx * self.stride
+        start = int(self.start_indices[idx])
         end = start + self.window_size
         window = self.data[start:end]  # (W, n_features) — view, no copy
 
-        label_tensor = torch.tensor(
-            [self.label], dtype=self.dtype
-        )
+        label_tensor = torch.tensor([self.label], dtype=self.dtype)
 
         return window, label_tensor
 
     def __repr__(self) -> str:
         return (
             f"KukaDataset(n_windows={self.n_windows}, "
-            f"window_size={self.window_size}, stride={self.stride}, "
+            f"window_size={self.window_size}, "
             f"n_features={self.n_features}, label={self.label})"
         )
 
 
 # ---------------------------------------------------------------------------
-# Convenience: build all four datasets from processed .npy files
+# Factory: build all loaders from new processed artifacts
 # ---------------------------------------------------------------------------
-def build_datasets(
-    processed_dir: str | Path,
-    window_size: int = 16,
-    stride: int = 1,
+def build_dataloaders(
+    config: dict[str, Any],
+    partitions: list[str] | None = None,
     batch_size: int = 256,
     num_workers: int = 2,
 ) -> dict[str, DataLoader]:
-    """Load processed .npy files and create DataLoaders for train/val/test.
+    """Load processed artifacts and create DataLoaders for requested partitions.
 
-    Reads the 5-file temporal split from ``processed_dir``:
-    ``train.npy``, ``val_normal.npy``, ``val_anomaly.npy``,
-    ``test_normal.npy``, ``test_anomaly.npy``.
+    Reads the new artifact layout from ``processed_dir``:
+    - ``normal_scaled.npy``, ``slow_scaled.npy``
+    - ``plan_{partition}.npy`` (window start indices)
+    - Reconstructs partition plan from config (or loads manifest)
 
-    ``train`` is shuffled; ``val_*`` and ``test`` are not.
-    The ``val`` loader concatenates ``val_normal`` (label 0) and
-    ``val_anomaly`` (label 1) via ``ConcatDataset``.
-    The ``test`` loader concatenates ``test_normal`` (label 0) and
-    ``test_anomaly`` (label 1) via ``ConcatDataset``.
+    Args:
+        config: Full config dict.
+        partitions: List of partition names to build loaders for.
+                    Default: all five partitions.
+        batch_size: Batch size.
+        num_workers: DataLoader worker processes.
+
+    Returns:
+        Dict mapping partition name -> DataLoader.
     """
-    processed_dir = Path(processed_dir)
+    processed_dir = Path(config["paths"]["data_processed"])
+    window_size = int(config.get("data", {}).get("window_size", 256))
 
-    train_data = np.load(processed_dir / "train.npy")
-    val_normal_data = np.load(processed_dir / "val_normal.npy")
-    val_anomaly_data = np.load(processed_dir / "val_anomaly.npy")
-    test_normal_data = np.load(processed_dir / "test_normal.npy")
-    test_anomaly_data = np.load(processed_dir / "test_anomaly.npy")
+    # Load scaled recordings
+    normal_scaled = np.load(processed_dir / "normal_scaled.npy")
+    slow_scaled = np.load(processed_dir / "slow_scaled.npy")
 
-    train_ds = KukaDataset(train_data, window_size, stride, label=0)
-    val_normal_ds = KukaDataset(val_normal_data, window_size, stride, label=0)
-    val_anomaly_ds = KukaDataset(val_anomaly_data, window_size, stride, label=1)
-    test_normal_ds = KukaDataset(test_normal_data, window_size, stride, label=0)
-    test_anomaly_ds = KukaDataset(test_anomaly_data, window_size, stride, label=1)
+    # Reconstruct partition plan from config (deterministic)
+    if partitions is None:
+        partitions = ["train", "val_normal", "val_anomaly", "test_normal", "test_anomaly"]
 
-    val_ds: ConcatDataset[Any] = ConcatDataset([val_normal_ds, val_anomaly_ds])
-    test_ds: ConcatDataset[Any] = ConcatDataset([test_normal_ds, test_anomaly_ds])
+    # Build plan from config
+    normal_n = normal_scaled.shape[0]
+    slow_n = slow_scaled.shape[0]
+    plan = {}
+    for src in ("normal", "slow"):
+        src_plan = plan_from_config(config, src, normal_n, slow_n)
+        plan.update(src_plan)
 
-    loaders: dict[str, DataLoader] = {
-        "train": DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True,
+    loaders: dict[str, DataLoader] = {}
+
+    for name in partitions:
+        if name not in plan:
+            logger.warning("Partition '%s' not in plan, skipping", name)
+            continue
+
+        starts = plan[name]
+        label = 1 if "anomaly" in name else 0
+        data = slow_scaled if "anomaly" in name else normal_scaled
+
+        ds = KukaDataset(data, starts, window_size, label=label)
+        shuffle = (name == "train")
+        loaders[name] = DataLoader(
+            ds, batch_size=batch_size, shuffle=shuffle,
             num_workers=num_workers, drop_last=False,
-        ),
-        "val": DataLoader(
-            val_ds, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, drop_last=False,
-        ),
-        "test": DataLoader(
-            test_ds, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, drop_last=False,
-        ),
-    }
+        )
+        logger.info("Built loader for %s: %d windows, label=%d", name, len(ds), label)
 
     return loaders
 
 
 # ---------------------------------------------------------------------------
-# Single-loader convenience (used by train/validiation scripts)
+# Single-loader convenience (used by training/validation scripts)
 # ---------------------------------------------------------------------------
 def build_loader(
     data: np.ndarray | torch.Tensor,
-    window_size: int = 16,
-    stride: int = 1,
+    start_indices: np.ndarray,
+    window_size: int,
     batch_size: int = 256,
     label: int = 0,
     shuffle: bool = False,
     num_workers: int = 0,
     drop_last: bool = False,
 ) -> DataLoader:
-    """Build a single ``DataLoader`` from a data array.
+    """Build a single ``DataLoader`` from data array and window start indices.
 
-    Wraps :class:`KukaDataset` + ``DataLoader`` in one call so that training
-    and validation scripts don't need to repeat the boilerplate.
+    Wraps :class:`KukaDataset` + ``DataLoader`` in one call.
 
     Parameters
     ----------
     data : array-like of shape (n_samples, n_features)
         The raw data (already normalised).
-    window_size : int, default=16
-        Number of timesteps per sliding-window sample.
-    stride : int, default=1
-        Stride between consecutive windows.
+    start_indices : 1-D array of int
+        Window start indices (absolute in the data array).
+    window_size : int
+        Number of timesteps per window.
     batch_size : int, default=256
     label : int, default=0
         Label to assign to every window (0 = normal, 1 = anomaly).
@@ -220,7 +222,7 @@ def build_loader(
     DataLoader
         A ready-to-use data loader.
     """
-    ds = KukaDataset(data, window_size=window_size, stride=stride, label=label)
+    ds = KukaDataset(data, start_indices, window_size, label=label)
     return DataLoader(
         ds, batch_size=batch_size, shuffle=shuffle,
         num_workers=num_workers, drop_last=drop_last,

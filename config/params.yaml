@@ -1,7 +1,6 @@
 model:
   name: adversarial_autoencoder
   input_dim: 86
-  window_size: 256
   encoding_dim: 32
   latent_dim: 32
   encoder:
@@ -22,7 +21,7 @@ model:
     activation: leaky_relu
 training:
   batch_size: 256
-  epochs: 100
+  epochs: 200
   learning_rate: 0.0001
   weight_decay: 0.0001
   beta1: 0.5
@@ -33,7 +32,7 @@ training:
   loss: mae
   reconstruction_metric: mae
   early_stopping:
-    patience: 10
+    patience: 15
     min_delta: 0.0001
   train_split: 0.7
   val_split: 0.15
@@ -43,7 +42,23 @@ data:
   slow_data_path: data/raw/KukaSlow.npy
   column_names_path: data/raw/KukaColumnNames.npy
   window_size: 256
-  window_stride: 1
-  drop_incomplete: true
   normalization: minmax
   augmentation: false
+  partitioning:
+    mode: interleaved
+    chunk_size: 1024
+    gap: window
+    quotas:
+      normal:
+        train: 0.7
+        val_normal: 0.15
+        test_normal: 0.15
+      slow:
+        val_anomaly: 0.5
+        test_anomaly: 0.5
+    stride_multipliers:
+      train: 0.25
+      val_normal: 0.5
+      test_normal: 0.5
+      val_anomaly: 0.5
+      test_anomaly: 0.5

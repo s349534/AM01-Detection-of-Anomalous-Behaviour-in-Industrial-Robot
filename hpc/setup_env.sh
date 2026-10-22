@@ -43,6 +43,12 @@ echo "  PolitO Legion Cluster"
 echo "=========================================="
 echo ""
 
+# The project is an APPLICATION run from the project root: it is NOT installed
+# into the venv (building it would need setuptools downloaded from PyPI, which
+# fails on the cluster). UV_NO_SYNC=1 stops the `uv run` calls below from
+# re-syncing (and therefore re-building) the project.
+export UV_NO_SYNC=1
+
 # ── Step 1: Check system info ───────────────────────────────────────────────
 echo "--- System Information ---"
 echo "User:  $(whoami)"
@@ -79,7 +85,11 @@ fi
 # ── Step 4: Sync dependencies from the frozen lockfile ──────────────────────
 echo ""
 echo "--- Syncing project dependencies (frozen lockfile) ---"
-uv sync --frozen
+# --no-install-project: the project is an APPLICATION run from the project
+# root (`python -m src...`), it does not need to be installed in the venv.
+# Installing it would build it with setuptools, which must be DOWNLOADED from
+# PyPI — that fails on the cluster (no PyPI access, connection timeout).
+uv sync --frozen --no-install-project
 # Re-export pinned requirements.txt for any pip-based fallback
 uv export --no-dev --no-hashes -o requirements.txt 2>/dev/null || true
 
@@ -99,8 +109,7 @@ print(f'pandas={pandas.__version__}')
 print(f'sklearn={sklearn.__version__}')
 print(f'torch={torch.__version__}')
 from src.data import dataset, preprocessing
-from src.models import autoencoder, adversarial_ae
-from src.utils import visualization
+from src.models import autoencoder
 print('All project modules import successfully!')
 "
 

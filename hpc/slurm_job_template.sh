@@ -62,6 +62,11 @@ export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1   # flush stdout subito → `tail -f` del log mostra l'output riga per riga
 export CUDA_VISIBLE_DEVICES=0
 export SCRATCH_PROJECT="am01"
+# The project is an APPLICATION run from the project root (`python -m src...`):
+# it is not installed into the venv. Building it would require downloading
+# setuptools from PyPI, which fails on the cluster (no PyPI access).
+# UV_NO_SYNC=1 keeps the `uv run` calls from re-syncing (and re-building).
+export UV_NO_SYNC=1
 
 # ── Main execution ──────────────────────────────────────────────────────────
 
@@ -89,6 +94,17 @@ if [[ -d "${HOME}/am01_project" ]]; then
         --exclude='outputs/' --exclude='reports/figures/' \
         "${HOME}/am01_project/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/"
     echo "Synced project to scratch (excluded .venv/.git/data/raw)."
+
+    # Content-based re-sync of the sources (--checksum): the quick check
+    # (size+mtime) above can skip files whose timestamp did not change,
+    # leaving a STALE copy of the code on scratch.
+    rsync -a --checksum \
+        --include='*/' --include='*.py' --include='*.yaml' --include='*.sh' --exclude='*' \
+        "${HOME}/am01_project/src/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/src/"
+    rsync -a --checksum \
+        --include='*/' --include='*.yaml' --include='*.sh' --exclude='*' \
+        "${HOME}/am01_project/config/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/config/"
+    echo "Sources re-synced with --checksum."
 fi
 
 # Activate uv environment — rebuild the venv on scratch from the frozen lockfile.
@@ -99,7 +115,7 @@ unset VIRTUAL_ENV 2>/dev/null || true
 
 if command -v uv &>/dev/null; then
     echo "--- Syncing frozen deps on scratch ---"
-    uv sync --frozen --quiet
+    uv sync --frozen --no-install-project --quiet
     echo "--- PyTorch / device check ---"
     uv run python -c "
 import torch
@@ -110,11 +126,13 @@ if torch.cuda.is_available():
 "
 fi
 
+
+
 # ── Preprocessing (always executed) ──────────────────────────────────────────
 # data/processed/ may be stale from a previous run (different hyperparameters,
 # window size, or scaler), so re-generate it every time to guarantee consistency.
 echo "=== Running preprocessing from data/raw/ ==="
-uv run python -m src.data.preprocessing
+uv run python -m src.data.preprocessing --config config/params.yaml
 
 # ── Run your training script ────────────────────────────────────────────────
 # Replace with your actual training command when the pipeline is implemented.

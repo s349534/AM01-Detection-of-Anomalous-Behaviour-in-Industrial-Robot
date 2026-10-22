@@ -64,11 +64,10 @@ def import_modules() -> None:
     print("--- Importing project modules ---")
     from src.data import dataset, preprocessing  # noqa: F401
     try:
-        from src.models import adversarial_ae, autoencoder  # noqa: F401
+        from src.models import autoencoder  # noqa: F401
         print("models import OK.")
     except ImportError as e:
         print(f"models import skipped (scaffolding): {e}")
-    from src.utils import visualization  # noqa: F401
     print("All src.* modules import OK.")
 
 
@@ -93,7 +92,7 @@ def run_phase_train(config: dict) -> None:
 
 def run_phase_evaluate(config: dict) -> None:
     """Fase 5 — Evaluate trained model on test set."""
-    from src.evaluation.evaluate import run_evaluation
+    from src.evaluation.evaluate import evaluate_checkpoints
     from pathlib import Path
 
     checkpoint_path = Path("reports/checkpoints/ae_baseline.pth")
@@ -102,12 +101,16 @@ def run_phase_evaluate(config: dict) -> None:
         return
 
     print("\n=== Fase 5: Evaluate Model ===")
-    result = run_evaluation(
-        checkpoint_path=checkpoint_path,
-        processed_dir=Path(config["paths"]["data_processed"]),
+    result = evaluate_checkpoints(
+        checkpoint_paths=[checkpoint_path],
         config=config,
     )
-    # Results printed by run_evaluation
+    tm = result["per_seed"][0]
+    print(f"Test ROC-AUC: {tm['roc_auc']:.4f} | PR-AUC: {tm['pr_auc']:.4f} | F1: {tm['f1']:.4f}")
+    cm = tm["confusion_matrix"]
+    print(f"Confusion matrix: TN={cm['tn']} FP={cm['fp']} FN={cm['fn']} TP={cm['tp']}")
+    print("For the full report (figure + metrics CSV) run: python -m src.evaluation "
+          "--checkpoint reports/checkpoints/ae_baseline.pth")
 
 
 def main() -> None:
