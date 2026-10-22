@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 #
 # hpc_connect.sh — Automated SSH connection and command execution for PolitO HPC Legion
 #
@@ -142,7 +142,16 @@ cmd_download() {
 
 cmd_submit() {
     local script="$1"
-    if [[ ! -f "${script}" ]]; then
+    # Resolve script path: if not absolute and not found relative to cwd, try PROJECT_ROOT
+    if [[ ! "${script}" = /* ]] && [[ ! -f "${script}" ]]; then
+        local candidate="${PROJECT_ROOT}/${script}"
+        if [[ -f "${candidate}" ]]; then
+            script="${candidate}"
+        else
+            echo "ERROR: SLURM script not found: ${script} (also checked ${candidate})"
+            exit 1
+        fi
+    elif [[ ! -f "${script}" ]]; then
         echo "ERROR: SLURM script not found: ${script}"
         exit 1
     fi
@@ -290,6 +299,20 @@ cmd_batch() {
     if [[ "${1:-}" == "--dry-run" ]]; then dry=1; shift; fi
     script="$1"
     [[ -n "${script}" ]] || { echo "ERROR: usage: ./hpc_connect.sh batch [--dry-run] <slurm_script>"; exit 1; }
+
+    # Resolve script path: if not absolute and not found relative to cwd, try PROJECT_ROOT
+    if [[ ! "${script}" = /* ]] && [[ ! -f "${script}" ]]; then
+        local candidate="${PROJECT_ROOT}/${script}"
+        if [[ -f "${candidate}" ]]; then
+            script="${candidate}"
+        else
+            echo "ERROR: SLURM script not found: ${script} (also checked ${candidate})"
+            exit 1
+        fi
+    elif [[ ! -f "${script}" ]]; then
+        echo "ERROR: SLURM script not found: ${script}"
+        exit 1
+    fi
 
     cmd_deploy $([[ "$dry" == "1" ]] && echo "--dry-run")
     [[ "$dry" == "1" ]] && { echo "[dry-run] would then submit ${script} (via upload+sbatch)."; return 0; }
