@@ -30,12 +30,25 @@
 
 set -euo pipefail
 
+# ── Resolve paths relative to this script & project root (cwd-independent)
+# hpc_connect.sh lives in <root>/hpc, so project root is one level up.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# ── Load .env if present ─────────────────────────────────────────────────────
+if [[ -f "${PROJECT_ROOT}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${PROJECT_ROOT}/.env"
+    set +a
+fi
+
 # ── Configuration ────────────────────────────────────────────────────────────
-HPC_USER="${HPC_USER:-mungolo}"
+HPC_USER="${HPC_USER:-anardelli}"
 HPC_HOST="${HPC_HOST:-polito-hpc}"
 # Use $HOME literal (NOT $HOME expanded locally, NOT ~/ which POSIX sh
 # inside ssh neutralises when single-quoted) so the REMOTE shell expands it
-# to the HPC home (e.g. /home/mungolo), never the local /c/Users/... path.
+# to the HPC home (e.g. /home/anardelli), never the local /c/Users/... path.
 PROJECT_DIR_REMOTE="${PROJECT_DIR_REMOTE:-\$HOME/am01_project}"
 SSH_OPTS="-o StrictHostKeyChecking=yes -o ConnectTimeout=10"
 # Things never to upload to the HPC (large / secret / local-only)
@@ -51,11 +64,6 @@ RSYNC_EXCLUDES=(
     --exclude='outputs/'
     --exclude='reports/figures/'
 )
-
-# ── Resolve paths relative to this script & project root (cwd-independent)
-# hpc_connect.sh lives in <root>/hpc, so project root is one level up.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ── Helper: build SSH host string ───────────────────────────────────────────────
 ssh_target() {
@@ -347,17 +355,17 @@ cmd_batch() {
     echo ""
     ssh_run "$(ssh_target)" "
         set +e
-        LOG=\"~/jobs/logs/am01_*_${jid}.log\"
-        # Wait for log file to appear (job may be PENDING)
-        for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        LOG=\"\$HOME/jobs/logs/am01_*_${jid}.log\"
+        # Wait for log file to appear while job is queued/pending
+        log_file=\"\"
+        while squeue -j ${jid} -h -o '%T' 2>/dev/null | grep -q .; do
             eval \"log_file=\$(ls \$LOG 2>/dev/null | head -1)\"
             [[ -n \"\$log_file\" ]] && break
-            sleep 5
+            echo \"Job ${jid} in queue (waiting for GPU resources)...\"
+            sleep 15
         done
-        log_file=\$(ls \$LOG 2>/dev/null | head -1)
         if [[ -z \"\$log_file\" ]]; then
-            echo \"WARNING: Log file not found after 60s. Checking sinfo...\"
-            sinfo -p \${SLURM_PARTITION:-gpu_a40} 2>/dev/null || true
+            eval \"log_file=\$(ls \$LOG 2>/dev/null | head -1)\"
         fi
         # Stream live (use resolved log_file, not the glob)
         if [[ -n \"\$log_file\" ]]; then
@@ -381,57 +389,60 @@ cmd_batch() {
     # ── Auto-download results ───────────────────────────────────────────────
     echo ""
     echo "=== Fetching results to local ==="
-    mkdir -p ./data/processed ./reports/tables ./reports/figures ./logs
+    mkdir -p "${PROJECT_ROOT}/data/processed" "${PROJECT_ROOT}/reports/tables" \
+             "${PROJECT_ROOT}/reports/figures" "${PROJECT_ROOT}/reports/checkpoints" \
+             "${PROJECT_ROOT}/config" "${PROJECT_ROOT}/logs"
 
     if command -v rsync >/dev/null 2>&1; then
         rsync -av --progress \
             "$(ssh_target):~/am01_project/data/processed/" \
-            ./data/processed/ 2>/dev/null || true
+            "${PROJECT_ROOT}/data/processed/" 2>/dev/null || true
 
-        # Download reports/ (CSV + plots) — populated by AE search / training jobs
-        rsync -av --progress --ignore-existing \
+        # Download reports/ (CSV + plots + checkpoints) — overwrite with newest results
+        rsync -av --progress \
             "$(ssh_target):~/am01_project/reports/tables/" \
-            ./reports/tables/ 2>/dev/null || true
-        rsync -av --progress --ignore-existing \
+            "${PROJECT_ROOT}/reports/tables/" 2>/dev/null || true
+        rsync -av --progress \
             "$(ssh_target):~/am01_project/reports/figures/" \
-            ./reports/figures/ 2>/dev/null || true
-        rsync -av --progress --ignore-existing \
+            "${PROJECT_ROOT}/reports/figures/" 2>/dev/null || true
+        rsync -av --progress \
             "$(ssh_target):~/am01_project/reports/checkpoints/" \
-            ./reports/checkpoints/ 2>/dev/null || true || true
+            "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null || true
 
-        # Download validated params (produced by analyze_results)
-        if [[ -f "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" ]]; then
-            scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
-                ./config/params_validated_ae.yaml 2>/dev/null || true
-            echo "Validated params → ./config/params_validated_ae.yaml"
-        fi
+        # Download validated params (produced by analyze_results for AE or AAE)
+        scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
+            "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null && echo "Validated AE params → ${PROJECT_ROOT}/config/params_validated_ae.yaml" || true
+        scp "$(ssh_target):~/am01_project/config/params_validated_aae.yaml" \
+            "${PROJECT_ROOT}/config/params_validated_aae.yaml" 2>/dev/null && echo "Validated AAE params → ${PROJECT_ROOT}/config/params_validated_aae.yaml" || true
     else
         # Fallback: scp individual files
         for f in train.npy val.npy test_normal.npy test_anomaly.npy \
                  scaler.pkl selected_columns.npy preprocessing_config.json; do
             scp "$(ssh_target):~/am01_project/data/processed/${f}" \
-                ./data/processed/ 2>/dev/null || true
+                "${PROJECT_ROOT}/data/processed/" 2>/dev/null || true
         done
         # CSV results
-        for f in validation_results_ae.csv ae_final_metrics.csv; do
+        for f in validation_results_ae.csv validation_results_aae.csv ae_final_metrics.csv aae_final_metrics.csv; do
             scp "$(ssh_target):~/am01_project/reports/tables/${f}" \
-                ./reports/tables/ 2>/dev/null || true
+                "${PROJECT_ROOT}/reports/tables/" 2>/dev/null || true
         done
         # Validated params
         scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
-            ./config/params_validated_ae.yaml 2>/dev/null || true
+            "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null || true
+        scp "$(ssh_target):~/am01_project/config/params_validated_aae.yaml" \
+            "${PROJECT_ROOT}/config/params_validated_aae.yaml" 2>/dev/null || true
     fi
 
-    # Download latest log (fetched to ~/am01_project/logs/ by SLURM post-run rsync)
+    # Download latest log (from ~/jobs/logs/ or ~/am01_project/logs/)
     local latest_log
-    latest_log=$(ssh_run "$(ssh_target)" "ls -t ~/am01_project/logs/am01_*.log 2>/dev/null | head -1")
+    latest_log=$(ssh_run "$(ssh_target)" "ls -t ~/jobs/logs/am01_*_${jid}.log ~/jobs/logs/am01_*.log ~/am01_project/logs/am01_*.log 2>/dev/null | head -1")
     if [[ -n "${latest_log}" ]]; then
-        scp "$(ssh_target):${latest_log}" ./logs/ 2>/dev/null || true
-        echo "Log downloaded → ./logs/$(basename "${latest_log}")"
+        scp "$(ssh_target):${latest_log}" "${PROJECT_ROOT}/logs/" 2>/dev/null || true
+        echo "Log downloaded → ${PROJECT_ROOT}/logs/$(basename "${latest_log}")"
     fi
 
     echo ""
-    echo "Done.  Data: ./data/processed/   Reports: ./reports/   Config: ./config/params_validated_ae.yaml   Log: ./logs/"
+    echo "Done. Results fetched to ${PROJECT_ROOT}/reports/, ${PROJECT_ROOT}/config/, ${PROJECT_ROOT}/logs/"
 }
 
 cmd_help() {

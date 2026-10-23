@@ -53,27 +53,36 @@ echo "Python: $(python3 --version 2>/dev/null || echo 'not found')"
 echo "uv:   $(uv --version 2>/dev/null || echo 'not found')"
 echo ""
 
+# Ensure cluster Python 3.13 and local uv are in PATH
+export PATH="/share/apps/miniconda3/bin:$HOME/.local/bin:$PATH"
+
+# Unset invalid proxy variables (direct connection on login node works without proxy)
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
 # ── Step 2: Install uv if not present ───────────────────────────────────────
 if ! command -v uv &>/dev/null; then
     echo "--- Installing uv ---"
     curl -LsSf https://astral.sh/uv/install.sh | sh
-    # Add to PATH for current session
-    export PATH="$HOME/.local/bin:$PATH"
     echo "uv installed: $(uv --version)"
 else
     echo "uv already installed: $(uv --version)"
 fi
 
 # ── Step 3: Set Python version ──────────────────────────────────────────────
-# Use .python-version from the project (3.13). uv will fetch the exact build.
+# Use Python 3.13 already installed on cluster at /share/apps/miniconda3/bin/python3
 PYTHON_VERSION_FILE=".python-version"
 if [[ -f "${PYTHON_VERSION_FILE}" ]]; then
     DESIRED_PYTHON=$(cat "${PYTHON_VERSION_FILE}")
     echo "--- Setting Python version to ${DESIRED_PYTHON} ---"
-    uv python find "${DESIRED_PYTHON}" >/dev/null 2>&1 || {
-        echo "Python ${DESIRED_PYTHON} not found. Installing via uv..."
-        uv python install "${DESIRED_PYTHON}"
-    }
+    if ! uv python find "${DESIRED_PYTHON}" >/dev/null 2>&1; then
+        if [[ -x "/share/apps/miniconda3/bin/python3" ]]; then
+            echo "Using cluster Python at /share/apps/miniconda3/bin/python3"
+            uv python pin /share/apps/miniconda3/bin/python3
+        else
+            echo "Python ${DESIRED_PYTHON} not found. Installing via uv..."
+            uv python install "${DESIRED_PYTHON}"
+        fi
+    fi
 fi
 
 # ── Step 4: Sync dependencies from the frozen lockfile ──────────────────────
@@ -137,7 +146,7 @@ else
     cat >> "$HOME/.bashrc" <<EOF
 
 # >>> AM01 / uv environment >>>
-export PATH="\$HOME/.local/bin:\$PATH"
+export PATH="/share/apps/miniconda3/bin:\$HOME/.local/bin:\$PATH"
 [ -d "\$HOME/am01_project/.venv" ] && source "\$HOME/am01_project/.venv/bin/activate" 2>/dev/null || true
 # <<< AM01 / uv environment <<<
 EOF

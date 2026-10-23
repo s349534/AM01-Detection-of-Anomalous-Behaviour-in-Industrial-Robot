@@ -31,6 +31,7 @@ export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=0
 export SCRATCH_PROJECT="am01"
+export PATH="/share/apps/miniconda3/bin:$HOME/.local/bin:$PATH"
 
 # Resolve N_ITER / MAX_VAL_EPOCHS from env (with defaults)
 N_ITER="${N_ITER:-25}"
@@ -104,7 +105,8 @@ rsync -a --include='params_validated_aae.yaml' \
     "${RESULTS_DIR}/config/" "${HOME_PROJECT}/config/" 2>/dev/null || true
 
 # Log
-cp "${RESULTS_DIR}/logs"/am01_aae_search_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+cp "${HOME}/jobs/logs/am01_aae_search_${SLURM_JOB_ID}.log" "${HOME_PROJECT}/logs/" 2>/dev/null || \
+    cp "${RESULTS_DIR}/logs"/am01_aae_search_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
 
 echo "=== Results fetched to ${HOME_PROJECT}/reports/ and ${HOME_PROJECT}/config/ ==="
 echo "Job completed."

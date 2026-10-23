@@ -48,9 +48,20 @@ def load_kuka_data(
     selected_col_names : np.ndarray, shape (82,)
     """
     data_cfg = config["data"]
-    normal_path = Path(data_cfg["normal_data_path"])
-    slow_path = Path(data_cfg["slow_data_path"])
-    col_names_path = Path(data_cfg["column_names_path"])
+    def _resolve(p: Path) -> Path:
+        if p.exists():
+            return p
+        alt1 = p.parent.parent / p.name
+        if alt1.exists():
+            return alt1
+        alt2 = p.parent / "KukaVelocityDataset" / p.name
+        if alt2.exists():
+            return alt2
+        return p
+
+    normal_path = _resolve(Path(data_cfg["normal_data_path"]))
+    slow_path = _resolve(Path(data_cfg["slow_data_path"]))
+    col_names_path = _resolve(Path(data_cfg["column_names_path"]))
 
     # --- Load raw .npy files ---
     normal = np.load(normal_path, allow_pickle=True)   # (233792, 86)
@@ -285,7 +296,12 @@ def save_processed_data(
     config: dict[str, Any],
 ) -> None:
     """Save .npy arrays, scaler.pkl, and selected_columns.npy to data/processed/."""
-    output_dir = Path(config["paths"]["processed_data_dir"])
+    output_dir = Path(
+        config.get("paths", {}).get(
+            "data_processed",
+            config.get("paths", {}).get("processed_data_dir", "data/processed/"),
+        )
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Save .npy arrays ---

@@ -48,7 +48,7 @@
 
 # Mail notifications (optional)
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=mungolo@studenti.polito.it
+#SBATCH --mail-user=anardelli@studenti.polito.it
 
 # ── Environment setup ───────────────────────────────────────────────────────
 set -euo pipefail
@@ -62,6 +62,7 @@ export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1   # flush stdout subito → `tail -f` del log mostra l'output riga per riga
 export CUDA_VISIBLE_DEVICES=0
 export SCRATCH_PROJECT="am01"
+export PATH="/share/apps/miniconda3/bin:$HOME/.local/bin:$PATH"
 
 # ── Main execution ──────────────────────────────────────────────────────────
 
@@ -134,6 +135,7 @@ rsync -a --ignore-existing \
 
 # logs/am01_train_*.log
 mkdir -p "${HOME_PROJECT}/logs"
-cp "${RESULTS_DIR}/logs"/am01_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+cp "${HOME}/jobs/logs/am01_train_${SLURM_JOB_ID}.log" "${HOME_PROJECT}/logs/" 2>/dev/null || \
+    cp "${RESULTS_DIR}/logs"/am01_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
 
 echo "Results fetched to ${HOME_PROJECT}/data/processed/ and ${HOME_PROJECT}/logs/"

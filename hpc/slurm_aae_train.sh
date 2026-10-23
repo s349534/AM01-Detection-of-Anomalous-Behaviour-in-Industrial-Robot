@@ -30,6 +30,7 @@ export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=0
 export SCRATCH_PROJECT="am01"
+export PATH="/share/apps/miniconda3/bin:$HOME/.local/bin:$PATH"
 
 # ── Working directory on scratch ────────────────────────────────────────────
 SCRATCH_DIR="${SCRATCH:-${HOME}/scratch}"
@@ -73,12 +74,13 @@ HOME_PROJECT="${HOME}/am01_project"
 
 mkdir -p "${HOME_PROJECT}/reports/checkpoints" "${HOME_PROJECT}/reports/tables" "${HOME_PROJECT}/logs"
 
-rsync -a --progress --ignore-existing \
+rsync -a --progress \
     "${RESULTS_DIR}/reports/checkpoints/" "${HOME_PROJECT}/reports/checkpoints/" 2>/dev/null || true
-rsync -a --progress --ignore-existing \
+rsync -a --progress \
     "${RESULTS_DIR}/reports/tables/" "${HOME_PROJECT}/reports/tables/" 2>/dev/null || true
 
-cp "${RESULTS_DIR}/logs"/am01_aae_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+cp "${HOME}/jobs/logs/am01_aae_train_${SLURM_JOB_ID}.log" "${HOME_PROJECT}/logs/" 2>/dev/null || \
+    cp "${RESULTS_DIR}/logs"/am01_aae_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
 
 echo "=== Results fetched to ${HOME_PROJECT}/reports/ ==="
 echo "Job completed."
