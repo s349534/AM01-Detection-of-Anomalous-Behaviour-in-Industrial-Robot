@@ -146,18 +146,26 @@ cmd_download() {
 
 cmd_submit() {
     local script="$1"
-    if [[ ! -f "${script}" ]]; then
-        echo "ERROR: SLURM script not found: ${script}"
-        exit 1
-    fi
-    echo "Uploading and submitting SLURM job: ${script}"
-    local basename_script
+    local basename_script abs_script
     basename_script=$(basename "${script}")
+    if [[ -f "${script}" ]]; then
+        abs_script="$(cd "$(dirname "${script}")" 2>/dev/null && pwd)/$(basename "${script}")"
+    elif [[ -f "${SCRIPT_DIR}/${script}" ]]; then
+        abs_script="${SCRIPT_DIR}/${script}"
+    elif [[ -f "${PROJECT_ROOT}/hpc/${script}" ]]; then
+        abs_script="${PROJECT_ROOT}/hpc/${script}"
+    elif [[ -f "${PROJECT_ROOT}/${script}" ]]; then
+        abs_script="${PROJECT_ROOT}/${script}"
+    else
+        echo "ERROR: SLURM script '${script}' not found in current directory, ${SCRIPT_DIR}, or ${PROJECT_ROOT}." >&2
+        return 1
+    fi
+    echo "Uploading and submitting SLURM job: ${abs_script}"
     # SLURM does NOT create the --output log directory itself; create ~/jobs/logs
     # on the login node (where sbatch runs) BEFORE submitting, otherwise the job
     # fails silently with no log files written.
     ssh_run "$(ssh_target)" "mkdir -p ~/jobs/logs"
-    scp "${script}" "$(ssh_target):~/jobs/${basename_script}"
+    scp "${abs_script}" "$(ssh_target):~/jobs/${basename_script}"
     ssh_run "$(ssh_target)" "cd ~/jobs && sbatch ${basename_script}"
 }
 
@@ -337,6 +345,22 @@ cmd_batch() {
     script="$1"
     [[ -n "${script}" ]] || { echo "ERROR: usage: ./hpc_connect.sh batch [--dry-run] <slurm_script>"; exit 1; }
 
+    # Resolve absolute path to the SLURM script BEFORE any directory change
+    local basename_script abs_script
+    basename_script=$(basename "${script}")
+    if [[ -f "${script}" ]]; then
+        abs_script="$(cd "$(dirname "${script}")" 2>/dev/null && pwd)/$(basename "${script}")"
+    elif [[ -f "${SCRIPT_DIR}/${script}" ]]; then
+        abs_script="${SCRIPT_DIR}/${script}"
+    elif [[ -f "${PROJECT_ROOT}/hpc/${script}" ]]; then
+        abs_script="${PROJECT_ROOT}/hpc/${script}"
+    elif [[ -f "${PROJECT_ROOT}/${script}" ]]; then
+        abs_script="${PROJECT_ROOT}/${script}"
+    else
+        echo "ERROR: SLURM script '${script}' not found in current directory, ${SCRIPT_DIR}, or ${PROJECT_ROOT}." >&2
+        return 1
+    fi
+
     cmd_deploy $([[ "$dry" == "1" ]] && echo "--dry-run")
     [[ "$dry" == "1" ]] && { echo "[dry-run] would then submit ${script} (via upload+sbatch)."; return 0; }
 
@@ -348,10 +372,6 @@ cmd_batch() {
         cd "${PROJECT_ROOT}" || return 1
     fi
     # ── Upload SLURM script ─────────────────────────────────────────────────
-    local basename_script abs_script
-    basename_script=$(basename "${script}")
-    abs_script="$(cd "$(dirname "${script}")" 2>/dev/null && pwd)/$(basename "${script}")"
-    [[ -f "${abs_script}" ]] || abs_script="${script}"
     ssh_run "$(ssh_target)" "mkdir -p ~/jobs/logs"
     scp "${abs_script}" "$(ssh_target):~/jobs/${basename_script}"
     echo "Uploaded ${basename_script} → ~/jobs/"
@@ -407,12 +427,10 @@ cmd_batch() {
     echo "  tail -f ~/jobs/logs/am01_*_${jid}.log"
     echo ""
     # Run log streaming on HPC via a single ssh_run invocation.
-    # Use a temp script to avoid fragile quoting of variables inside a nested string.
     # The stream script polls every 60s for the log file to appear (the cluster
     # may still be starting the job, so the log does not exist yet) and retries
     # indefinitely — it does not stop after the first 60s window.
-    local _stream_script="/tmp/am01_stream_${jid}.sh"
-    cat > "${_stream_script}.base" <<'EOFSRIPT'
+    ssh_run "$(ssh_target)" "cat > ~/am01_stream_${jid}.sh" <<'EOFSRIPT'
 #!/bin/bash
 set +e
 JID="$1"
@@ -437,12 +455,9 @@ echo ''
 echo "=== Job ${JID} completed ==="
 tail -8 "$log_file" 2>/dev/null || true
 EOFSRIPT
-    # JID is passed as $1 to the stream script (no sed substitution needed)
-    cp "${_stream_script}.base" "${_stream_script}"
-    chmod +x "${_stream_script}" 2>/dev/null || true
-    # Upload and execute on HPC (run in foreground so Ctrl-C detaches cleanly)
-    scp "${_stream_script}" "$(ssh_target):~/am01_stream_${jid}.sh" 2>/dev/null || true
-    ssh_run "$(ssh_target)" "bash ~/am01_stream_${jid}.sh ${jid}"
+    # Execute on HPC (run in foreground so Ctrl-C detaches cleanly)
+    ssh_run "$(ssh_target)" "chmod +x ~/am01_stream_${jid}.sh && bash ~/am01_stream_${jid}.sh ${jid}"
+    ssh_run "$(ssh_target)" "rm -f ~/am01_stream_${jid}.sh" 2>/dev/null || true
 
     # ── Auto-download results ───────────────────────────────────────────────
     echo ""

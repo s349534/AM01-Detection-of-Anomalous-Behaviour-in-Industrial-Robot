@@ -49,12 +49,23 @@ if [[ -d "${HOME}/am01_project" ]]; then
         --exclude='*.pth' --exclude='*.pt' --exclude='*.ckpt' \
         "${HOME}/am01_project/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/"
     echo "Synced project to scratch."
+
+    # Content-based re-sync of the sources (--checksum)
+    rsync -a --checksum \
+        --include='*/' --include='*.py' --include='*.yaml' --include='*.sh' --exclude='*' \
+        "${HOME}/am01_project/src/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/src/"
+    rsync -a --checksum \
+        --include='*/' --include='*.yaml' --include='*.sh' --exclude='*' \
+        "${HOME}/am01_project/config/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/config/"
+    echo "Sources re-synced with --checksum."
 fi
 
 # ── Activate uv environment ─────────────────────────────────────────────────
+unset VIRTUAL_ENV 2>/dev/null || true
+
 if command -v uv &>/dev/null; then
     echo "--- Syncing frozen deps on scratch ---"
-    uv sync --frozen --quiet
+    uv sync --frozen --no-install-project --quiet
 fi
 
 # ── Ensure preprocessed data exists ──────────────────────────────────────────
