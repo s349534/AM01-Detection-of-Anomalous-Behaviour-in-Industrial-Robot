@@ -28,7 +28,8 @@ module load cuda 2>/dev/null || true
 
 export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES=0
+# Do not overwrite CUDA_VISIBLE_DEVICES if SLURM has already assigned a GPU
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export SCRATCH_PROJECT="am01"
 # The project is an APPLICATION run from the project root (`python -m src...`):
 # it is not installed into the venv. Building it would require downloading

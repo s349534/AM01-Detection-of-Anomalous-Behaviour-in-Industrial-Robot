@@ -29,7 +29,8 @@ module load cuda 2>/dev/null || true
 
 export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES=0
+# Do not overwrite CUDA_VISIBLE_DEVICES if SLURM has already assigned a GPU
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export SCRATCH_PROJECT="am01"
 export PATH="/share/apps/miniconda3/bin:$HOME/.local/bin:$PATH"
 
