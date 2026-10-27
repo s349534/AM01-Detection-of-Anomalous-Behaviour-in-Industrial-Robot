@@ -166,7 +166,7 @@ cmd_submit() {
     # fails silently with no log files written.
     ssh_run "$(ssh_target)" "mkdir -p ~/jobs/logs"
     scp "${abs_script}" "$(ssh_target):~/jobs/${basename_script}"
-    ssh_run "$(ssh_target)" "cd ~/jobs && sbatch ${basename_script}"
+    ssh_run "$(ssh_target)" "sed -i 's/\r$//' ~/jobs/${basename_script} && cd ~/jobs && sbatch ${basename_script}"
 }
 
 cmd_check() {
@@ -374,7 +374,8 @@ cmd_batch() {
     # ── Upload SLURM script ─────────────────────────────────────────────────
     ssh_run "$(ssh_target)" "mkdir -p ~/jobs/logs"
     scp "${abs_script}" "$(ssh_target):~/jobs/${basename_script}"
-    echo "Uploaded ${basename_script} → ~/jobs/"
+    ssh_run "$(ssh_target)" "sed -i 's/\r$//' ~/jobs/${basename_script}"
+    echo "Uploaded and normalized (LF) ${basename_script} → ~/jobs/"
 
     # ── Submit and capture job ID ───────────────────────────────────────────
     local jid
