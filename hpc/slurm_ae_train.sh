@@ -14,7 +14,7 @@
 #SBATCH --partition=gpu_a40
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
-#SBATCH --gpus=1
+#SBATCH --gres=gpu:1
 #SBATCH --time=04:00:00
 #SBATCH --mem=64GB
 #SBATCH --output=logs/%x_%j.log
@@ -28,9 +28,8 @@ module load cuda 2>/dev/null || true
 
 export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
-# Do not overwrite CUDA_VISIBLE_DEVICES if SLURM has already assigned a GPU
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export SCRATCH_PROJECT="am01"
+echo "Allocated GPU (SLURM GRES): CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 # The project is an APPLICATION run from the project root (`python -m src...`):
 # it is not installed into the venv. Building it would require downloading
 # setuptools from PyPI, which fails on the cluster (no PyPI access).
