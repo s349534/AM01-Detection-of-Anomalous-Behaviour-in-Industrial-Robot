@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.utils.metrics import (
+from src.evaluation.metrics import (
     calculate_auc,
     calculate_metrics,
     compute_anomaly_scores,
@@ -139,7 +139,7 @@ class TestFindOptimalThreshold:
     def test_finds_perfect_threshold(self, perfect_scores):
         """Optimal threshold should perfectly separate classes."""
         y_true, scores = perfect_scores
-        threshold, metrics = find_optimal_threshold(y_true, scores)
+        _threshold, metrics = find_optimal_threshold(y_true, scores)
         assert metrics["f1"] == pytest.approx(1.0)
         assert metrics["precision"] == pytest.approx(1.0)
         assert metrics["recall"] == pytest.approx(1.0)
@@ -152,7 +152,7 @@ class TestFindOptimalThreshold:
     def test_threshold_value_reasonable(self, perfect_scores):
         """Threshold should be between 0.4 and 0.6 for perfect scores."""
         y_true, scores = perfect_scores
-        threshold, metrics = find_optimal_threshold(y_true, scores)
+        threshold, _metrics = find_optimal_threshold(y_true, scores)
         assert 0.4 <= threshold <= 0.6
 
 

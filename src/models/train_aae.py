@@ -4,8 +4,10 @@ After Fase 4.1 validation selects HP_AAE_best and writes
 ``config/params_validated_aae.yaml``, this script performs the final training:
 
     - 3 runs with different seeds (nested validation, §4.8.1)
+    - Calibrates decision threshold on validation set
+    - Evaluates on the held-out test set
     - Saves best checkpoint to reports/checkpoints/aae_final.pth
-    - Writes reports/tables/aae_final_metrics.csv with mean ± std
+    - Writes reports/tables/aae_final_metrics.csv with mean +/- std
 
 Usage:
     python -m src.models.train_aae --config config/params_validated_aae.yaml
@@ -16,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -23,66 +26,48 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 
-from src.data.dataset import KukaDataset
+from src.data.dataset import build_dataloaders
+from src.models.autoencoder import compute_errors_on_loader
 from src.models.adversarial_ae import AdversarialAutoencoder, fit_aae
-from src.utils.config import load_config, get_param
-from src.utils.metrics import (
-    calculate_auc,
-    calculate_metrics,
-    compute_anomaly_scores,
-    percentile_threshold,
-)
+from src.evaluation.metrics import calculate_auc, evaluate_threshold
+from src.evaluation.threshold import calibrate_threshold
+from src.utils.config import get_param, load_config
 from src.utils.seed import set_seed
 
 logger = logging.getLogger(__name__)
 
-# Nested validation: 3 runs with different seeds (§4.2)
 DEFAULT_SEEDS = [42, 123, 7]
 
-
-def _build_loader(
-    processed_dir: Path,
-    filename: str,
-    window_size: int,
-    batch_size: int,
-    label: int,
-    shuffle: bool = False,
-) -> DataLoader:
-    """Build a DataLoader from a processed .npy file."""
-    data = np.load(processed_dir / filename)
-    ds = KukaDataset(data, window_size=window_size, label=label)
-    return DataLoader(
-        ds, batch_size=batch_size, shuffle=shuffle, num_workers=0, drop_last=False
-    )
-
-
-def _compute_errors(
-    model: AdversarialAutoencoder,
-    loader: DataLoader,
-    device: torch.device,
-    metric: str = "mse",
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute per-sample reconstruction errors and labels."""
-    model.eval()
-    all_errors: list[np.ndarray] = []
-    all_labels: list[np.ndarray] = []
-
-    with torch.no_grad():
-        for batch in loader:
-            x = batch[0] if isinstance(batch, (list, tuple)) else batch
-            x = x.to(device)
-            y = batch[1] if isinstance(batch, (list, tuple)) else None
-
-            errors = model.compute_reconstruction_error(x, reduction="sample", metric=metric)
-            all_errors.append(errors.cpu().numpy())
-            if y is not None:
-                all_labels.append(y.cpu().numpy().flatten())
-
-    errors = np.concatenate(all_errors)
-    labels = np.concatenate(all_labels) if all_labels else np.array([])
-    return errors, labels
+FINAL_METRICS_COLUMNS = [
+    "seed",
+    "train_time_sec",
+    "best_epoch",
+    "threshold",
+    "test_pr_auc",
+    "test_roc_auc",
+    "test_f1",
+    "test_accuracy",
+    "test_precision",
+    "test_recall",
+    "test_specificity",
+    "test_fpr",
+    "test_fnr",
+    "test_balanced_accuracy",
+    "test_mcc",
+    "test_cohen_kappa",
+    "test_npv",
+    "test_jaccard",
+    "test_tn",
+    "test_fp",
+    "test_fn",
+    "test_tp",
+    "n_train_windows",
+    "n_val_normal_windows",
+    "n_val_anomaly_windows",
+    "n_test_normal_windows",
+    "n_test_anomaly_windows",
+]
 
 
 def train_single_seed(
@@ -91,77 +76,57 @@ def train_single_seed(
     checkpoint_path: str | Path | None = None,
     device: str | torch.device | None = None,
 ) -> dict[str, Any]:
-    """Train a single AAE with a given seed and evaluate on test set.
-
-    Parameters
-    ----------
-    config : dict
-        Validated config (from params_validated_aae.yaml).
-    seed : int
-        Random seed for this run.
-    checkpoint_path : str | Path | None
-        Where to save the model checkpoint.
-    device : str | torch.device | None
-        Device to train on.
-
-    Returns
-    -------
-    dict
-        Metrics dict for this run: {seed, train_time_sec, test_pr_auc,
-        test_roc_auc, test_f1, test_accuracy, test_precision, test_recall,
-        best_epoch, threshold, reconstruction_weight, adversarial_weight}
-    """
+    """Train a single AAE with a given seed and evaluate on test set."""
     set_seed(seed)
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     dev = torch.device(device)
 
-    window_size = int(get_param(config, "model.window_size", 16))
+    window_size = int(get_param(config, "data.window_size", 256))
     batch_size = int(get_param(config, "training.batch_size", 256))
-    epochs = int(get_param(config, "training.epochs", 100))
+    epochs = int(get_param(config, "training.epochs", 200))
     lr = float(get_param(config, "training.learning_rate", 1e-3))
     weight_decay = float(get_param(config, "training.weight_decay", 0.0))
-    patience = int(get_param(config, "training.early_stopping.patience", 10))
+    patience = int(get_param(config, "training.early_stopping.patience", 15))
     min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
-    reconstruction_weight = float(get_param(config, "training.reconstruction_weight", 1.0))
-    adversarial_weight = float(get_param(config, "training.adversarial_weight", 0.1))
-    disc_updates_per_gen = int(get_param(config, "training.discriminator_updates_per_gen", 1))
-    metric = str(get_param(config, "training.loss", "mse"))
-    processed_dir = Path(get_param(config, "paths.data_processed", "data/processed/"))
-    reports_dir = Path(get_param(config, "paths.reports", "reports/"))
-
-    logger.info(
-        "Training AAE (seed=%d) on %s, epochs=%d, patience=%d, "
-        "recon_w=%.2f, adv_w=%.3f",
-        seed, dev, epochs, patience, reconstruction_weight, adversarial_weight,
+    reconstruction_weight = float(
+        get_param(config, "training.reconstruction_weight", 1.0)
     )
+    adversarial_weight = float(
+        get_param(config, "training.adversarial_weight", 0.1)
+    )
+    disc_updates_per_gen = int(
+        get_param(config, "training.discriminator_updates_per_gen", 1)
+    )
+    loss_name = str(get_param(config, "training.loss", "mae"))
+    metric = str(get_param(config, "training.reconstruction_metric", "mae"))
+
+    logger.info("Training AAE (seed=%d) on %s, epochs=%d, patience=%d", seed, dev, epochs, patience)
 
     # --- Build dataloaders ---
-    train_loader = _build_loader(processed_dir, "train.npy", window_size, batch_size, label=0, shuffle=True)
-    val_loader = _build_loader(processed_dir, "val.npy", window_size, batch_size, label=0, shuffle=False)
+    loaders = build_dataloaders(
+        config,
+        partitions=["train", "val_normal", "val_anomaly", "test_normal", "test_anomaly"],
+        batch_size=batch_size,
+    )
 
-    # Test loader: normal + anomaly
-    test_normal_loader = _build_loader(processed_dir, "test_normal.npy", window_size, batch_size, label=0)
-    test_anomaly_loader = _build_loader(processed_dir, "test_anomaly.npy", window_size, batch_size, label=1)
+    train_loader = loaders["train"]
+    val_normal_loader = loaders["val_normal"]
+    val_anomaly_loader = loaders["val_anomaly"]
+    test_normal_loader = loaders["test_normal"]
+    test_anomaly_loader = loaders["test_anomaly"]
 
     # --- Instantiate model ---
     model = AdversarialAutoencoder.from_config(config)
     model.to(dev)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(
-        "AAE parameters: %d total, %d trainable (encoder+decoder+discriminator)",
-        total_params, trainable_params,
-    )
 
     # --- Train ---
     start_time = time.time()
     history = fit_aae(
         model=model,
         train_loader=train_loader,
-        val_loader=val_loader,
+        val_loader=val_normal_loader,
         epochs=epochs,
         learning_rate=lr,
         weight_decay=weight_decay,
@@ -177,195 +142,160 @@ def train_single_seed(
     train_time_sec = time.time() - start_time
     best_epoch = len(history["val_loss"]) if history else 0
 
-    # --- Calibrate threshold on validation (normal only) ---
-    val_errors, _ = _compute_errors(model, val_loader, dev, metric=metric)
-    threshold = percentile_threshold(val_errors, 99.0)
+    # --- Validation AUC for model selection ---
+    val_normal_errors = compute_errors_on_loader(model, val_normal_loader, dev, metric=metric)
+    val_anomaly_errors = compute_errors_on_loader(model, val_anomaly_loader, dev, metric=metric)
+    val_errors = np.concatenate([val_normal_errors, val_anomaly_errors])
+    val_labels = np.concatenate([
+        np.zeros(len(val_normal_errors), dtype=np.int32),
+        np.ones(len(val_anomaly_errors), dtype=np.int32),
+    ])
+    val_auc = calculate_auc(val_labels, val_errors)
+    val_roc_auc = float(val_auc["roc_auc"])
+    val_pr_auc = float(val_auc["pr_auc"])
 
-    # --- Evaluate on test (normal + anomaly) ---
-    test_normal_errors, _ = _compute_errors(model, test_normal_loader, dev, metric=metric)
-    test_anomaly_errors, _ = _compute_errors(model, test_anomaly_loader, dev, metric=metric)
+    # --- Calibrate threshold on validation and evaluate on TEST set ---
+    threshold, _ = calibrate_threshold(
+        model, val_normal_loader, val_anomaly_loader, dev, metric=metric, method="f1_optimal"
+    )
+
+    test_normal_errors = compute_errors_on_loader(model, test_normal_loader, dev, metric=metric)
+    test_anomaly_errors = compute_errors_on_loader(model, test_anomaly_loader, dev, metric=metric)
     test_errors = np.concatenate([test_normal_errors, test_anomaly_errors])
     test_labels = np.concatenate([
         np.zeros(len(test_normal_errors), dtype=np.int32),
         np.ones(len(test_anomaly_errors), dtype=np.int32),
     ])
 
-    auc_scores = calculate_auc(test_labels, test_errors)
-    test_pred = compute_anomaly_scores(test_errors, threshold)
-    test_metrics = calculate_metrics(test_labels, test_pred)
+    test_metrics = evaluate_threshold(test_labels, test_errors, threshold)
+    cm = test_metrics["confusion_matrix"]
 
     logger.info(
-        "Seed %d: train_time=%.1fs, best_epoch=%d, "
-        "PR-AUC=%.4f, ROC-AUC=%.4f, F1=%.4f, threshold=%.6f",
-        seed, train_time_sec, best_epoch,
-        auc_scores["pr_auc"], auc_scores["roc_auc"], test_metrics["f1"], threshold,
+        "AAE Seed %d: ROC-AUC=%.4f, PR-AUC=%.4f, F1=%.4f, threshold=%.6f [TN=%d FP=%d FN=%d TP=%d]",
+        seed, test_metrics["roc_auc"], test_metrics["pr_auc"], test_metrics["f1"],
+        threshold, cm["tn"], cm["fp"], cm["fn"], cm["tp"],
     )
 
-    return {
+    result_dict = {
         "seed": seed,
         "train_time_sec": round(train_time_sec, 2),
         "best_epoch": best_epoch,
-        "test_pr_auc": round(auc_scores["pr_auc"], 6),
-        "test_roc_auc": round(auc_scores["roc_auc"], 6),
+        "threshold": round(float(threshold), 6),
+        "test_pr_auc": round(test_metrics["pr_auc"], 6),
+        "test_roc_auc": round(test_metrics["roc_auc"], 6),
         "test_f1": round(test_metrics["f1"], 6),
         "test_accuracy": round(test_metrics["accuracy"], 6),
         "test_precision": round(test_metrics["precision"], 6),
         "test_recall": round(test_metrics["recall"], 6),
-        "threshold": round(float(threshold), 6),
-        "reconstruction_weight": round(reconstruction_weight, 6),
-        "adversarial_weight": round(adversarial_weight, 6),
+        "test_specificity": round(test_metrics["specificity"], 6),
+        "test_fpr": round(test_metrics["fpr"], 6),
+        "test_fnr": round(test_metrics["fnr"], 6),
+        "test_balanced_accuracy": round(test_metrics["balanced_accuracy"], 6),
+        "test_mcc": round(test_metrics["mcc"], 6),
+        "test_cohen_kappa": round(test_metrics["cohen_kappa"], 6),
+        "test_npv": round(test_metrics["npv"], 6),
+        "test_jaccard": round(test_metrics["jaccard"], 6),
+        "test_tn": cm["tn"],
+        "test_fp": cm["fp"],
+        "test_fn": cm["fn"],
+        "test_tp": cm["tp"],
         "n_train_windows": len(train_loader.dataset),
-        "n_val_windows": len(val_loader.dataset),
+        "n_val_normal_windows": len(val_normal_loader.dataset),
+        "n_val_anomaly_windows": len(val_anomaly_loader.dataset),
         "n_test_normal_windows": len(test_normal_loader.dataset),
         "n_test_anomaly_windows": len(test_anomaly_loader.dataset),
+        "_val_roc_auc": val_roc_auc,
+        "_val_pr_auc": val_pr_auc,
     }
+
+    if checkpoint_path is not None:
+        ckpt = Path(checkpoint_path)
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "history": history,
+                "config": config,
+                "seed": seed,
+                "threshold": threshold,
+            },
+            ckpt,
+        )
+
+    return result_dict
 
 
 def run_final_training(
-    config_path: str | Path,
+    config_path: str | Path = "config/params_validated_aae.yaml",
     seeds: list[int] | None = None,
     device: str | torch.device | None = None,
 ) -> None:
-    """Run final AAE training with nested validation across multiple seeds.
-
-    Parameters
-    ----------
-    config_path : str | Path
-        Path to ``params_validated_aae.yaml``.
-    seeds : list[int] or None
-        Seeds for nested validation runs. Defaults to ``[42, 123, 7]``.
-    device : str | torch.device | None
-        Device to train on.
-    """
-    from src.utils.config import load_config
-
+    """Run final AAE training across multiple seeds and record final metrics."""
     if seeds is None:
         seeds = DEFAULT_SEEDS
 
-    config = load_config(
-        config_path=Path("config/config.yaml"),
-        params_path=Path(config_path) if isinstance(config_path, str) else config_path,
-    )
+    cfg_file = Path(config_path)
+    if not cfg_file.exists():
+        cfg_file = Path("config/params_validated_aae.yaml")
+        if not cfg_file.exists():
+            cfg_file = Path("config/params.yaml")
 
-    reports_dir = Path(get_param(config, "paths.reports", "reports/"))
-    ckpt_dir = reports_dir / "checkpoints"
-    tables_dir = reports_dir / "tables"
+    config = load_config(config_path=Path("config/config.yaml"), params_path=cfg_file)
+
+    reports_dir = Path(get_param(config, "paths.reports_tables", "reports/tables/"))
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = reports_dir / "aae_final_metrics.csv"
+
+    ckpt_dir = Path(get_param(config, "paths.reports_checkpoints", "reports/checkpoints/"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    tables_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = ckpt_dir / "aae_final.pth"
-    metrics_path = tables_dir / "aae_final_metrics.csv"
+    results: list[dict[str, Any]] = []
+    best_val_auc = -1.0
+    best_seed = seeds[0]
 
-    # Read model HP for logging
-    window_size = int(get_param(config, "model.window_size", 16))
-    latent_dim = int(get_param(config, "model.latent_dim", 16))
-    enc_channels = list(get_param(config, "model.encoder.conv_channels", [128, 64]))
-    disc_hidden = list(get_param(config, "model.discriminator.hidden_layers", [32, 16]))
-    recon_w = float(get_param(config, "training.reconstruction_weight", 1.0))
-    adv_w = float(get_param(config, "training.adversarial_weight", 0.1))
+    for seed in seeds:
+        seed_ckpt = ckpt_dir / f"aae_final_seed{seed}.pth"
+        res = train_single_seed(config, seed=seed, checkpoint_path=seed_ckpt, device=device)
+        results.append(res)
 
-    logger.info("=" * 60)
-    logger.info("Fase 4.2 — Final AAE Training")
-    logger.info("HP_AAE_best: W=%d, latent_dim=%d, encoder_channels=%s",
-                window_size, latent_dim, enc_channels)
-    logger.info("  discriminator_hidden=%s, recon_w=%.2f, adv_w=%.3f",
-                disc_hidden, recon_w, adv_w)
-    logger.info("Nested validation: %d seeds %s", len(seeds), seeds)
-    logger.info("=" * 60)
+        if res["_val_roc_auc"] > best_val_auc:
+            best_val_auc = res["_val_roc_auc"]
+            best_seed = seed
+            final_ckpt = ckpt_dir / "aae_final.pth"
+            shutil.copy2(seed_ckpt, final_ckpt)
+            logger.info("New best AAE model (seed=%d, val_roc_auc=%.4f) -> %s", seed, best_val_auc, final_ckpt)
 
-    all_results: list[dict[str, Any]] = []
-
-    for i, seed in enumerate(seeds):
-        # Save checkpoint only for the first seed (the baseline)
-        save_ckpt = str(checkpoint_path) if i == 0 else None
-
-        result = train_single_seed(config, seed, checkpoint_path=save_ckpt, device=device)
-        all_results.append(result)
-
-    # --- Write metrics CSV ---
-    csv_columns = [
-        "seed", "train_time_sec", "best_epoch", "test_pr_auc", "test_roc_auc",
-        "test_f1", "test_accuracy", "test_precision", "test_recall", "threshold",
-        "reconstruction_weight", "adversarial_weight",
-        "n_train_windows", "n_val_windows", "n_test_normal_windows", "n_test_anomaly_windows",
-    ]
-
-    with open(metrics_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=csv_columns)
+    # Write metrics CSV
+    with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FINAL_METRICS_COLUMNS)
         writer.writeheader()
-        for row in all_results:
-            writer.writerow({col: row.get(col, "") for col in csv_columns})
+        for r in results:
+            row = {k: r[k] for k in FINAL_METRICS_COLUMNS if k in r}
+            writer.writerow(row)
 
-    # --- Compute mean ± std ---
-    pr_aucs = [r["test_pr_auc"] for r in all_results]
-    f1s = [r["test_f1"] for r in all_results]
-    roc_aucs = [r["test_roc_auc"] for r in all_results]
+    logger.info("AAE Final metrics saved to %s", csv_path)
 
-    logger.info("=" * 60)
-    logger.info("FINAL METRICS (mean ± std over %d seeds)", len(seeds))
-    logger.info("  PR-AUC:  %.4f ± %.4f", float(np.mean(pr_aucs)), float(np.std(pr_aucs)))
-    logger.info("  ROC-AUC: %.4f ± %.4f", float(np.mean(roc_aucs)), float(np.std(roc_aucs)))
-    logger.info("  F1:      %.4f ± %.4f", float(np.mean(f1s)), float(np.std(f1s)))
-    logger.info("=" * 60)
-    logger.info("Checkpoint: %s", checkpoint_path)
-    logger.info("Metrics:    %s", metrics_path)
 
-    # Append summary row to CSV
-    with open(metrics_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([])
-        writer.writerow(csv_columns)
-        # Write summary row
-        summary_row = {
-            "seed": "MEAN±STD",
-            "train_time_sec": f"{float(np.mean([r['train_time_sec'] for r in all_results])):.2f} ± {float(np.std([r['train_time_sec'] for r in all_results])):.2f}",
-            "best_epoch": f"{float(np.mean([r['best_epoch'] for r in all_results])):.1f} ± {float(np.std([r['best_epoch'] for r in all_results])):.1f}",
-            "test_pr_auc": f"{float(np.mean(pr_aucs)):.4f} ± {float(np.std(pr_aucs)):.4f}",
-            "test_roc_auc": f"{float(np.mean(roc_aucs)):.4f} ± {float(np.std(roc_aucs)):.4f}",
-            "test_f1": f"{float(np.mean(f1s)):.4f} ± {float(np.std(f1s)):.4f}",
-        }
-        writer.writerow([summary_row.get(col, "") for col in csv_columns])
+run_final_training_aae = run_final_training
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Final AAE training with validated hyperparameters (§4.2)"
-    )
-    parser.add_argument(
-        "--config", type=Path,
-        default=Path("config/params_validated_aae.yaml"),
-        help="Path to params_validated_aae.yaml (default: config/params_validated_aae.yaml)",
-    )
-    parser.add_argument(
-        "--seeds", type=int, nargs="+", default=None,
-        help="Seeds for nested validation (default: 42 123 7)",
-    )
-    parser.add_argument(
-        "--device", type=str, default=None,
-        help="Device (cuda/cpu), auto-detect if not specified",
-    )
+    parser = argparse.ArgumentParser(description="Train final AAE models across multiple seeds")
+    parser.add_argument("--config", type=Path, default=Path("config/params_validated_aae.yaml"), help="Config path")
+    parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS, help="Random seeds")
+    parser.add_argument("--device", type=str, default=None, help="Device (cpu/cuda)")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
         datefmt="%H:%M:%S",
         stream=sys.stdout,
     )
-
-    device = args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
-
-    run_final_training(
-        config_path=args.config,
-        seeds=args.seeds,
-        device=device,
-    )
+    run_final_training(config_path=args.config, seeds=args.seeds, device=args.device)
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
     main()

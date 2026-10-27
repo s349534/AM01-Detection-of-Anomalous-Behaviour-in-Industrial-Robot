@@ -48,7 +48,7 @@
 
 # Mail notifications (optional)
 #SBATCH --mail-type=END,FAIL
-#SBATCH --mail-user=anardelli@studenti.polito.it
+#SBATCH --mail-user=mungolo@studenti.polito.it
 
 # ── Environment setup ───────────────────────────────────────────────────────
 set -euo pipefail
@@ -62,7 +62,11 @@ export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1   # flush stdout subito → `tail -f` del log mostra l'output riga per riga
 export CUDA_VISIBLE_DEVICES=0
 export SCRATCH_PROJECT="am01"
-export PATH="/share/apps/miniconda3/bin:$HOME/.local/bin:$PATH"
+# The project is an APPLICATION run from the project root (`python -m src...`):
+# it is not installed into the venv. Building it would require downloading
+# setuptools from PyPI, which fails on the cluster (no PyPI access).
+# UV_NO_SYNC=1 keeps the `uv run` calls from re-syncing (and re-building).
+export UV_NO_SYNC=1
 
 # ── Main execution ──────────────────────────────────────────────────────────
 
@@ -86,18 +90,32 @@ if [[ -d "${HOME}/am01_project" ]]; then
         --exclude='.git/' \
         --exclude='__pycache__/' \
         --exclude='.ipynb_checkpoints/' \
-        --exclude='data/raw/' \
         --exclude='*.pth' --exclude='*.pt' --exclude='*.ckpt' \
         --exclude='outputs/' --exclude='reports/figures/' \
         "${HOME}/am01_project/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/"
     echo "Synced project to scratch (excluded .venv/.git/data/raw)."
+
+    # Content-based re-sync of the sources (--checksum): the quick check
+    # (size+mtime) above can skip files whose timestamp did not change,
+    # leaving a STALE copy of the code on scratch.
+    rsync -a --checksum \
+        --include='*/' --include='*.py' --include='*.yaml' --include='*.sh' --exclude='*' \
+        "${HOME}/am01_project/src/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/src/"
+    rsync -a --checksum \
+        --include='*/' --include='*.yaml' --include='*.sh' --exclude='*' \
+        "${HOME}/am01_project/config/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/config/"
+    echo "Sources re-synced with --checksum."
 fi
 
 # Activate uv environment — rebuild the venv on scratch from the frozen lockfile.
 # `uv run` is network/credential-free once the shared cache is populated.
+# Clear any stale VIRTUAL_ENV inherited from a remote .bashrc (setup_env.sh
+# auto-activates ~/am01_project/.venv, which is wrong on scratch)
+unset VIRTUAL_ENV 2>/dev/null || true
+
 if command -v uv &>/dev/null; then
     echo "--- Syncing frozen deps on scratch ---"
-    uv sync --frozen --quiet
+    uv sync --frozen --no-install-project --quiet
     echo "--- PyTorch / device check ---"
     uv run python -c "
 import torch
@@ -107,6 +125,14 @@ if torch.cuda.is_available():
     print(f'GPU: {torch.cuda.get_device_name(0)}')
 "
 fi
+
+
+
+# ── Preprocessing (always executed) ──────────────────────────────────────────
+# data/processed/ may be stale from a previous run (different hyperparameters,
+# window size, or scaler), so re-generate it every time to guarantee consistency.
+echo "=== Running preprocessing from data/raw/ ==="
+uv run python -m src.data.preprocessing --config config/params.yaml
 
 # ── Run your training script ────────────────────────────────────────────────
 # Replace with your actual training command when the pipeline is implemented.
@@ -121,21 +147,20 @@ echo "Job completed successfully."
 RESULTS_DIR="${SCRATCH_DIR}/${SCRATCH_PROJECT}"
 HOME_PROJECT="${HOME}/am01_project"
 
-# data/processed/*.npy, *.pkl, *.json
+# data/processed/*.npy, *.pkl, *.json (no --ignore-existing: overwrite stale)
 mkdir -p "${HOME_PROJECT}/data/processed"
-rsync -a --ignore-existing \
+rsync -a \
     --include='*.npy' --include='*.pkl' --include='*.json' --exclude='*' \
     "${RESULTS_DIR}/data/processed/" "${HOME_PROJECT}/data/processed/" 2>/dev/null || true
 
 # data/models/*.pth (se esistono)
 mkdir -p "${HOME_PROJECT}/data/models"
-rsync -a --ignore-existing \
+rsync -a \
     --include='*.pth' --include='*.pt' --exclude='*' \
     "${RESULTS_DIR}/data/models/" "${HOME_PROJECT}/data/models/" 2>/dev/null || true
 
-# logs/am01_train_*.log
+# Log — SLURM writes to ~/jobs/logs/ (relative to sbatch submission dir), not to scratch
 mkdir -p "${HOME_PROJECT}/logs"
-cp "${HOME}/jobs/logs/am01_train_${SLURM_JOB_ID}.log" "${HOME_PROJECT}/logs/" 2>/dev/null || \
-    cp "${RESULTS_DIR}/logs"/am01_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+cp ~/jobs/logs/am01_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
 
 echo "Results fetched to ${HOME_PROJECT}/data/processed/ and ${HOME_PROJECT}/logs/"

@@ -77,15 +77,17 @@
 
 ### 2.3 Strategia di split
 - **KukaNormal NON va nel training per intero.** Va diviso in tre sottoinsiemi
-  (60/20/20), più tutto `KukaSlow` aggiunto al test set come classe anomala.
-- **Training (60% di KukaNormal, ~140k)**: il modello impara la distribuzione
+  (70/15/15), mentre `KukaSlow` viene diviso 50/50 tra validation e test.
+- **Training (70% di KukaNormal, ~163k)**: il modello impara la distribuzione
   normale.
-- **Validation (20% di KukaNormal, ~47k)**: per early stopping + per calibrare
-  la soglia di decisione (es. 99° percentile dell'errore di ricostruzione).
-- **Test set finale**:
-  - 20% di KukaNormal (~47k) → classe "normale" per le metriche.
-  - Tutto KukaSlow (~41k) → classe "anomala" per le metriche.
-  - Totale ~88k campioni etichettati.
+- **Validation set (HP selection)**:
+  - 15% di KukaNormal (~35k) → `val_normal`: per early stopping + calibrazione soglia (99° percentile errore ricostruzione)
+  - 50% di KukaSlow (~21k) → `val_anomaly`: per calcolo PR-AUC/ROC-AUC/F1 nella selezione HP
+  - Totale ~56k campioni etichettati (normal + anomaly)
+- **Test set finale (report only)**:
+  - 15% di KukaNormal (~35k) → `test_normal`: classe "normale" per metriche finali
+  - 50% di KukaSlow (~21k) → `test_anomaly`: classe "anomala" per metriche finali
+  - Totale ~56k campioni etichettati
 
 **Modalità di split**: **temporale** (no shuffle).
 - **Temporale** (scelta adottata): simula il deployment reale (addestri su
@@ -106,6 +108,11 @@
 > possiamo fare early stopping né calibrare la soglia; senza test_norm non
 > abbiamo un riferimento "vero negativo" pulito su cui riportare metriche
 > oneste.
+>
+> **Perché KukaSlow diviso 50/50 tra val e test?** Per calcolare PR-AUC/ROC-AUC
+> durante la HP selection servono anomalie nel validation set. Senza, `best_val_pr_auc`
+> verrebbe calcolato sul test set (data leakage). Il 50% di slow in validation
+> permette selezione HP onesta; il resto in test garantisce report finale pulito.
 
 ---
 
@@ -147,13 +154,14 @@ temporale).
 - Rimozione colonna `anomaly` da `KukaSlow` (etichetta, non feature) + rimozione
   4 feature costanti (verificate su entrambi i dataset).
 - **NO clipping** — i valori di saturazione sensore vengono gestiti da
-  StandardScaler + MSE loss (vedi §7 #9).
-- **Split**: solo `KukaNormal` per train+val (60/20/20, no shuffle); test =
-  Normal hold-out + tutto `KukaSlow` (classe anomala).
+  StandardScaler + MAE loss (vedi §7 #9).
+- **Split** (temporale, no shuffle):
+  - `KukaNormal`: 70% train, 15% val_normal, 15% test_normal
+  - `KukaSlow`: 50% val_anomaly, 50% test_anomaly
 - **Normalizzazione**: `StandardScaler` (fit **solo** sul train) — motivazione §4.
 - Windowing on-the-fly in `KukaDataset` (non pre-computato) — motivazione §4.1.
 - Salvataggio:
-  - `data/processed/{train, val, test_normal, test_anomaly}.npy`
+  - `data/processed/{train, val_normal, val_anomaly, test_normal, test_anomaly}.npy` (5 file)
   - `data/processed/scaler.pkl`
   - `data/processed/selected_columns.npy` (82 nomi, dtype `<U37`)
   - Le etichette sono implicite (0 = normal, 1 = anomaly), non salvate separatamente.
@@ -180,14 +188,28 @@ non può esplorare lo spazio di ricerca.
 
 #### **Fase 3.1 — Validazione AE**
 **Obiettivo**: identificare `HP_AE_best` tramite random search vincolato
-(spazio in §4.8).
+(spazio in §4.8), seguito da calibrazione della soglia operativa.
 
-- Esecuzione: `python -m src.validation.run_search_ae --n-iter 20 --seed 42`.
-- Output: `reports/tables/validation_results_ae.csv`.
-- Analisi: `python -m src.validation.analyze_results` → 3 grafici di
-  sensitività (`sensitivity_ae_*.png`).
-- Selezione: riga con `best_val_pr_auc` massimo (vedi §4.8.8).
-- Output finale: `config/params_validated_ae.yaml`.
+Pipeline a **tre stadi separati**:
+
+- **Stage 1 (Model Selection):** `python -m src.validation.run_search_ae --n-iter 20 --seed 42 --no-resume`
+  - Per ogni config: training su `train` (70% normali) con early stopping su `val_normal` (15% normali)
+  - HP selection: **solo ROC-AUC e PR-AUC** su `val_normal` + `val_anomaly` (threshold-free)
+  - Nessun accesso al test set, nessuna soglia fissata, nessun F1 calcolato
+  - Output: `reports/tables/validation_results_ae.csv`
+  - Selezione: riga con `val_pr_auc` massimo, tie-break `val_roc_auc`, poi `best_epoch`
+
+- **Stage 1b (Analysis):** `python -m src.validation.analyze_results` → grafici di sensitività
+  - Output: `config/params_validated_ae.yaml` con `W`, `latent_dim` (no `model.threshold`)
+
+- **Stage 2 (Best Config Report):** `python -m src.validation.select_threshold`
+  - **NON calibra la soglia** (spostata in Stage 3 / train_ae.py)
+  - Reporta solo la best config da Stage 1: W, latent_dim, val_roc_auc, val_pr_auc
+  - `params_validated_ae.yaml` **non viene modificato**
+
+> **Nota sull'architettura fissa**: l'encoder (canali 64/32/16, 3 layer) è fissato e
+> **non** è un iperparametro di ricerca — non appare nel CSV né in `params_validated_ae.yaml`
+> come colonna. Appare solo come configurazione fissa in `params.yaml`.
 
 #### **Fase 3.2 — Training finale AE**
 **Obiettivo**: addestrare il modello definitivo con `HP_AE_best`.
@@ -373,49 +395,59 @@ data:
 L'encoder non è più un MLP piatto: deve ridurre un tensore `(W, 86)` a un
 vettore latente `(latent_dim,)` **riassumendo l'evoluzione temporale**.
 
-**Architettura scelta: Encoder convoluzionale 1D + Decoder speculare.**
+**Architettura scelta: Encoder convoluzionale 1D (3 layer, 2 pooling) + Decoder speculare auto-derivato.**
 
 ```
-ENCODER                                    DECODER
-─────────────────────────                 ─────────────────────────
-Input  (B, 86, W)                          Input  (B, latent_dim)
-   ↓                                          ↓
-Conv1d(86→128, kernel=5, pad=2)            Linear(latent → 64·W')
-   ↓ ReLU                                    ↓ ReLU
-MaxPool1d(2)  → (B, 128, W/2)             Reshape → (B, 64, W')
-   ↓                                          ↓
-Conv1d(128→64, kernel=3, pad=1)           ConvTranspose1d(64→128, kernel=4, stride=2)
-   ↓ ReLU                                    ↓ ReLU
-AdaptiveAvgPool1d(1) → (B, 64, 1)         Conv1d(128→86, kernel=3, pad=1)
-   ↓                                          ↓
-Flatten → (B, 64)                          Output (B, 86, W)
-   ↓                                          ↓
-Linear(64 → latent_dim)                    → ricostruzione della sequenza
-   ↓                                          → errore = MSE(x, x̂)
+NEW ENCODER (3 conv layers, 2 pools)          NEW DECODER (auto-derived)
+─────────────────────────────────────────     ─────────────────────────────────────────
+Input  (B, 82, W)                              Input  (B, latent_dim)
+   ↓                                               ↓
+Conv1d(82→64, kernel=5, pad=2) + ReLU            Linear(latent → 16·W/4) + ReLU
+   ↓                                               ↓
+MaxPool1d(2)  → (B, 64, W/2)                   Reshape → (B, 16, W/4)
+   ↓                                               ↓
+Conv1d(64→32, kernel=3, pad=1) + ReLU          ConvTranspose1d(16→32, k=4,s=2,p=1) + ReLU
+   ↓                                               ↓
+MaxPool1d(2)  → (B, 32, W/4)                   ConvTranspose1d(32→64, k=4,s=2,p=1) + ReLU
+   ↓                                               ↓
+Conv1d(32→16, kernel=3, pad=1) + ReLU          Conv1d(64→82, kernel=3, pad=1)
+   ↓                                               ↓
+Flatten → (B, 16·W/4)                          Output (B, 82, W)
+   ↓
+Linear(16·W/4 → latent_dim)
+   ↓
 z  (B, latent_dim)
 ```
 
 **Note sull'architettura**:
 
 - **Input layout**: PyTorch `Conv1d` vuole `(batch, channels, length)`,
-  quindi passiamo `(B, 86, W)`: gli 86 sensori sono i "canali", le `W`
+  quindi passiamo `(B, 82, W)`: gli 82 sensori sono i "canali", le `W`
   posizioni temporali sono la "lunghezza". È un ribaltamento del layout
-  `(B, W, 86)` che useremo nel `Dataset` per comodità.
+  `(B, W, 82)` che useremo nel `Dataset` per comodità.
 - **Perché 1D-Conv e non LSTM**: la 1D-Conv è molto più veloce da
   addestrare (parallelizzabile, niente stato ricorrente) e cattura pattern
   locali (brevi trend, oscillazioni) che sono esattamente ciò che ci
   interessa in finestre corte. LSTM avrebbe senso per finestre molto
   lunghe (W ≥ 200) o se volessimo modellare dipendenze a lungo raggio, ma
   qui non serve.
-- **AdaptiveAvgPool1d(1)**: comprime la dimensione temporale a 1 dopo le
-  conv, così il Linear finale riceve un vettore di lunghezza fissa
-  indipendente da W. Vantaggio: posso cambiare W senza ridisegnare
-  l'encoder.
-- **Decoder speculare**: ConvTranspose1d fa l'upsampling temporale. Per
-  finestre piccole (W=16) la ricostruzione è praticamente perfetta sui
-  sample normali → l'errore è guidato quasi solo dalle anomalie.
+- **3 layer convoluzionali a imbuto (64 → 32 → 16)**: ogni strato comprime
+  gradualmente l'informazione, costruendo rappresentazioni gerarchiche.
+  I primi layer catturano dettagli locali a grana fine, gli ultimi combinano
+  quei dettagli in pattern più ampi.
+- **Due stadi di pooling (MaxPool1d dopo layer 1 e 2)**: riducono la
+  dimensione temporale di fattore 4 complessivo (W → W/2 → W/4). Questo
+  richiede che W sia multiplo di 4. Il terzo layer conv NON ha pooling,
+  preservando la risoluzione temporale residua per il flatten.
+- **Niente AdaptiveAvgPool1d**: il flatten preserva l'intera sequenza
+  temporale residua (W/4 posizioni × 16 canali = 4W elementi), dando
+  allo strato denso finale accesso a tutta l'informazione spaziotemporale.
+- **Decoder auto-derivato**: i canali del decoder sono l'inverso di quelli
+  dell'encoder (16 → 32 → 64 → 82), con due ConvTranspose1d per i due
+  stadi di upsampling. È strutturalmente impossibile disallineare encoder
+  e decoder.
 
-**Addestramento**: MSE tra input e ricostruzione, ottimizzatore Adam, batch
+**Addestramento**: MAE tra input e ricostruzione, ottimizzatore Adam, batch
 size 256 (da `params.yaml`).
 
 #### 4.1.3 Estensione all'AAE
@@ -443,14 +475,16 @@ pipeline AAE rimane identico al piano originale.
 - Normalizzazione per-feature con statistiche di dominio (angoli → [-π,π]) →
   da valutare caso per caso se StandardScaler fallisce.
 
-### 4.3 Loss di ricostruzione: MSE (poi MAE da confrontare)
-**Scelta iniziale**: MSE per il baseline; MAE come confronto se MSE produce
-code troppo pesanti per le anomalie.
+### 4.3 Loss di ricostruzione: MAE (scelta)
+**Scelta**: MAE per il baseline. Inizialmente si era scelto MSE, ma è stata
+cambiata in MAE perché i valori saturo (Gyro ±2000, Acc ±16) producevano
+errori di ricostruzione al quadrato eccessivi, distorti il training e
+sovrastavano le anomalie vere.
 
 **Motivazione**:
-- MSE penalizza di più gli errori grandi → enfatizza le anomalie, che è
-  *esattamente* ciò che vogliamo in anomaly detection.
-- MAE è più robusto a outlier → utile in scenari industriali rumorosi.
+- MAE penalizza linearmente gli errori → robusta a outlier e feature saturo.
+- MSE (scomodatazione valutata) amplifica al quadrato gli errori grandi,
+  causando errori di ricostruzione proibitivi quando i sensori saturano.
 
 ### 4.4 Dimensione latente: 16 (iniziale) → tuning
 **Scelta iniziale**: `latent_dim=16` (da `params.yaml`).
@@ -487,11 +521,42 @@ code troppo pesanti per le anomalie.
 > accuracy altissima ma F1=0).
 
 ### 4.7 Scelta della soglia
-- **Soglia primaria**: 99° percentile dell'errore di ricostruzione sul
-  validation set (garantisce FPR ≈ 1% in condizioni normali).
-- **Soglia alternativa**: soglia che massimizza F1 sul validation set
-  (ottimistica, da usare come upper bound).
-- **Soglie da confrontare** per mostrare il trade-off operazionale.
+La scelta della soglia operativa è divise in **tre stadi separati**:
+
+**Stadio 1 — Selezione configurazione (senza soglia):**
+Per ogni combinazione di iperparametri (W, latent_dim) provata nella ricerca,
+il modello viene addestrato con early stopping su `val_normal` e valutato
+calcolando **esclusivamente ROC-AUC e PR-AUC** su `val_normal` + `val_anomaly`
+concatenati. Queste metriche sono **threshold-free**: valutano il ranking
+degli score continui (errori di ricostruzione) senza binarizzare. Nessun
+accesso al test set durante la ricerca. La configurazione vincente si sceglie
+da (PR-AUC, ROC-AUC, best_epoch).
+
+**Stadio 2 — Best Config Report (solo sulla configurazione vincente):**
+Non calibra più la soglia. Esegue solo un report della configurazione vincente
+dallo Stadio 1: stampa W, latent_dim, val_roc_auc, val_pr_auc.
+Il file `config/params_validated_ae.yaml` **non viene modificato** (già prodotto
+da `analyze_results.py` senza `model.threshold`).
+
+**Stadio 3 — Training finale + Calibrazione soglia:**
+Il training finale (`train_ae.py`) addestra il modello con 100 epoche e 3 seed
+[42, 123, 7] (nested validation). **Dopo ogni training**, per ogni seed:
+- Carica `val_anomaly.npy` (mai usato in training)
+- Calcola errori su `val_normal` + `val_anomaly`
+- `threshold, _ = find_optimal_threshold(val_labels, val_errors)` → soglia calibrata per questo specifico seed/modello
+- Usa questa soglia per valutare sul test set
+- Ogni seed produce la propria soglia e metriche test
+
+**Motivazione della separazione:**
+- AUC (ROC-AUC, PR-AUC) seleziona la configurazione senza dipendere da una
+  soglia arbitraria — la scelta è pura, basata sul ranking.
+- La soglia operativa viene calibrata **sul modello finale** (100 epoche, seed specifico),
+  non su un modello di ricerca HP (50 epoche). Questo evita miscalibrazione.
+- Ogni seed nel nested validation ha la sua soglia calibrata (modelli diversi → soglie diverse).
+- `val_anomaly` usato SOLO post-training per calibrazione, mai per training (no leakage).
+- Separare i tre stadi rende la pipeline verificabile: ogni fase ha un
+  input e un output ben definiti, e nessun dato di test è mai toccato
+  durante la ricerca o la calibrazione.
 
 ### 4.8 Validazione iperparametri
 
@@ -515,33 +580,50 @@ report di media ± deviazione standard.
 
 | HP | Range | Tipo | Giustificazione del range |
 |----|-------|------|---------------------------|
-| `W` | {8, 12, 16, 24, 32} | discreto | Limiti inferiore/superiore vincolati da Fase 1 (frequenza di campionamento, costo computazionale) |
-| `latent_dim` | {8, 12, 16, 24, 32} | discreto | Compromesso compressione 82→{8..32} = 2.5×–10× |
-| `encoder_channels` | {[64,32], [128,64], [128,64,32]} | categorico | 2 o 3 layer, range standard per AE su dati 1D |
+| `W` | {16, 32, 64, 128} | discreto | Potenze di 2 da 16 a 128 (tutti multipli di 4), default 16. Copre finestre brevi (pattern locali) a lunghe (trend lenti). Vincolo: W deve essere multiplo di 4 per i 2 stadi di pooling. |
+| `latent_dim` | {8, 12, 16, 24, 32} | discreto | Compromesso compressione: input al Linear = 4×W (es. 64 per W=16, 512 per W=128) → latent_dim. |
 
-Spazio totale: 75 combinazioni, 20 campionate con
-`sklearn.model_selection.ParameterSampler(seed=42)`. Esempio delle prime 10
-combinazioni campionate:
+**Architettura encoder FISSATA (non validata):**
+- 3 layer convoluzionali con canali: `(64, 32, 16)` (progressione a imbuto)
+- Kernel sizes: `(5, 3, 3)`
+- 2 stadi di MaxPool1d(2) dopo layer 1 e 2 → riduzione temporale fattore 4
+- Nessun AdaptiveAvgPool1d → Flatten preserva sequenza temporale (W/4 × 16 = 4W elementi)
+- Decoder auto-derivato: canali inversi `(16, 32, 64)` + 2 ConvTranspose1d + Conv1d finale
 
-| run_id | W | latent_dim | encoder_channels |
-|--------|---|------------|------------------|
-| 1      | 24 | 16         | [128, 64]        |
-| 2      | 12 | 32         | [64, 32]         |
-| 3      | 16 | 8          | [128, 64, 32]    |
-| 4      | 8  | 24         | [128, 64]        |
-| 5      | 32 | 12         | [64, 32]         |
-| 6      | 24 | 32         | [128, 64, 32]    |
-| 7      | 16 | 16         | [64, 32]         |
-| 8      | 12 | 8          | [128, 64]        |
-| 9      | 32 | 24         | [128, 64]        |
-| 10     | 8  | 12         | [128, 64, 32]    |
+Spazio totale: **20 combinazioni** (4 × 5), tutte campionabili esaustivamente con
+`sklearn.model_selection.ParameterGrid` o `ParameterSampler(seed=42)`.
 
-(Le combinazioni effettive dipendono dal seed; sopra è un'illustrazione del
-formato. Le 20 run prodotte andranno a popolare il CSV finale.)
+Esempio delle 20 combinazioni (griglia completa):
+
+| run_id | W | latent_dim |
+|--------|---|------------|
+| 1      | 16 | 8          |
+| 2      | 16 | 12         |
+| 3      | 16 | 16         |
+| 4      | 16 | 24         |
+| 5      | 16 | 32         |
+| 6      | 32 | 8          |
+| 7      | 32 | 12         |
+| 8      | 32 | 16         |
+| 9      | 32 | 24         |
+| 10     | 32 | 32         |
+| 11     | 64 | 8          |
+| 12     | 64 | 12         |
+| 13     | 64 | 16         |
+| 14     | 64 | 24         |
+| 15     | 64 | 32         |
+| 16     | 128 | 8         |
+| 17     | 128 | 12         |
+| 18     | 128 | 16         |
+| 19     | 128 | 24         |
+| 20     | 128 | 32         |
+
+(Le combinazioni effettive dipendono dal seed se si usa random sampling; sopra è la griglia esaustiva.)
 
 **4.8.3 Spazio di ricerca AAE**
 
-HP AE-derivati (`W`, `latent_dim`, `encoder_channels`) fissati a `HP_AE_best`.
+HP AE-derivati (`W`, `latent_dim`) fissati a `HP_AE_best`.
+L'architettura encoder (3 layer, canali 64/32/16) è fissa e non è più un iperparametro.
 HP validati:
 
 | HP | Range | Tipo | Giustificazione |
@@ -572,11 +654,24 @@ in Fase 5, diventano candidati per analisi di sensitività post-hoc.
 | `optimizer` | Adam | Kingma & Ba, 2014 (standard de facto) |
 | `learning_rate` | 1e-3 | Default Adam (Kingma & Ba, 2014) |
 | `batch_size` | 256 | Compromesso standard su GPU moderne per dataset 10⁵-10⁶ |
-| `loss` (reconstruction) | MSE | Massima verosimiglianza gaussiana, enfatizza outlier (anomalie) |
+| `loss` (reconstruction) | MAE | Robusta a feature saturo (±2000), non amplifica errori grandi al quadrato |
 | `weight_decay` | 0 | Non critico per AE brevi (Goodfellow et al., 2016, §6.2) |
-| `early_stopping_patience` | 5 | Standard (Goodfellow et al., 2016, §7.8) |
+| `early_stopping_patience` | 10 | Standard (Goodfellow et al., 2016, §7.8) |
+| `early_stopping_min_delta` | 1e-4 | EarlyStopping: stop se miglioramento < min_delta |
+| `best_epoch` | tracciato in `EarlyStopping` | Ora traccia l'epoca reale del miglior val_loss (non `len(history)`) |
 | `discriminator_updates_per_gen` | 1 | Default GAN (Goodfellow et al., 2014) |
 | `discriminator_lr` | 1e-3 | Stesso di E+D, default comune nelle implementazioni AAE |
+| **Architettura Encoder (FIXA)** | | |
+| `encoder_num_layers` | 3 | Scelto per rappresentazioni gerarchiche più ricche (vedi §4.1.2) |
+| `encoder_conv_channels` | (64, 32, 16) | Progressione a imbuto: compressione graduale da 82 sensori verso 16 |
+| `encoder_conv_kernels` | (5, 3, 3) | Kernel ampio all'inizio per contesto largo, poi stretti per dettagli |
+| `encoder_pool_stages` | 2 | MaxPool1d(2) dopo layer 1 e 2 → riduzione temporale ×4 |
+| `encoder_pool_size` | 2 | Fattore di pooling per stadio |
+| `adaptive_avg_pool` | False | Rimosso: Flatten preserva informazione temporale per Linear finale |
+| **Architettura Decoder (AUTO-DERIVATA)** | | |
+| `decoder_channels` | (16, 32, 64, 82) | Inverso di encoder_channels + input_dim finale |
+| `decoder_upsample_stages` | 2 | ConvTranspose1d per ogni stadio di pooling dell'encoder |
+| `decoder_final_kernel` | 3 | Conv1d finale per proiezione a input_dim |
 
 **4.8.5 Workflow CLI**
 
@@ -585,16 +680,23 @@ compatibilità con HPC e parallelizzazione. I notebook sono usati solo per
 ispezione visiva dei CSV.
 
 ```bash
-# AE
-python -m src.validation.run_search_ae --n-iter 20 --seed 42
+# AE (3-stage pipeline: selection → report → training+threshold)
+python -m src.validation.run_search_ae --n-iter 20 --seed 42 --no-resume
 python -m src.validation.analyze_results --input validation_results_ae.csv
-python -m src.models.train_ae --config params_validated_ae.yaml
+python -m src.validation.select_threshold           # report best config only (no threshold)
+python -m src.models.train_ae --config params_validated_ae.yaml  # trains + calibrates threshold per seed
 
-# AAE
-python -m src.validation.run_search_aae --n-iter 15 --seed 42
+# AAE (uses AE's threshold + best config; same pipeline structure)
+python -m src.validation.run_search_aae --n-iter 15 --seed 42 --no-resume
 python -m src.validation.analyze_results --input validation_results_aae.csv
+python -m src.validation.select_threshold --input validation_results_aae.csv --params config/params_validated_aae.yaml
 python -m src.models.train_aae --config params_validated_aae.yaml
 ```
+
+> **Importante `--no-resume`**: il default di `run_search_ae.py` è
+> `resume=False` (cambiato da `True` in Fase 3.1 per evitare che run_id già
+> presenti nel CSV vengano saltati). Lo script SLURM `slurm_ae_search.sh`
+> passa sempre `--no-resume` per garantire che le 50 epoche vengano eseguite.
 
 **4.8.6 Parallelizzazione**
 
@@ -603,6 +705,12 @@ Ogni run è un processo Python indipendente. Su HPC, job array SLURM con
 è determinato a runtime via `nvidia-smi`. In locale, `ProcessPoolExecutor` o
 `&`. Il CSV finale è scritto in append (`mode='a'`) per garantire robustezza
 a crash.
+
+Sul cluster, usa `--no-resume` per forzare il complete rewrite del CSV:
+```bash
+cd hpc && N_ITER=20 MAX_VAL_EPOCHS=50 ./hpc_connect.sh batch slurm_ae_search.sh
+```
+
 
 **4.8.7 Recovery condizionale post-validazione AAE**
 
@@ -617,30 +725,31 @@ Dopo aver selezionato `HP_AAE_best`, si confronta `PR-AUC_AAE` vs
 
 **4.8.8 Formato degli output e criterio di selezione**
 
-`reports/tables/validation_results_ae.csv`:
+`reports/tables/validation_results_ae.csv` (Stage 1 output):
 
 ```csv
-run_id,W,latent_dim,encoder_channels,best_val_pr_auc,best_val_f1,best_epoch,train_time_sec,seed
-1,24,16,[128, 64],0.852,0.781,12,341,42
-2,12,32,[64, 32],0.834,0.762,15,298,42
+run_id,config_id,W,latent_dim,val_roc_auc,val_pr_auc,best_epoch,train_time_sec,seed
+1,1,24,16,0.952,0.852,12,341,42
+2,1,12,32,0.918,0.834,15,298,42
 ...
 ```
 
-`HP_AE_best` = riga con `best_val_pr_auc` massimo. Tie-break su
-`best_val_f1`, poi `best_epoch` (preferenza per convergenza più rapida).
+Il CSV contiene **solo metriche threshold-free** (val_roc_auc, val_pr_auc).
+Non contiene F1, soglia, `errors_file`, o metriche sul test set.
+L'architettura encoder (canali 64/32/16) è fissa, non è una colonna del CSV.
 
-Stesso formato per `validation_results_aae.csv`, con colonne
-`reconstruction_weight` e `adversarial_weight` al posto di quelle AE.
+`HP_AE_best` = riga con `val_pr_auc` massimo. Tie-break su `val_roc_auc`,
+poi `best_epoch` (preferenza per convergenza più rapida).
 
-Output finali:
-- `reports/tables/validation_results_ae.csv`
-- `reports/tables/validation_results_aae.csv`
-- `reports/figures/sensitivity_ae_W.png`, `sensitivity_ae_latent_dim.png`,
-  `sensitivity_ae_encoder_channels.png`
-- `reports/figures/sensitivity_aae_reconstruction_weight.png`,
-  `sensitivity_aae_adversarial_weight.png`
-- `config/params_validated_ae.yaml`
-- `config/params_validated_aae.yaml`
+`config/params_validated_ae.yaml` (Stage 1b + Stage 2 output):
+- Stage 1b (analyze_results): scritto con `W`, `latent_dim` (no `model.threshold`)
+- Stage 2 (select_threshold): **non modifica** il file (report only)
+
+Output finali della validazione AE:
+- `reports/tables/validation_results_ae.csv` (Stage 1)
+- `reports/figures/sensitivity_ae_W.png`, `sensitivity_ae_latent_dim.png` (Stage 1b)
+- `config/params_validated_ae.yaml` (Stage 1b, aggiornato da Stage 2)
+- `reports/errors/ae_errors_run_*_seed_*_W*_latent*.npz` (Stage 1, raw errors)
 
 ---
 
@@ -658,6 +767,13 @@ AM01-.../
 │   ├── raw/                         # Dati originali (versionati o via DVC)
 │   │   └── KukaVelocityDataset/
 │   └── processed/                   # Output del preprocessing
+│       ├── train.npy                # 70% KukaNormal (~163k, 82 features)
+│       ├── val_normal.npy           # 15% KukaNormal (~35k, early stopping)
+│       ├── val_anomaly.npy          # 50% KukaSlow (~21k, HP selection + Stage 3 threshold calibration)
+│       ├── test_normal.npy          # 15% KukaNormal (~35k, final report)
+│       ├── test_anomaly.npy         # 50% KukaSlow (~21k, final report)
+│       ├── scaler.pkl               # StandardScaler fitted on train
+│       └── selected_columns.npy     # 82 column names
 │
 ├── src/                             # Codice di produzione (importabile, testabile)
 │   ├── data/
@@ -743,7 +859,7 @@ celle, va spostata in un modulo `.py`.
 ### Fase 2 — Preprocessing
 - [x] Gestione colonna extra (`anomaly` rimossa da KukaSlow: 87→86)
 - [x] Pulizia NaN/inf/outlier (nessun NaN/inf nel raw; saturazione sensore gestita da scaler)
-- [x] Split deterministico temporale (60/20/20, no shuffle)
+- [x] Split deterministico temporale (70/15/15 normal, 50/50 slow, no shuffle)
 - [x] Normalizzazione (StandardScaler, fit su train only)
 - [x] `src/data/preprocessing.py` implementato (load → split → normalize → save)
 - [x] `src/data/dataset.py` implementato (KukaDataset, windowing on-the-fly)
@@ -751,28 +867,34 @@ celle, va spostata in un modulo `.py`.
 - [x] `notebooks/02_preprocessing.ipynb` popolato (6 celle)
 - [x] `src/utils/config.py` creato (loader YAML unificato)
 - [x] `src/main.py` refactorato (usa config.py, flag --phase)
-- [x] Output generati in `data/processed/` (4 .npy + scaler.pkl + selected_columns.npy)
+- [x] Output generati in `data/processed/` (5 .npy + scaler.pkl + selected_columns.npy)
 - [x] Verifica locale: pipeline end-to-end ✅, pytest 33/33 ✅
 
-### Fase 3.0 — Costruzione AE parametrico
-- [ ] `src/models/autoencoder.py` (Encoder, Decoder, Autoencoder — costruttore parametrico)
-- [ ] `src/models/train_utils.py` (train_one_epoch, validate, EarlyStopping)
-- [ ] `src/validation/run_experiment_ae.py` (`train_and_evaluate_ae(config)`)
-- [ ] `src/validation/run_search_ae.py` (CLI per N run random)
-- [ ] Test 1 run (3-5 epoche) su 3-5 epoche per verificare pipeline
+### Fase 3.0 — Costruzione AE parametrico (COMPLETATA)
+- [x] `src/models/autoencoder.py` (Encoder, Decoder, Autoencoder — costruttore parametrico, `EarlyStopping` con `best_epoch`)
+- [x] `src/models/train_utils.py` (train_one_epoch, validate, EarlyStopping)
+- [x] `src/validation/run_experiment_ae.py` (`train_and_evaluate_ae(config)`)
+- [x] `src/validation/run_search_ae.py` (CLI per N run random, default `--no-resume`)
+- [x] Test 1 run (3-5 epoche) verificata
 
-### Fase 3.1 — Validazione AE
-- [ ] `python -m src.validation.run_search_ae --n-iter 20 --seed 42`
-- [ ] `reports/tables/validation_results_ae.csv` (20 righe)
-- [ ] `python -m src.validation.analyze_results` → 3 grafici sensitività
-- [ ] `config/params_validated_ae.yaml`
-- [ ] Selezione `HP_AE_best` (riga con PR-AUC max, vedi §4.8.8)
+### Fase 3.1 — Validazione AE (DA RIESGUIRE)
+- [ ] `python -m src.validation.run_search_ae --n-iter 20 --seed 42 --no-resume`
+  - **NOTA**: pipeline ristrutturata in 3 stadi. CSV ora usa `val_roc_auc`/`val_pr_auc` (senza soglia, senza `errors_file`).
+  - Output: `reports/tables/validation_results_ae.csv` (no `reports/errors/`)
+- [ ] `python -m src.validation.analyze_results` → 2 grafici sensitività (W, latent_dim — senza encoder_channels)
+- [ ] `python -m src.validation.select_threshold` — report best config only (NO threshold calibration)
+- [ ] `config/params_validated_ae.yaml` (con `W`, `latent_dim`, **senza** `model.threshold`)
+- [ ] Selezione `HP_AE_best` (riga con val_pr_auc max, tie-break val_roc_auc, poi best_epoch)
+- [x] Articolato in sessione precedente; ristrutturazione pipeline completata in codice
 
-### Fase 3.2 — Training finale AE
+### Fase 3.2 — Training finale AE (DA RIESGUIRE)
 - [ ] `python -m src.models.train_ae --config params_validated_ae.yaml`
-- [ ] Nested validation (3 run con seed diversi) → media ± std
-- [ ] `reports/checkpoints/ae_baseline.pth`
-- [ ] `reports/tables/ae_final_metrics.csv`
+  - **NOTA**: calibra soglia per-seed post-training su `val_normal` + `val_anomaly` (Stage 3)
+  - **NOTA**: loader `val_normal.npy` + `val_anomaly.npy` (non più `val.npy`)
+- [ ] Nested validation (3 run con seed [42, 123, 7]) → media ± std
+- [ ] `reports/checkpoints/ae_baseline.pth` (seed 42)
+- [ ] `reports/tables/ae_final_metrics.csv` (con colonna `threshold` per-seed)
+- [ ] Artefatti vecchi cancellati, da rigenerare con nuova pipeline
 
 ### Fase 4.0 — Costruzione AAE parametrico
 - [ ] `src/models/adversarial_ae.py` (Discriminator, AdversarialAE)
@@ -814,7 +936,23 @@ celle, va spostata in un modulo `.py`.
 
 ---
 
-## 7. Decisioni aperte (backlog)
+## 7. HPC workflow
+
+Il deployment e il training avvengono sul cluster Legion (SLURM). Il workflow è diviso in:
+
+| Fase | Comando locale | Script SLURM | Output |
+|---|---|---|---|
+| Setup | `./hpc_connect.sh deploy` | `setup_env.sh` | `~/am01_project/.venv/`, kernel Jupyter |
+| Data upload | `./hpc_connect.sh upload data/raw/ ~/am01_project/data/raw/` | — | `data/raw/*.npy` su HPC |
+| Search | `./hpc_connect.sh batch slurm_ae_search.sh` | `slurm_ae_search.sh` | `validation_results_ae.csv`, 3 plots, `params_validated_ae.yaml` |
+| Training | `./hpc_connect.sh batch slurm_ae_train.sh` | `slurm_ae_train.sh` | `ae_baseline.pth`, `ae_final_metrics.csv` |
+
+**Dove esegue cosa**: il preprocessing e il training girano su **compute node** (GPU A40),
+nessun carico sul login node. `hpc_connect.sh batch` esegue deploy (rsync) → sbatch →
+stream log → auto-fetch risultati. Il preprocessing è triggerato automaticamente
+se `data/processed/train.npy` è mancante (sui script SLURM).
+
+## Decisioni aperte (backlog)
 
 > Domande la cui risposta cambierà il codice. Da affrontare nell'ordine in cui
 > emergono durante l'esecuzione.
@@ -832,20 +970,21 @@ celle, va spostata in un modulo `.py`.
    dataset. Correlazione > 0.95 → valutare rimozione feature correlate (Fase 2).
 3. ✅ **Split temporale vs random — definizione**:
    - **Temporale**: i dati vengono divisi mantenendo l'ordine cronologico
-     (primi 60% → train, successivi 20% → val, ultimi 20% → test).
+     (primi 70% → train, successivi 15% → val_normal, ultimi 15% → test_normal).
+     Per KukaSlow: primi 50% → val_anomaly, ultimi 50% → test_anomaly.
    - **Random**: mescola i dati con un seed prima dello split.
    Scelta: **temporale**. Confermato in Fase 1: lag-1 AC = 0.99+ su tutte le
    feature → i dati sono una sessione continua. Lo shuffle romperebbe la
-   continuità e causerebbe leakage. Split 60/20/20 su KukaNormal, test =
-   Normal hold-out + Slow.
+   continuità e causerebbe leakage. Split normal 70/15/15, slow 50/50.
 4. **Dimensione della finestra W — definizione**: numero di timestep consecutivi
    dati in pasto alla rete ad ogni sample (slide con stride=1). Default `W=16`.
    In Fase 3 si confrontano `W ∈ {8, 16, 32, 64}` su validation set → si
    conferma il valore migliore per trade-off errore di ricostruzione / costo
    computazionale. Vedi §4.1.1.
-5. **MAE vs MSE — definizione**:
+5. **MAE vs MSE — definizione** (MAE scelta, MSE valutata):
+   - **MAE** (Mean Absolute Error): penalizza linearmente, robusto a outlier e
+     satura — **loss scelta** (config: `training.loss: "mae"`).
    - **MSE** (Mean Squared Error): penalizza quadraticamente gli errori grandi.
-   - **MAE** (Mean Absolute Error): penalizza linearmente, più robusto a outlier.
    Confronto empirico in Fase 5.
 6. **Dimensione latente ottimale — definizione**: numero di dimensioni del
    vettore latente z. Grid search su {8, 16, 32} in Fase 5.
@@ -861,10 +1000,10 @@ celle, va spostata in un modulo `.py`.
    bound sono calcolati su train only** (nessun leakage).
    **Deciso: NON applicare clipping.** I valori di saturazione sensore (Gyro
    ±2000, Acc ±16) sono artefatti hardware, non anomalie da rilevare. Lo
-   StandardScaler li assorbe (z-score alti ma finiti) e la MSE loss penalizza
-   naturalmente le finestre con spike saturati. La classe anomala si
-   caratterizza da drift lenti, non da spike — il clipping non aiuterebbe e
-   potrebbe nascondere pattern utili.
+   StandardScaler li assorbe (z-score alti ma finiti) e la MAE loss gestisce
+   linearmente le finestre con spike saturati senza amplificarli al quadrato.
+   La classe anomala si caratterizza da drift lenti, non da spike — il clipping
+   non aiuterebbe e potrebbe nascondere pattern utili.
    → Pipeline: load → split → normalize → save (NO clipping step).
 10. ✅ **Validare gli iperparametri dei modelli?** Sì, con random search
     vincolato (Bergstra & Bengio, 2012) su 3 HP AE (`W`, `latent_dim`,
@@ -940,7 +1079,7 @@ celle, va spostata in un modulo `.py`.
 **Processo (ordine di lavoro):**
 1. **Scelta clipping**: valutata la possibilità di clippare i valori di saturazione
    sensore (Gyro ±2000, Acc ±16). **Deciso: NO** — artefatti hardware, la classe
-   anomala si caratterizza da drift lenti non da spike, StandardScaler + MSE li
+   anomala si caratterizza da drift lenti non da spike, StandardScaler + MAE li
    gestiscono. Pipeline = load → split → normalize → save.
 2. **`src/utils/config.py`**: creato il loader YAML unificato (config.yaml +
    params.yaml). Path root con `parents[2]` (utils/ → src/ → root).
@@ -963,3 +1102,126 @@ celle, va spostata in un modulo `.py`.
 **Verifica:** pytest 33/33 ✅; pipeline end-to-end ~1s.
 
 **Prossima fase:** Fase 3 — baseline Autoencoder (1D-Conv encoder + decoder speculare).
+
+### Sessione 3 — Fase 3: Costruzione AE + validation + training + HPC fixes (4–5set2026)
+
+**Processo:**
+1. **Costruzione AE parametrico**: implementati `autoencoder.py` (SequenceAutoencoder con
+   costruttore parametrico `from_config`), `train_utils.py` (EarlyStopping, train_one_epoch),
+   `run_experiment_ae.py` (`train_and_evaluate_ae`), `run_search_ae.py` (CLI per random search).
+
+2. **Bug `best_epoch`**: in `run_experiment_ae.py` e `train_ae.py`, `best_epoch` era
+   `len(history["val_loss"])` (totale epoche). Fix: `EarlyStopping` traccia
+   `self.best_epoch` (l'epoca del miglior val_loss), passata via `history["best_epoch"]`.
+
+3. **Bug resume + 50 epoche**: `run_search_ae.py` aveva `resume=True` per default,
+   saltando run_id già nel CSV. Fix: default `resume=False`, flag `--no-resume`
+   nello script SLURM. Il CSV obsoleto (34 righe, 2 epoche) è stato rimosso da `reports/`
+   e `hpc/reports/`.
+
+4. **Bug patience hardcoded**: `run_experiment_ae.py` aveva `patience=5` hardcoded.
+   Fix: letto da `config["training"]["early_stopping"]["patience"]` (valore 10).
+   Aggiunto `min_delta` da config.
+
+5. **HPC execution fixes (7 problemi)**:
+   - **Data loading**: `data/raw/` ora incluso nel deploy rsync (era escluso).
+   - **Preprocessing location**: eseguito su compute node (HPC-side) dopo sync
+     a `$SCRATCH`, triggerato automaticamente se `data/processed/` mancante.
+   - **Config errata**: 50 epoche garantite con `--no-resume` + `resume=False` default.
+   - **Overwrite**: rimosso `--ignore-existing` da tutti i rsync; fixato filtro
+     `--include='*' --exclude='*'` (no-op) in `slurm_ae_search.sh`.
+   - **"no log file found"**: SLURM log va in `~/jobs/logs/`, non in scratch.
+     Fixato `cp` path negli script SLURM + fallback in `cmd_batch`.
+   - **Results scattered**: eliminate `hpc/reports/` e `hpc/data/`, aggiunte a `.gitignore`.
+   - **Data scattered**: `hpc/data/` eliminato, dati solo in `data/`.
+
+6. **Verifica locale**: search 5-iter, 10-epoch, `--no-resume` → CSV 5 righe pulite,
+   `best_epoch` > 2. Training 1 seed → checkpoint + CSV metriche.
+
+**Outputs:** `reports/tables/validation_results_ae.csv`, `reports/figures/sensitivity_ae_*.png`,
+`config/params_validated_ae.yaml`, `reports/tables/ae_final_metrics.csv`, `reports/checkpoints/ae_baseline.pth`.
+
+**Prossima fase:** Fase 4 — AAE (adversarial autoencoder).
+
+### Sessione 5 — Fix validation split & HP selection leakage (30set2026)
+
+**Problema identificato**: Il flusso di validazione precedente aveva due problemi critici:
+1. **HP selection usava test set** → `best_val_pr_auc` proveniva dal test set (data leakage totale)
+2. **Validation solo normali** → impossibile calcolare PR-AUC/ROC-AUC senza anomalie
+3. **Split 60/20/20 non conforme** → specifica richiedeva 70/15/15 normal + 50/50 slow
+
+**Soluzione implementata**:
+- **Nuovi split** (`config/params.yaml`): `train_split=0.70`, `val_split=0.15`, `slow_val_split=0.50`
+- **Preprocessing** (`src/data/preprocessing.py`): split normal 70/15/15, slow 50/50 → 5 file .npy separati
+- **Validation experiment** (`src/validation/run_experiment_ae.py`):
+  - 5 DataLoader separati (train, val_normal, val_anomaly, test_normal, test_anomaly)
+  - Early stopping su `val_normal` (reconstruction loss)
+  - HP selection: **solo ROC-AUC e PR-AUC** su val_normal + val_anomaly (threshold-free)
+  - Nessun test set access, nessuna soglia, nessun F1 durante la ricerca
+  - **Non salva più errori grezzi in `.npz`** (rimosso `errors_file` dal CSV)
+- **Leakage accettato**: `val_normal` serve per early stopping; `val_anomaly` serve solo per AUC calculation; test set rimane unseen
+
+**File modificati**:
+- `config/params.yaml`
+- `src/data/preprocessing.py` (split_temporal_data, normalize_data)
+- `src/validation/run_experiment_ae.py` (5 loader, threshold-free AUC only, no .npz saving)
+- `src/validation/run_search_ae.py` (CSV columns: rimosso `errors_file`)
+- `src/validation/select_threshold.py` (semplificato: solo report, no threshold calibration)
+
+**Prossima fase**: Rigenerare processed data e lanciare HP search con nuova logica.
+
+### Sessione 6 — Ristrutturazione pipeline in tre stadi (2°ott2026)
+
+**Problema identificato**: La pipeline di validazione mescolava selezione della configurazione
+e calibrazione della soglia in un unico stadio:
+1. **Soglia arbitraria al 99° percentile** — mai validata, scelta per convenzione
+2. **F1 calcolato ad ogni run** usando soglia arbitraria come tie-break nella selezione HP
+3. **Test set toccato durante ricerca** — calcolo di `_test_metrics` ad ogni run (lavoro sprecato, contatto con test da eliminare)
+
+**Soluzione implementata** (tre stadi separati e sequenziali — **FINALE: soglia in Stage 3**):
+
+- **Stadio 1 (Model Selection)** — `run_experiment_ae.py`:
+  - Addestramento con early stopping su `val_normal` (invariato)
+  - HP selection: **solo ROC-AUC e PR-AUC** su `val_normal + val_anomaly` (threshold-free)
+  - Nessun test set access, nessuna soglia, nessun F1 durante la ricerca
+  - **NON salva più errori grezzi** (rimosso salvataggio `.npz` e colonna `errors_file`)
+  - CSV: colonne `run_id`, `config_id`, `W`, `latent_dim`, `val_roc_auc`, `val_pr_auc`, `best_epoch`, `train_time_sec`, `seed`
+  - Rimozione `encoder_channels` dal CSV (architettura fissa, non HP)
+
+- **Stadio 2 (Best Config Report)** — `select_threshold.py` (semplificato):
+  - **NON calibra più la soglia** (spostata in Stage 3)
+  - Esegue solo report della best config: W, latent_dim, val_roc_auc, val_pr_auc
+  - `params_validated_ae.yaml` **non modificato** (già prodotto da analyze_results senza threshold)
+
+- **Stadio 3 (Final Training + Threshold Calibration)** — `train_ae.py`:
+  - Addestramento 100 epoche, 3 seed [42, 123, 7] (nested validation)
+  - **Dopo ogni training per-seed**: calibra soglia su `val_normal + val_anomaly`
+    - `threshold, _ = find_optimal_threshold(val_labels, val_errors)` → soglia per questo seed/modello
+    - Usa questa soglia per valutazione test set
+  - Ogni seed ha la sua soglia calibrata (modelli diversi → soglie diverse)
+  - Seed 42 produce il checkpoint salvato `ae_baseline.pth`
+  - CSV `ae_final_metrics.csv` include colonna `threshold` per-seed
+
+**Motivazione della separazione**: AUC (ROC-AUC, PR-AUC) seleziona la configurazione
+senza dipendere da una soglia arbitraria — la scelta è pura, basata sul ranking.
+La soglia operativa viene calibrata **sul modello finale** (100 epoche, seed specifico),
+non su un modello di ricerca HP (50 epoche). Questo evita miscalibrazione.
+`val_anomaly` usato SOLO post-training per calibrazione, mai per training (no leakage).
+Separare i tre stadi rende la pipeline verificabile.
+
+**File modificati:**
+- `src/validation/run_experiment_ae.py` (rimozione .npz saving, errors_file)
+- `src/validation/run_search_ae.py` (CSV columns: rimosso `errors_file`)
+- `src/validation/select_threshold.py` (semplificato: solo report, no threshold calibration)
+- `src/models/train_ae.py` (calibrazione soglia per-seed post-training)
+- `hpc/slurm_ae_search.sh` (rimosso step Stage 2 threshold calibration, sync errors/)
+- `hpc/hpc_connect.sh` (rimosso download reports/errors/, exclude *.npz)
+- `docs/project_plan.md` (aggiornamento §4.7, §4.8.5, §4.8.8, §6, §9)
+
+**Artefatti cancellati e da rigenerare:**
+- `reports/tables/validation_results_ae.csv` ✅ cancellato
+- `config/params_validated_ae.yaml` ✅ cancellato
+- `reports/tables/ae_final_metrics.csv` ✅ cancellato
+- `reports/checkpoints/ae_baseline.pth` ✅ cancellato
+- `reports/errors/` (directory non più generata)
+- Preprocessing da rilanciare per rigenerare i 5 file .npy

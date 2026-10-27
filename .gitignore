@@ -14,6 +14,7 @@ lib/
 lib64/
 parts/
 sdist/
+.kilo/
 var/
 wheels/
 *.egg-info/
@@ -34,10 +35,14 @@ env/
 # data/raw/*
 # !data/raw/.gitkeep
 
-# Model checkpoints
+# Model results
+diagnostics/
 *.pth
 *.pt
 *.ckpt
+
+# Intermediate results (error arrays for threshold calibration Stage 2)
+*.npz
 
 # IDE
 .vscode/
@@ -45,6 +50,10 @@ env/
 *.swp
 *.swo
 *~
+
+# HPC local mirrors (results/data only in project root)
+hpc/reports/
+hpc/data/
 
 # OS
 .DS_Store
@@ -57,3 +66,7 @@ logs/
 # Environment
 .env
 .env.local
+
+# Temporary Multi-Agent Scratchpad
+.audit/
+

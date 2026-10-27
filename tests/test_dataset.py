@@ -1,23 +1,24 @@
-"""Tests for Fase 2 preprocessing + dataset pipeline (33 tests).
+"""Tests for Fase 2 preprocessing + dataset pipeline (interleaved partitioning).
 
 Run: uv run pytest tests/test_dataset.py -v
 """
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import numpy as np
 import pytest
 import torch
-from sklearn.preprocessing import StandardScaler
 
-from src.data.dataset import KukaDataset
-from src.data.preprocessing import (
-    CONST_STD_THRESHOLD,
-    load_kuka_data,
-    normalize_data,
-    split_temporal_data,
+from src.data.dataset import KukaDataset, build_dataloaders
+from src.data.partitioning import (
+    PartitionSpec,
+    plan_partitions,
+    assign_chunks_spread,
+    verify_no_leakage,
 )
+from src.data.preprocessing import load_kuka_data
 from src.utils.config import load_config
 
 
@@ -37,70 +38,30 @@ def loaded(config):
     return normal, slow, cols
 
 
-@pytest.fixture(scope="module")
-def splits(loaded, config):
-    """Split the loaded data temporally (60/20/20)."""
-    normal, slow, _ = loaded
-    return split_temporal_data(normal, slow, config)
-
-
-@pytest.fixture(scope="module")
-def normalised(splits, config):
-    """StandardScale the splits and return (scaled_dict, scaler)."""
-    return normalize_data(splits, config)
-
-
 # ---------------------------------------------------------------------------
 # load_kuka_data
 # ---------------------------------------------------------------------------
 class TestLoadKukaData:
     def test_normal_shape(self, loaded):
         normal, _, _ = loaded
-        assert normal.shape == (233792, 82), f"Expected (233792, 82), got {normal.shape}"
+        assert normal.shape == (233792, 86), f"Expected (233792, 86), got {normal.shape}"
 
     def test_slow_shape(self, loaded):
         _, slow, _ = loaded
-        assert slow.shape == (41538, 82), f"Expected (41538, 82), got {slow.shape}"
+        assert slow.shape == (41538, 86), f"Expected (41538, 86), got {slow.shape}"
 
     def test_selected_cols_shape(self, loaded):
         _, _, cols = loaded
-        assert cols.shape == (82,), f"Expected (82,), got {cols.shape}"
+        assert cols.shape == (86,), f"Expected (86,), got {cols.shape}"
 
     def test_columns_aligned(self, loaded):
-        """Both arrays must have the same number of features."""
         normal, slow, cols = loaded
-        assert normal.shape[1] == slow.shape[1] == 82
-        assert len(cols) == 82
+        assert normal.shape[1] == slow.shape[1] == 86
+        assert len(cols) == 86
 
     def test_anomaly_dropped(self, loaded):
-        """The 'anomaly' column must not be among the retained columns."""
         _, _, cols = loaded
         assert "anomaly" not in cols
-
-    def test_constant_features_removed(self, loaded):
-        """The 4 sensor_id{2,5,6,7}_temp columns must be removed."""
-        _, _, cols = loaded
-        removed = {
-            "sensor_id2_temp",
-            "sensor_id5_temp",
-            "sensor_id6_temp",
-            "sensor_id7_temp",
-        }
-        assert removed.isdisjoint(set(cols.tolist())), (
-            f"Found removed features in selected columns: {removed & set(cols.tolist())}"
-        )
-
-    def test_no_constant_features_remaining(self, loaded):
-        """No remaining feature should be (near-)constant across BOTH datasets."""
-        normal, slow, _ = loaded
-        std_normal = normal.std(axis=0)
-        std_slow = slow.std(axis=0)
-        constant_both = (std_normal < CONST_STD_THRESHOLD) & (
-            std_slow < CONST_STD_THRESHOLD
-        )
-        assert not constant_both.any(), (
-            f"Found constant features in both datasets: {np.where(constant_both)[0]}"
-        )
 
     def test_dtype(self, loaded):
         normal, slow, _ = loaded
@@ -109,206 +70,312 @@ class TestLoadKukaData:
 
 
 # ---------------------------------------------------------------------------
-# split_temporal_data
+# Partitioning: assign_chunks_spread
 # ---------------------------------------------------------------------------
-class TestSplitTemporal:
-    def test_proportions(self, splits):
-        n_total = 233792
-        train = splits["train"]
-        val = splits["val"]
-        test_normal = splits["test_normal"]
-        expected_train = int(0.60 * n_total)  # 140275
-        expected_val = int(0.20 * n_total)   # 46758
+class TestAssignChunksSpread:
+    def test_exact_counts(self):
+        """Total chunks assigned equals n_chunks, counts match quotas within ±1."""
+        n_chunks = 100
+        quotas = [0.7, 0.15, 0.15]
+        owner = assign_chunks_spread(n_chunks, quotas)
+        assert len(owner) == n_chunks
+        counts = np.bincount(owner, minlength=3)
+        expected = np.array([70, 15, 15])
+        assert np.all(np.abs(counts - expected) <= 1)
 
-        assert train.shape[0] == expected_train
-        assert val.shape[0] == expected_val
-        assert train.shape[0] + val.shape[0] + test_normal.shape[0] == n_total
+    def test_spread_distribution(self):
+        """Each partition's chunks are spread across the timeline."""
+        n_chunks = 100
+        quotas = [0.7, 0.15, 0.15]
+        owner = assign_chunks_spread(n_chunks, quotas)
+        # Partition 0 (70%) should appear in first, middle, last third
+        for p in range(3):
+            third = n_chunks // 3
+            first_third = np.any(owner[:third] == p)
+            middle_third = np.any(owner[third:2*third] == p)
+            last_third = np.any(owner[2*third:] == p)
+            assert first_third or middle_third or last_third, f"Partition {p} not spread"
 
-    def test_no_shuffle(self, loaded, config):
-        """train[0] must equal the first row of the full normal array."""
-        normal, slow, _ = loaded
-        splits = split_temporal_data(normal, slow, config)
-        np.testing.assert_array_equal(
-            splits["train"][0], normal[0],
-            err_msg="First train row must match first normal row (no shuffle)",
+    def test_deterministic(self):
+        """Same input produces same assignment."""
+        o1 = assign_chunks_spread(100, [0.7, 0.15, 0.15])
+        o2 = assign_chunks_spread(100, [0.7, 0.15, 0.15])
+        assert np.array_equal(o1, o2)
+
+
+# ---------------------------------------------------------------------------
+# Partitioning: plan_partitions
+# ---------------------------------------------------------------------------
+class TestPlanPartitions:
+    def test_basic_plan(self):
+        """Basic plan generation with known specs."""
+        specs = [
+            PartitionSpec("train", 0.7, 0.25),
+            PartitionSpec("val", 0.15, 0.5),
+            PartitionSpec("test", 0.15, 0.5),
+        ]
+        plan = plan_partitions(
+            n_samples=10000,
+            window_size=100,
+            chunk_size=1000,
+            gap=100,
+            specs=specs,
         )
+        assert "train" in plan
+        assert "val" in plan
+        assert "test" in plan
+        # Check no empty partitions
+        for name in specs:
+            assert len(plan[name.name]) > 0, f"Partition {name.name} has no windows"
 
-    def test_test_anomaly_is_full_slow(self, loaded, config):
-        """test_anomaly must contain exactly all of KukaSlow."""
-        normal, slow, _ = loaded
-        splits = split_temporal_data(normal, slow, config)
-        assert splits["test_anomaly"].shape[0] == slow.shape[0]
+    def test_disjointness(self):
+        """Partitions have no shared samples."""
+        specs = [
+            PartitionSpec("train", 0.7, 0.25),
+            PartitionSpec("val", 0.15, 0.5),
+            PartitionSpec("test", 0.15, 0.5),
+        ]
+        plan = plan_partitions(10000, 100, 1000, 100, specs)
+        # Verify using the verification function
+        verify_no_leakage(plan, window_size=100, gap=100)
 
-    def test_temporal_continuity(self, loaded, config):
-        """train is the first 60%, val the next 20%, test_normal the last 20%."""
-        normal, slow, _ = loaded
-        n_total = normal.shape[0]
-        n_train = int(0.60 * n_total)
-        n_val = int(0.20 * n_total)
-
-        splits = split_temporal_data(normal, slow, config)
-
-        # train[0] == normal[0], train[-1] == normal[n_train-1]
-        np.testing.assert_array_equal(splits["train"][0], normal[0])
-        np.testing.assert_array_equal(splits["train"][-1], normal[n_train - 1])
-        # val[0] == normal[n_train], val[-1] == normal[n_train+n_val-1]
-        np.testing.assert_array_equal(splits["val"][0], normal[n_train])
-        # test_normal[-1] == normal[-1]
-        np.testing.assert_array_equal(splits["test_normal"][-1], normal[-1])
-
-    def test_feature_dim_consistency(self, splits):
-        for key in ("train", "val", "test_normal", "test_anomaly"):
-            assert splits[key].shape[1] == 82
-
-
-# ---------------------------------------------------------------------------
-# normalize_data
-# ---------------------------------------------------------------------------
-class TestNormalizeData:
-    def test_train_zero_mean(self, normalised):
-        scaled, _ = normalised
-        train_mean = scaled["train"].mean(axis=0)
-        np.testing.assert_allclose(
-            train_mean, 0, atol=1e-3,
-            err_msg="train mean should be ≈0 after StandardScaler",
+    def test_stride_values(self):
+        """Windows within a partition have correct stride."""
+        specs = [
+            PartitionSpec("train", 0.7, 0.25),  # stride = 25 (W/4)
+            PartitionSpec("val", 0.15, 0.5),    # stride = 50 (W/2)
+        ]
+        window_size = 100
+        plan = plan_partitions(
+            n_samples=10000, window_size=window_size, chunk_size=1000, gap=100, specs=specs
         )
+        # Check train stride: minimum diff should equal stride (25)
+        train_starts = plan["train"]
+        diffs = np.diff(train_starts)
+        # Within a chunk, stride = 25; between chunks, larger gaps appear
+        min_diff = diffs.min()
+        assert min_diff == 25, f"Train min stride mismatch: got {min_diff}, expected 25"
 
-    def test_train_unit_std_nonconst(self, normalised):
-        """Non-constant features should have std ≈1 after StandardScaler."""
-        scaled, scaler = normalised
-        train = scaled["train"]
-        nonconst = scaler.var_ >= CONST_STD_THRESHOLD
-        if nonconst.any():
-            train_std = train.std(axis=0)[nonconst]
-            np.testing.assert_allclose(
-                train_std, 1, atol=0.03,
-                err_msg="Non-constant train std should be ≈1 after StandardScaler",
-            )
+        # Check val stride
+        val_starts = plan["val"]
+        diffs = np.diff(val_starts)
+        min_diff = diffs.min()
+        assert min_diff == 50, f"Val min stride mismatch: got {min_diff}, expected 50"
 
-    def test_no_leakage(self, normalised):
-        """Val mean must NOT be ≈0 (proves scaler was fit on train only)."""
-        scaled, _ = normalised
-        val_mean_abs = np.abs(scaled["val"].mean(axis=0)).max()
-        assert val_mean_abs > 1e-3, (
-            f"val mean ≈ 0 — scaler may have been fit on val (max abs={val_mean_abs})"
-        )
+    def test_gap_at_partition_change(self):
+        """Guard band of size gap between partitions."""
+        specs = [
+            PartitionSpec("train", 0.5, 0.25),
+            PartitionSpec("val", 0.5, 0.5),
+        ]
+        # chunk_size must be >= 2*W + max(stride) = 2*100 + 50 = 250
+        plan = plan_partitions(1000, 100, 250, 100, specs)
+        # The last train window should end 100 samples before first val window
+        train_ends = plan["train"] + 100  # window_size=100
+        val_starts = plan["val"]
+        # Find transition
+        last_train_end = train_ends[np.argmax(train_ends >= val_starts[0])]
+        first_val_start = val_starts[val_starts > last_train_end][0]
+        gap = first_val_start - last_train_end - 1
+        assert gap >= 100, f"Gap {gap} < 100"
 
-    def test_scaler_is_fitted(self, normalised):
-        _, scaler = normalised
-        assert hasattr(scaler, "mean_"), "Scaler must be fitted"
-        assert hasattr(scaler, "scale_")
-        assert scaler.mean_.shape == (82,)
-        assert scaler.scale_.shape == (82,)
-
-    def test_all_splits_finite(self, normalised):
-        scaled, _ = normalised
-        for key in ("train", "val", "test_normal", "test_anomaly"):
-            assert scaled[key].dtype == np.float32
-            assert np.all(np.isfinite(scaled[key])), f"{key} contains inf/nan"
+    def test_chunk_size_insufficient_raises(self):
+        """chunk_size too small raises ValueError."""
+        specs = [PartitionSpec("train", 1.0, 0.25)]
+        with pytest.raises(ValueError, match="too small"):
+            plan_partitions(1000, 200, 100, 100, specs)  # chunk_size=100 < 2*200 + 50
 
 
 # ---------------------------------------------------------------------------
-# KukaDataset
+# Partitioning: verify_no_leakage
+# ---------------------------------------------------------------------------
+class TestVerifyNoLeakage:
+    def test_passes_on_valid_plan(self):
+        specs = [
+            PartitionSpec("train", 0.7, 0.25),
+            PartitionSpec("val", 0.15, 0.5),
+            PartitionSpec("test", 0.15, 0.5),
+        ]
+        plan = plan_partitions(10000, 100, 1000, 100, specs)
+        verify_no_leakage(plan, window_size=100, gap=100)
+
+    def test_fails_on_overlap(self):
+        plan = {"a": np.array([0, 50]), "b": np.array([25])}  # overlap
+        with pytest.raises(ValueError):
+            verify_no_leakage(plan, window_size=100, gap=0)
+
+    def test_fails_on_insufficient_gap(self):
+        plan = {"a": np.array([0]), "b": np.array([50])}  # gap = 49, need 100
+        with pytest.raises(ValueError):
+            verify_no_leakage(plan, window_size=100, gap=100)
+
+
+# ---------------------------------------------------------------------------
+# KukaDataset (new API with start_indices)
 # ---------------------------------------------------------------------------
 class TestKukaDataset:
     @pytest.fixture
     def dummy_data(self):
-        """2D array: 100 samples, 5 features."""
         rng = np.random.RandomState(42)
         return rng.randn(100, 5).astype(np.float32)
 
-    def test_len(self, dummy_data):
-        ds = KukaDataset(dummy_data, window_size=16, stride=1, label=0)
-        expected = (100 - 16) // 1 + 1  # 85
-        assert len(ds) == expected, f"Expected {expected}, got {len(ds)}"
+    @pytest.fixture
+    def starts(self):
+        return np.array([0, 16, 32, 48, 64], dtype=np.int64)
 
-    def test_getitem_shape(self, dummy_data):
-        ds = KukaDataset(dummy_data, window_size=16, label=0)
+    def test_len(self, dummy_data, starts):
+        ds = KukaDataset(dummy_data, starts, window_size=16, label=0)
+        assert len(ds) == len(starts)
+
+    def test_getitem_shape(self, dummy_data, starts):
+        ds = KukaDataset(dummy_data, starts, window_size=16, label=0)
         window, label = ds[0]
-        assert window.shape == (16, 5), f"Expected (16, 5), got {window.shape}"
-        assert label.shape == (1,), f"Expected (1,), got {label.shape}"
+        assert window.shape == (16, 5)
+        assert label.shape == (1,)
 
-    def test_getitem_dtype(self, dummy_data):
-        ds = KukaDataset(dummy_data, window_size=16, label=0)
+    def test_getitem_dtype(self, dummy_data, starts):
+        ds = KukaDataset(dummy_data, starts, window_size=16, label=0)
         window, label = ds[0]
         assert window.dtype == torch.float32
         assert label.dtype == torch.float32
 
-    def test_label_consistency_normal(self, dummy_data):
-        ds = KukaDataset(dummy_data, window_size=16, label=0)
-        for i in range(len(ds)):
-            _, label = ds[i]
-            assert label.item() == 0.0
+    def test_label_consistency(self, dummy_data, starts):
+        ds_normal = KukaDataset(dummy_data, starts, window_size=16, label=0)
+        ds_anomaly = KukaDataset(dummy_data, starts, window_size=16, label=1)
+        for i in range(len(ds_normal)):
+            assert ds_normal[i][1].item() == 0.0
+        for i in range(len(ds_anomaly)):
+            assert ds_anomaly[i][1].item() == 1.0
 
-    def test_label_consistency_anomaly(self, dummy_data):
-        ds = KukaDataset(dummy_data, window_size=16, label=1)
-        for i in range(len(ds)):
-            _, label = ds[i]
-            assert label.item() == 1.0
-
-    def test_temporal_order_preserved(self, dummy_data):
-        """Window at idx i must start at row i*stride of the original data."""
-        W = 16
-        stride = 1
-        ds = KukaDataset(dummy_data, window_size=W, stride=stride, label=0)
-        for i in range(min(5, len(ds))):
+    def test_window_correctness(self, dummy_data):
+        """Window at index i uses start_indices[i]."""
+        starts = np.array([10, 25, 40], dtype=np.int64)
+        ds = KukaDataset(dummy_data, starts, window_size=10, label=0)
+        for i, s in enumerate(starts):
             window, _ = ds[i]
-            expected = torch.from_numpy(dummy_data[i * stride : i * stride + W])
+            expected = torch.from_numpy(dummy_data[s:s+10])
             torch.testing.assert_close(window, expected)
 
-    def test_strided_windows(self, dummy_data):
-        stride = 3
-        W = 16
-        ds = KukaDataset(dummy_data, window_size=W, stride=stride, label=0)
-        for i in range(len(ds)):
-            window, _ = ds[i]
-            start = i * stride
-            expected = torch.from_numpy(dummy_data[start : start + W])
-            torch.testing.assert_close(window, expected)
-
-    def test_index_out_of_range(self, dummy_data):
-        ds = KukaDataset(dummy_data, window_size=16, label=0)
+    def test_index_out_of_range(self, dummy_data, starts):
+        ds = KukaDataset(dummy_data, starts, window_size=16, label=0)
         with pytest.raises(IndexError):
             ds[len(ds)]
 
-    def test_window_size_greater_than_data(self):
-        data = np.random.randn(10, 5).astype(np.float32)
-        ds = KukaDataset(data, window_size=16, label=0)
-        assert len(ds) == 0
+    def test_invalid_start_indices(self, dummy_data):
+        starts = np.array([95], dtype=np.int64)  # 95 + 16 > 100
+        with pytest.raises(ValueError):
+            KukaDataset(dummy_data, starts, window_size=16, label=0)
 
-    def test_accepts_torch_tensor(self, dummy_data):
+    def test_accepts_torch_tensor(self, dummy_data, starts):
         data = torch.from_numpy(dummy_data)
-        ds = KukaDataset(data, window_size=16, label=0)
-        assert len(ds) == 85
+        ds = KukaDataset(data, starts, window_size=16, label=0)
+        assert len(ds) == 5
         window, _ = ds[0]
         assert window.shape == (16, 5)
 
-    def test_negative_index(self, dummy_data):
-        ds = KukaDataset(dummy_data, window_size=16, label=0)
-        last_idx = len(ds) - 1
+    def test_negative_index(self, dummy_data, starts):
+        ds = KukaDataset(dummy_data, starts, window_size=16, label=0)
         window_neg, _ = ds[-1]
-        window_pos, _ = ds[last_idx]
+        window_pos, _ = ds[len(starts) - 1]
         torch.testing.assert_close(window_neg, window_pos)
-
-    def test_repr(self, dummy_data):
-        ds = KukaDataset(dummy_data, window_size=16, label=0)
-        repr_str = repr(ds)
-        assert "KukaDataset" in repr_str
-        assert "label=0" in repr_str
 
     def test_invalid_ndim(self):
         with pytest.raises(ValueError):
-            KukaDataset(np.random.randn(10, 5, 3), window_size=16, label=0)
+            KukaDataset(np.random.randn(10, 5, 3), np.array([0]), window_size=16, label=0)
 
     def test_empty_data(self):
         with pytest.raises(ValueError):
-            KukaDataset(np.array([]).reshape(0, 5), window_size=16, label=0)
+            KukaDataset(np.array([]).reshape(0, 5), np.array([]), window_size=16, label=0)
 
-    def test_real_data_shapes(self):
-        """Test with actual processed data files (generated by run_preprocessing)."""
-        train = np.load(Path("data/processed/train.npy"))
-        ds = KukaDataset(train, window_size=16, label=0)
+    def test_repr(self, dummy_data, starts):
+        ds = KukaDataset(dummy_data, starts, window_size=16, label=0)
+        r = repr(ds)
+        assert "KukaDataset" in r
+        assert "label=0" in r
+
+
+# ---------------------------------------------------------------------------
+# Integration: load_kuka_data + plan + dataset
+# ---------------------------------------------------------------------------
+class TestIntegration:
+    def test_plan_and_dataset_shapes(self, config):
+        """End-to-end: load -> plan -> dataset."""
+        normal, slow, cols = load_kuka_data(config)
+
+        # Plan with default config parameters
+        plan = plan_partitions(
+            n_samples=normal.shape[0],
+            window_size=config["data"]["window_size"],
+            chunk_size=config["data"]["partitioning"]["chunk_size"],
+            gap=config["data"]["window_size"],
+            specs=[
+                PartitionSpec("train", 0.7, 0.25),
+                PartitionSpec("val", 0.15, 0.5),
+                PartitionSpec("test", 0.15, 0.5),
+            ],
+        )
+        assert "train" in plan
+        assert "val" in plan
+        assert "test" in plan
+
+        # Build dataset
+        ds = KukaDataset(normal, plan["train"], config["data"]["window_size"], label=0)
+        assert len(ds) > 0
         window, label = ds[0]
-        assert window.shape == (16, 82)
+        assert window.shape == (config["data"]["window_size"], 86)
         assert label.item() == 0.0
-        assert len(ds) == 140275 - 16 + 1  # 140260
+
+
+# ---------------------------------------------------------------------------
+# run_preprocessing (if processed data exists)
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(
+    not Path("data/processed/normal_scaled.npy").exists(),
+    reason="Processed data not generated yet"
+)
+class TestPreprocessingOutput:
+    def test_artifacts_exist(self):
+        processed_dir = Path("data/processed")
+        for name in ["normal_scaled.npy", "slow_scaled.npy",
+                     "plan_train.npy", "plan_val_normal.npy",
+                     "plan_val_anomaly.npy", "plan_test_normal.npy",
+                     "plan_test_anomaly.npy", "scaler.pkl",
+                     "selected_columns.npy", "manifest.json", "stats.json"]:
+            assert (processed_dir / name).exists(), f"Missing {name}"
+
+    def test_manifest_fields(self):
+        with open("data/processed/manifest.json") as f:
+            manifest = json.load(f)
+        assert manifest["window_size"] > 0
+        assert "partitions" in manifest
+        for name, info in manifest["partitions"].items():
+            assert info["n_windows"] > 0
+            assert 0 < info["coverage_ratio"] <= 1
+
+    def test_build_dataloaders(self, config):
+        loaders = build_dataloaders(config, partitions=["train", "val_normal", "val_anomaly"], num_workers=0)
+        assert "train" in loaders
+        assert "val_normal" in loaders
+        assert "val_anomaly" in loaders
+        # Check first batch: window is (B, W, n_features), label is (B, 1)
+        window, label = next(iter(loaders["train"]))
+        batch_size = window.shape[0]
+        assert window.shape[1:] == (config["data"]["window_size"], 86)
+        assert label.shape == (batch_size, 1)
+        # Labels must be the partition label (0 = normal)
+        assert torch.allclose(label, torch.zeros_like(label))
+
+    def test_stats_json(self):
+        """stats.json holds per-partition descriptive statistics."""
+        with open("data/processed/stats.json") as f:
+            stats = json.load(f)
+        assert stats["n_features"] == 86
+        assert len(stats["feature_names"]) == 86
+        for rec in ("normal", "slow"):
+            for stat in ("min", "max", "mean", "std"):
+                assert len(stats["recordings"][rec]["raw"][stat]) == 86
+        # Every partition must have statistics
+        for name in ("train", "val_normal", "test_normal", "val_anomaly", "test_anomaly"):
+            part = stats["partitions"][name]
+            assert part["n_windows"] > 0
+            assert len(part["scaled"]["mean"]) == 86

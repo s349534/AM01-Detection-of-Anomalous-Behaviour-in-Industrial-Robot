@@ -2,15 +2,12 @@
 
 This script orchestrates:
 1. Data loading and preprocessing
-2. Model training
+2. Model training (AE or AAE)
 3. Evaluation and comparison
 4. Results visualization
 
 Usage:
-    uv run python src/main.py [--config CONFIG] [--phase {preprocess,train,evaluate,all}]
-
-Note: model/data modules are currently scaffolding (placeholders) for Fases 3–5.
-Fase 2 (preprocessing) is fully implemented and wired up — use ``--phase preprocess``.
+    uv run python src/main.py [--config CONFIG] [--phase {preprocess,train,train_aae,evaluate,all}]
 """
 from __future__ import annotations
 
@@ -64,16 +61,15 @@ def import_modules() -> None:
     print("--- Importing project modules ---")
     from src.data import dataset, preprocessing  # noqa: F401
     try:
-        from src.models import autoencoder, adversarial_ae, compare_models  # noqa: F401
+        from src.models import autoencoder, adversarial_ae  # noqa: F401
         print("models import OK.")
     except ImportError as e:
         print(f"models import skipped (scaffolding): {e}")
-    from src.utils import metrics, visualization  # noqa: F401
     print("All src.* modules import OK.")
 
 
 def run_phase_preprocess(config: dict) -> None:
-    """Run Fase 2 — preprocessing pipeline (fully implemented)."""
+    """Run Fase 2 — preprocessing pipeline."""
     from src.data.preprocessing import run_preprocessing
 
     print("\n=== Fase 2: Preprocessing ===")
@@ -82,117 +78,47 @@ def run_phase_preprocess(config: dict) -> None:
 
 def run_phase_train(config: dict) -> None:
     """Run Fase 3 — Train baseline SequenceAutoencoder."""
-    from src.data.dataset import build_datasets
-    from src.models.autoencoder import SequenceAutoencoder, fit_autoencoder
-    from src.utils.config import get_param
+    from src.models.train_ae import run_final_training
 
     print("\n=== Fase 3: Train Baseline SequenceAutoencoder ===")
-    processed_dir = Path(config["paths"]["data_processed"])
-    if not (processed_dir / "train.npy").exists():
-        print(f"Processed data not found at {processed_dir}. Running preprocessing first...")
-        from src.data.preprocessing import run_preprocessing
-        run_preprocessing(config)
-
-    window_size = int(get_param(config, "data.window_size", 16))
-    window_stride = int(get_param(config, "data.window_stride", 1))
-    batch_size = int(get_param(config, "training.batch_size", 256))
-    epochs = int(get_param(config, "training.epochs", 100))
-    lr = float(get_param(config, "training.learning_rate", 1e-3))
-    weight_decay = float(get_param(config, "training.weight_decay", 1e-4))
-    patience = int(get_param(config, "training.early_stopping.patience", 10))
-    min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
-
-    print(f"Loading datasets from {processed_dir} (W={window_size}, batch_size={batch_size})...")
-    loaders = build_datasets(
-        processed_dir=processed_dir,
-        window_size=window_size,
-        stride=window_stride,
-        batch_size=batch_size,
-        num_workers=0,
+    run_final_training(
+        config_path="config/params_validated_ae.yaml",
+        seeds=[42, 123, 7],
     )
-
-    model = SequenceAutoencoder.from_config(config)
-    checkpoint_path = Path("reports/checkpoints/ae_baseline.pth")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Training on device: {device}")
-
-    history = fit_autoencoder(
-        model=model,
-        train_loader=loaders["train"],
-        val_loader=loaders["val"],
-        epochs=epochs,
-        learning_rate=lr,
-        weight_decay=weight_decay,
-        patience=patience,
-        min_delta=min_delta,
-        checkpoint_path=checkpoint_path,
-        device=device,
-    )
-    print(f"Baseline Autoencoder training complete. Checkpoint: {checkpoint_path}")
 
 
 def run_phase_train_aae(config: dict) -> None:
-    """Run Fase 4 — Train Adversarial Autoencoder with validated HPs."""
-    from src.data.dataset import build_datasets
-    from src.models.adversarial_ae import AdversarialAutoencoder, fit_aae
-    from src.utils.config import get_param
+    """Run Fase 4 — Train Adversarial Autoencoder."""
+    from src.models.train_aae import run_final_training_aae
 
     print("\n=== Fase 4: Train Adversarial Autoencoder ===")
-    processed_dir = Path(config["paths"]["data_processed"])
-    if not (processed_dir / "train.npy").exists():
-        print(f"Processed data not found at {processed_dir}. Running preprocessing first...")
-        from src.data.preprocessing import run_preprocessing
-        run_preprocessing(config)
-
-    window_size = int(get_param(config, "data.window_size", 16))
-    window_stride = int(get_param(config, "data.window_stride", 1))
-    batch_size = int(get_param(config, "training.batch_size", 256))
-    epochs = int(get_param(config, "training.epochs", 100))
-    lr = float(get_param(config, "training.learning_rate", 1e-3))
-    weight_decay = float(get_param(config, "training.weight_decay", 0.0))
-    patience = int(get_param(config, "training.early_stopping.patience", 10))
-    min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
-    reconstruction_weight = float(get_param(config, "training.reconstruction_weight", 1.0))
-    adversarial_weight = float(get_param(config, "training.adversarial_weight", 0.1))
-
-    print(f"Loading datasets from {processed_dir} (W={window_size}, batch_size={batch_size})...")
-    loaders = build_datasets(
-        processed_dir=processed_dir,
-        window_size=window_size,
-        stride=window_stride,
-        batch_size=batch_size,
-        num_workers=0,
+    run_final_training_aae(
+        config_path="config/params_validated_aae.yaml",
+        seeds=[42, 123, 7],
     )
-
-    model = AdversarialAutoencoder.from_config(config)
-    checkpoint_path = Path("reports/checkpoints/aae_final.pth")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Training AAE on device: {device}")
-    print(f"  reconstruction_weight={reconstruction_weight}, adversarial_weight={adversarial_weight}")
-
-    history = fit_aae(
-        model=model,
-        train_loader=loaders["train"],
-        val_loader=loaders["val"],
-        epochs=epochs,
-        learning_rate=lr,
-        weight_decay=weight_decay,
-        reconstruction_weight=reconstruction_weight,
-        adversarial_weight=adversarial_weight,
-        patience=patience,
-        min_delta=min_delta,
-        checkpoint_path=str(checkpoint_path),
-        device=device,
-    )
-    print(f"Adversarial Autoencoder training complete. Checkpoint: {checkpoint_path}")
-
 
 
 def run_phase_evaluate(config: dict) -> None:
-    """Fase 5 placeholder (model comparison + metrics)."""
-    print("\n[Not yet implemented] Fase 5: Evaluate and compare models")
+    """Fase 5 — Evaluate trained model on test set."""
+    from src.evaluation.evaluate import evaluate_checkpoints
+    from pathlib import Path
+
+    checkpoint_path = Path("reports/checkpoints/ae_baseline.pth")
+    if not checkpoint_path.exists():
+        print(f"Checkpoint not found: {checkpoint_path}. Train first with --phase train")
+        return
+
+    print("\n=== Fase 5: Evaluate Model ===")
+    result = evaluate_checkpoints(
+        checkpoint_paths=[checkpoint_path],
+        config=config,
+    )
+    tm = result["per_seed"][0]
+    print(f"Test ROC-AUC: {tm['roc_auc']:.4f} | PR-AUC: {tm['pr_auc']:.4f} | F1: {tm['f1']:.4f}")
+    cm = tm["confusion_matrix"]
+    print(f"Confusion matrix: TN={cm['tn']} FP={cm['fp']} FN={cm['fn']} TP={cm['tp']}")
+    print("For the full report (figure + metrics CSV) run: python -m src.evaluation "
+          "--checkpoint reports/checkpoints/ae_baseline.pth")
 
 
 def main() -> None:
@@ -202,7 +128,7 @@ def main() -> None:
     # Ensure UTF-8 output on Windows (cp1252 can't encode em-dashes etc.)
     # On Linux this is a no-op.
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     except AttributeError:
         pass
 
@@ -236,7 +162,7 @@ def main() -> None:
     }
 
     if args.phase == "all":
-        for phase_name, phase_fn in phases.items():
+        for phase_fn in phases.values():
             phase_fn(config)
     else:
         phases[args.phase](config)

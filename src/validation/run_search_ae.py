@@ -1,10 +1,15 @@
 """CLI for random hyperparameter search over the vanilla AE (§4.8.6, §4.8.5).
 
 Usage:
-    python -m src.validation.run_search_ae --n-iter 20 --seed 42
+    python -m src.validation.run_search_ae --n-iter 20 --seed 42  # random subset
+    python -m src.validation.run_search_ae --max-val-epochs 50    # exhaustive (all combos)
 
 Produces:
     reports/tables/validation_results_ae.csv  (append mode, N rows)
+
+For each configuration, **3 models** are trained using the fixed validation seeds
+VALIDATION_SEEDS = [7, 42, 123] (§4.8.6). The CSV contains 3 rows per config,
+distinguished by the ``config_id`` column and the ``seed`` column.
 
 Each row follows the CSV format defined in §4.8.8 of project_plan.md.
 """
@@ -17,21 +22,28 @@ import sys
 import time
 from pathlib import Path
 
-from sklearn.model_selection import ParameterSampler
+import numpy as np
+from sklearn.model_selection import ParameterGrid, ParameterSampler
 
 from src.utils.config import load_config
 from src.validation.run_experiment_ae import train_and_evaluate_ae
 from src.validation.search_space import get_search_space_ae, merge_search_sample
+from src.data.partitioning import plan_from_config
 
 logger = logging.getLogger(__name__)
 
+# Fixed validation seeds for robust hyperparameter selection (§4.8.6).
+# Each configuration is trained with these 3 seeds; results are aggregated
+# (mean ± std) in analyze_results.py before best-config selection.
+VALIDATION_SEEDS = [7, 42, 123]
+
 CSV_COLUMNS = [
     "run_id",
+    "config_id",   # groups the 3 seed-runs for the same configuration
     "W",
     "latent_dim",
-    "encoder_channels",
-    "best_val_pr_auc",
-    "best_val_f1",
+    "val_roc_auc",
+    "val_pr_auc",
     "best_epoch",
     "train_time_sec",
     "seed",
@@ -61,21 +73,28 @@ def write_result_row_csv(path: Path, row: dict, write_header: bool) -> None:
 
 
 def run_search(
-    n_iter: int = 20,
+    n_iter: int | None = None,
     seed: int = 42,
     config_path: str | Path | None = None,
     params_path: str | Path | None = None,
     max_val_epochs: int | None = None,
-    resume: bool = True,
+    resume: bool = False,
+    val_seeds: list[int] | None = None,
 ) -> Path:
     """Run the random search over AE hyperparameters.
 
+    For each sampled configuration, ``len(val_seeds)`` models are trained
+    (3 by default: 7, 42, 123). Results are written as one CSV row per seed-run,
+    grouped by ``config_id``.
+
     Parameters
     ----------
-    n_iter : int
-        Number of random configurations to sample.
+    n_iter : int or None
+        Number of random configurations to sample. If None (default), runs
+        ALL combinations exhaustively using ParameterGrid.
     seed : int
-        Random seed for ParameterSampler.
+        Random seed for ParameterSampler (only used when n_iter is set,
+        for reproducible sampling of configurations).
     config_path : str | Path | None
         Path to config.yaml. Defaults to ``config/config.yaml``.
     params_path : str | Path | None
@@ -84,12 +103,17 @@ def run_search(
         Override max epochs per run (useful for quick testing).
     resume : bool
         If True and the CSV already exists, skip run_ids already present.
+    val_seeds : list[int] or None
+        Fixed seeds for validation runs per configuration.
+        Defaults to ``VALIDATION_SEEDS`` = [7, 42, 123].
 
     Returns
     -------
     Path
         Path to the output CSV file.
     """
+    if val_seeds is None:
+        val_seeds = VALIDATION_SEEDS
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -98,13 +122,20 @@ def run_search(
     )
 
     # --- Load base config ---
-    base_config = load_config(config_path, params_path)
+    base_config = load_config(
+        Path(config_path) if config_path else None,
+        Path(params_path) if params_path else None,
+    )
 
     output_csv = get_output_path(base_config)
 
     # --- Determine which run_ids already exist (for resume) ---
     existing_run_ids: set[int] = set()
     write_header = True
+    if not resume and output_csv.exists():
+        # --no-resume: start fresh, remove existing CSV
+        output_csv.unlink()
+        logger.info("Removed existing CSV (no-resume mode)")
     if resume and output_csv.exists() and output_csv.stat().st_size > 0:
         with open(output_csv, "r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -118,62 +149,122 @@ def run_search(
 
     # --- Build search space and sample ---
     search_space = get_search_space_ae()
-    sampler = ParameterSampler(search_space, n_iter=n_iter, random_state=seed)
-    samples = list(sampler)
+
+    if n_iter is None:
+        # Exhaustive mode: run all combinations deterministically
+        grid = ParameterGrid(search_space)
+        samples = list(grid)
+        mode_str = "exhaustive"
+    else:
+        # Random sampling mode
+        sampler = ParameterSampler(search_space, n_iter=n_iter, random_state=seed)
+        samples = list(sampler)
+        mode_str = f"random (n_iter={n_iter})"
 
     logger.info(
-        "Starting AE validation: %d iterations (seed=%d), %d unique configs",
-        len(samples), seed, len(samples),
+        "Starting AE validation: %d configs (%s, sample_seed=%d), "
+        "%d seeds/config %s, total runs=%d",
+        len(samples), mode_str, seed,
+        len(val_seeds), val_seeds, len(samples) * len(val_seeds),
     )
 
     # --- Run experiments ---
-    for i, sample in enumerate(samples):
-        run_id = i + 1
-        if resume and run_id in existing_run_ids:
-            logger.info("Skipping run_id=%d (already completed)", run_id)
-            continue
+    # Pre-load validation data shape for window_size validation
+    processed_dir = Path(base_config.get("paths", {}).get("data_processed", "data/processed/"))
+    normal_path = processed_dir / "normal_scaled.npy"
+    val_windows = None
+    if normal_path.exists():
+        # Use the new partitioning to check planned val windows
+        normal_n = np.load(normal_path, mmap_mode="r").shape[0]
+        slow_path = processed_dir / "slow_scaled.npy"
+        slow_n = np.load(slow_path, mmap_mode="r").shape[0] if slow_path.exists() else 0
+        base_plan = plan_from_config(base_config, "normal", normal_n, slow_n)
+        val_windows = len(base_plan.get("val_normal", []))
+        logger.info("Planned val_normal windows: %d", val_windows)
+    else:
+        logger.warning("Validation data not found at %s -- cannot validate window_size", normal_path)
 
-        # Merge sampled HP into config
+    global_run_id = 0
+
+    for config_idx, sample in enumerate(samples):
+        config_id = config_idx + 1
+
+        # Merge sampled HP into config (shared across all seeds for this config)
         run_config = merge_search_sample(base_config, sample)
 
-        logger.info(
-            "[Run %d/%d] Sample: %s",
-            run_id, n_iter, sample,
-        )
-
-        try:
-            result = train_and_evaluate_ae(
-                config=run_config,
-                run_id=run_id,
-                seed=seed + run_id,  # varied seed per run
-                max_val_epochs=max_val_epochs,
+        # --- Validate window_size against planned validation windows ---
+        window_size = int(run_config.get("data", {}).get("window_size", 256))
+        if val_windows is not None and val_windows == 0:
+            logger.warning(
+                "Skipping config_id=%d: window_size=%d yields 0 validation windows",
+                config_id, window_size
             )
-
-            write_result_row_csv(output_csv, result, write_header=write_header)
-            write_header = False  # header written after first row
-            logger.info(
-                "  -> W=%d latent=%d channels=%s pr_auc=%.4f f1=%.4f time=%.1fs",
-                result["W"], result["latent_dim"], result["encoder_channels"],
-                result["best_val_pr_auc"], result["best_val_f1"],
-                result["train_time_sec"],
-            )
-
-        except Exception as e:
-            logger.error("Run %d failed: %s", run_id, e, exc_info=True)
-            # Write a failure row so the CSV maintains run_id continuity
+            global_run_id += 1
             fail_row = {
-                "run_id": run_id,
-                "W": sample.get("model.window_size", ""),
-                "latent_dim": sample.get("model.latent_dim", ""),
-                "encoder_channels": str(sample.get("model.encoder.conv_channels", "")),
-                "best_val_pr_auc": -1.0,  # sentinel for failure
-                "best_val_f1": -1.0,
+                "run_id": global_run_id,
+                "config_id": config_id,
+                "W": window_size,
+                "latent_dim": run_config.get("model", {}).get("latent_dim", ""),
+                "val_roc_auc": -1.0,
+                "val_pr_auc": -1.0,
                 "best_epoch": 0,
                 "train_time_sec": 0.0,
-                "seed": seed + run_id,
+                "seed": "",
             }
             write_result_row_csv(output_csv, fail_row, write_header=write_header)
             write_header = False
+            continue
+
+        logger.info(
+            "[Config %d/%d] Sample: %s",
+            config_id, len(samples), sample,
+        )
+
+        # --- Run 3 seeds for this configuration ---
+        for seed_idx, val_seed in enumerate(val_seeds):
+            global_run_id += 1
+            run_id = global_run_id
+
+            if resume and run_id in existing_run_ids:
+                logger.info("Skipping run_id=%d (already completed)", run_id)
+                continue
+
+            try:
+                result = train_and_evaluate_ae(
+                    config=run_config,
+                    run_id=run_id,
+                    seed=val_seed,  # fixed seed per config
+                    max_val_epochs=max_val_epochs,
+                )
+                # Inject config_id into result row
+                result["config_id"] = config_id
+                write_result_row_csv(output_csv, result, write_header=write_header)
+                write_header = False  # header written after first row
+                logger.info(
+                    "  -> seed=%d | W=%d latent=%d roc_auc=%.4f pr_auc=%.4f time=%.1fs",
+                    val_seed,
+                    result["W"], result["latent_dim"],
+                    result["val_roc_auc"], result["val_pr_auc"],
+                    result["train_time_sec"],
+                )
+
+            except Exception:
+                logger.exception("Run %d (config_id=%d, seed=%d) failed",
+                                 run_id, config_id, val_seed)
+                # Write a failure row so the CSV maintains run_id continuity
+                fail_row = {
+                    "run_id": run_id,
+                    "config_id": config_id,
+                    "W": sample.get("data.window_size", ""),
+                    "latent_dim": sample.get("model.latent_dim", ""),
+                    "val_roc_auc": -1.0,  # sentinel for failure
+                    "val_pr_auc": -1.0,
+                    "best_epoch": 0,
+                    "train_time_sec": 0.0,
+                    "seed": val_seed,
+                }
+                write_result_row_csv(output_csv, fail_row, write_header=write_header)
+                write_header = False
 
     logger.info("Search complete. Results: %s", output_csv)
     return output_csv
@@ -184,12 +275,13 @@ def parse_args() -> argparse.Namespace:
         description="Random search for AE hyperparameter validation (§4.8.2)"
     )
     parser.add_argument(
-        "--n-iter", type=int, default=20,
-        help="Number of random configurations to sample (default: 20)",
+        "--n-iter", type=int, default=None,
+        help="Number of random configurations to sample. If not set, runs ALL combinations exhaustively (default: exhaustive)",
     )
     parser.add_argument(
         "--seed", type=int, default=42,
-        help="Random seed for ParameterSampler (default: 42)",
+        help="Random seed for ParameterSampler sampling only (default: 42). "
+             "Training seeds are fixed: [7, 42, 123] per config (§4.8.6).",
     )
     parser.add_argument(
         "--max-val-epochs", type=int, default=None,
@@ -199,6 +291,15 @@ def parse_args() -> argparse.Namespace:
         "--no-resume", action="store_true",
         help="Do not resume from existing CSV (start fresh)",
     )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume from existing CSV (skip run_ids already present). "
+             "Default is no-resume (fresh start each time).",
+    )
+    parser.add_argument(
+        "--val-seeds", type=int, nargs="+", default=None,
+        help="Fixed seeds for validation runs per configuration (default: 7 42 123, §4.8.6)",
+    )
     return parser.parse_args()
 
 
@@ -206,11 +307,12 @@ def main() -> None:
     args = parse_args()
     start = time.time()
 
-    output_csv = run_search(
+    run_search(
         n_iter=args.n_iter,
         seed=args.seed,
         max_val_epochs=args.max_val_epochs,
-        resume=not args.no_resume,
+        resume=args.resume,
+        val_seeds=args.val_seeds,
     )
 
     elapsed = time.time() - start

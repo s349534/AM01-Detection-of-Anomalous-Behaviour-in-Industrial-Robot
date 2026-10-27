@@ -21,23 +21,19 @@ logging:
   format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 model:
   name: adversarial_autoencoder
-  input_dim: 82
-  window_size: 32
+  input_dim: 86
   encoding_dim: 32
-  latent_dim: 16
+  latent_dim: 32
   encoder:
     conv_channels:
-    - 128
     - 64
+    - 32
+    - 16
     conv_kernels:
     - 5
     - 3
+    - 3
     pool_size: 2
-    activation: relu
-  decoder:
-    conv_channels:
-    - 64
-    - 128
     activation: relu
   discriminator:
     hidden_layers:
@@ -46,24 +42,44 @@ model:
     activation: leaky_relu
 training:
   batch_size: 256
-  epochs: 100
-  learning_rate: 0.001
+  epochs: 200
+  learning_rate: 0.0001
   weight_decay: 0.0001
   beta1: 0.5
   beta2: 0.999
+  num_workers: 4
   adversarial_weight: 0.1
   reconstruction_weight: 1.0
+  loss: mae
+  reconstruction_metric: mae
   early_stopping:
-    patience: 10
+    patience: 15
     min_delta: 0.0001
-  train_split: 0.6
-  val_split: 0.2
+  train_split: 0.7
+  val_split: 0.15
+  slow_val_split: 0.5
 data:
-  normal_data_path: data/raw/KukaVelocityDataset/KukaNormal.npy
-  slow_data_path: data/raw/KukaVelocityDataset/KukaSlow.npy
-  column_names_path: data/raw/KukaVelocityDataset/KukaColumnNames.npy
-  window_size: 16
-  window_stride: 1
-  drop_incomplete: true
-  normalization: standard
+  normal_data_path: data/raw/KukaNormal.npy
+  slow_data_path: data/raw/KukaSlow.npy
+  column_names_path: data/raw/KukaColumnNames.npy
+  window_size: 128
+  normalization: minmax
   augmentation: false
+  partitioning:
+    mode: interleaved
+    chunk_size: 1024
+    gap: window
+    quotas:
+      normal:
+        train: 0.7
+        val_normal: 0.15
+        test_normal: 0.15
+      slow:
+        val_anomaly: 0.5
+        test_anomaly: 0.5
+    stride_multipliers:
+      train: 0.25
+      val_normal: 0.5
+      test_normal: 0.5
+      val_anomaly: 0.5
+      test_anomaly: 0.5

@@ -76,6 +76,24 @@ uv sync
 uv run python -m ipykernel install --user --name am01 --display-name "AM01"
 ```
 
+## Dataset Setup (CRITICAL for HPC)
+
+The raw dataset files (`KukaNormal.npy`, `KukaSlow.npy`, `KukaColumnNames.npy`) must be present in `data/raw/` **both locally and on the HPC**.
+
+**Local**: Already included in the repository (or download from the course materials).
+
+**HPC**: The `hpc_connect.sh deploy` command includes `data/raw/` in the rsync upload to `~/am01_project/data/raw/`. However, if the HPC home directory doesn't have the raw data (e.g., fresh user account, or deploy failed), you must manually upload them:
+
+```bash
+# Option 1: Include in deploy (recommended - automatic)
+./hpc_connect.sh deploy   # includes data/raw/ in rsync
+
+# Option 2: Manual upload if deploy doesn't transfer raw data
+scp data/raw/KukaNormal.npy data/raw/KukaSlow.npy data/raw/KukaColumnNames.npy polito-hpc:~/am01_project/data/raw/
+```
+
+> ⚠️ **Without raw data on HPC, the automatic preprocessing step on the compute node will fail** (no input files to process). The SLURM scripts check for `data/processed/train.npy` and trigger `src.data.preprocessing` only if raw data exists. If raw data is missing, preprocessing produces empty/truncated outputs (e.g., 30 validation samples instead of ~46k), causing downstream validation failures.
+
 ## Usage
 
 Run everything through `uv run` so the project venv is used:
