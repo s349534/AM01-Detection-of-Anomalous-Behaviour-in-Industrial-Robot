@@ -1,7 +1,8 @@
 project:
   name: AM01-AnomalyDetection
   version: 0.1.0
-  description: Detection of Anomalous Behaviour in Industrial Robot using Adversarial Autoencoders
+  description: Detection of Anomalous Behaviour in Industrial Robot using Adversarial
+    Autoencoders
   author: Student Group
   course: Machine Learning in Applications
   university: Politecnico di Torino
@@ -34,16 +35,10 @@ model:
     - 3
     pool_size: 2
     activation: relu
-  decoder:
-    conv_channels:
-    - 16
-    - 32
-    - 64
-    activation: relu
   discriminator:
     hidden_layers:
-    - 32
     - 16
+    - 8
     activation: leaky_relu
 training:
   batch_size: 256
@@ -53,9 +48,8 @@ training:
   beta1: 0.5
   beta2: 0.999
   num_workers: 4
-  adversarial_weight: 0.1
-  reconstruction_weight: 1.0
-  discriminator_updates_per_gen: 1
+  adversarial_weight: 0.01
+  reconstruction_weight: 0.5
   loss: mae
   reconstruction_metric: mae
   early_stopping:
@@ -68,7 +62,7 @@ data:
   normal_data_path: data/raw/KukaNormal.npy
   slow_data_path: data/raw/KukaSlow.npy
   column_names_path: data/raw/KukaColumnNames.npy
-  window_size: 128
+  window_size: 256
   normalization: minmax
   augmentation: false
   partitioning:
