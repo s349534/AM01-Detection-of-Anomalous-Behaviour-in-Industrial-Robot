@@ -1,7 +1,4 @@
-seed,train_time_sec,best_epoch,test_pr_auc,test_roc_auc,test_f1,test_accuracy,test_precision,test_recall,threshold,reconstruction_weight,adversarial_weight,n_train_windows,n_val_windows,n_test_normal_windows,n_test_anomaly_windows
-42,140.25,55,0.422716,0.419528,0.010199,0.529439,0.486364,0.005154,1.93742,0.5,0.01,140260,46743,46744,41523
-123,243.16,100,0.465533,0.492133,0.009632,0.529394,0.480952,0.004865,1.919008,0.5,0.01,140260,46743,46744,41523
-7,173.2,71,0.444495,0.458768,0.009961,0.529326,0.475,0.005033,1.920271,0.5,0.01,140260,46743,46744,41523
-
-seed,train_time_sec,best_epoch,test_pr_auc,test_roc_auc,test_f1,test_accuracy,test_precision,test_recall,threshold,reconstruction_weight,adversarial_weight,n_train_windows,n_val_windows,n_test_normal_windows,n_test_anomaly_windows
-MEAN±STD,185.54 ± 42.91,75.3 ± 18.6,0.4442 ± 0.0175,0.4568 ± 0.0297,0.0099 ± 0.0002,,,,,,,,,,
+seed,train_time_sec,best_epoch,threshold,test_pr_auc,test_roc_auc,test_f1,test_accuracy,test_precision,test_recall,test_specificity,test_fpr,test_fnr,test_balanced_accuracy,test_mcc,test_cohen_kappa,test_npv,test_jaccard,test_tn,test_fp,test_fn,test_tp,n_train_windows,n_val_normal_windows,n_val_anomaly_windows,n_test_normal_windows,n_test_anomaly_windows
+42,40.99,188,0.150624,0.323213,0.392004,0.540541,0.37037,0.37037,1.0,0.0,1.0,0.0,0.5,0.0,0.0,0.0,0.37037,0,136,0,80,1644,142,86,136,80
+123,20.42,104,0.151158,0.325066,0.393658,0.540541,0.37037,0.37037,1.0,0.0,1.0,0.0,0.5,0.0,0.0,0.0,0.37037,0,136,0,80,1644,142,86,136,80
+7,31.16,160,0.150809,0.32253,0.390625,0.540541,0.37037,0.37037,1.0,0.0,1.0,0.0,0.5,0.0,0.0,0.0,0.37037,0,136,0,80,1644,142,86,136,80
