@@ -57,6 +57,12 @@ if command -v uv &>/dev/null; then
     uv sync --frozen --quiet
 fi
 
+# ── Ensure preprocessed data exists ──────────────────────────────────────────
+if [[ ! -f "data/processed/normal_scaled.npy" ]]; then
+    echo "data/processed/normal_scaled.npy not found — running preprocessing on compute node..."
+    uv run python -m src.data.preprocessing --config config/params.yaml
+fi
+
 # ── Phase 4.2: Final AAE training with validated HPs (3 seeds) ──────────────
 echo "=== Phase 4.2: Final AAE training (3 seeds) ==="
 SEEDS="${SEEDS:-42 123 7}"

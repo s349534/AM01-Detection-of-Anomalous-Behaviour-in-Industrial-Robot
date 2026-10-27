@@ -69,6 +69,10 @@ print(f'CUDA available: {torch.cuda.is_available()}')
 if torch.cuda.is_available():
     print(f'GPU: {torch.cuda.get_device_name(0)}')
 "
+# ── Ensure preprocessed data exists ──────────────────────────────────────────
+if [[ ! -f "data/processed/normal_scaled.npy" ]]; then
+    echo "data/processed/normal_scaled.npy not found — running preprocessing on compute node..."
+    uv run python -m src.data.preprocessing --config config/params.yaml
 fi
 
 # ── Phase 4.1: AAE Validation search (§4.8.6) ───────────────────────────────
