@@ -3,18 +3,18 @@
 Extends the vanilla ``SequenceAutoencoder`` (Fase 3) by adding a discriminator
 that regularises the latent space to match a standard Gaussian prior ``N(0, I)``.
 
-Architecture overview (§4.1.3):
------------------------------------------
-Encoder  (Conv1d):   (B, 82, W)  → z ∈ ℝ^(B, latent_dim)     [shared with AE]
-Decoder  (Conv1d):   z           → x̂ ∈ ℝ^(B, 82, W)           [shared with AE]
-Discriminator (MLP): z           → D(z) ∈ [0, 1]
+Architecture overview:
+----------------------
+Encoder  (Conv1d):   (B, input_dim, W) → z ∈ ℝ^(B, latent_dim, W/4)  [shared with AE]
+Decoder  (Conv1d):   z                 → x̂ ∈ ℝ^(B, input_dim, W)    [shared with AE]
+Discriminator (MLP): z                 → D(z) ∈ [0, 1]              [aggregates over time]
 
 Training (alternating, per Makhzani et al. 2015):
     Phase D:  maximize  E[log D(z_prior)] + E[log(1 − D(E(x)))]
-    Phase G:  minimize  λ_rec · MSE(x, x̂) + λ_adv · E[log(1 − D(E(x)))]
-              ≡         λ_rec · MSE(x, x̂) − λ_adv · log D(E(x))   (non-saturating)
+    Phase G:  minimize  λ_rec · Loss(x, x̂) + λ_adv · E[log(1 − D(E(x)))]
+              ≡         λ_rec · Loss(x, x̂) − λ_adv · log D(E(x))   (non-saturating)
 
-Input Layout Support (§4.1.2):
+Input Layout Support:
     Accepts both ``(B, input_dim, W)`` and ``(B, W, input_dim)`` layouts,
     matching ``SequenceAutoencoder`` behaviour.
 """
@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from src.models.autoencoder import Conv1dDecoder, Conv1dEncoder
+from src.models.autoencoder import Conv1dDecoder, Conv1dEncoder, SequenceAutoencoder
 from src.utils.config import get_param, load_config
 
 logger = logging.getLogger(__name__)
@@ -40,22 +40,21 @@ logger = logging.getLogger(__name__)
 class Discriminator(nn.Module):
     """MLP discriminator for the AAE latent space.
 
-    Maps a latent vector ``z ∈ ℝ^(latent_dim,)`` to a scalar probability
-    that ``z`` came from the prior ``N(0, I)`` (i.e. "real") rather than
-    from the encoder ``E(x)`` (i.e. "fake").
+    Maps latent representations ``z`` (either 2D ``(B, latent_dim)`` or
+    temporal 3D ``(B, latent_dim, T)``) to a scalar probability in ``(B, 1)``
+    indicating whether ``z`` came from the prior ``N(0, I)`` (real) or the
+    encoder ``E(x)`` (fake).
 
     Parameters
     ----------
     latent_dim : int, default=16
         Dimension of the latent space (input size).
     hidden_layers : tuple[int, ...], default=(32, 16)
-        Width of hidden layers, e.g. ``(32, 16)`` → Linear(16→32) → ReLU
-        → Linear(32→16) → ReLU → Linear(16→1) → Sigmoid.
+        Width of hidden layers, e.g. ``(32, 16)``.
     activation : str, default="leaky_relu"
         Hidden activation: ``"relu"`` or ``"leaky_relu"``.
     use_sigmoid : bool, default=True
-        If **True**, the output is squashed to ``(0, 1)`` via Sigmoid.
-        Set **False** for BCEWithLogitsLoss (numerically more stable).
+        If True, squashes output to (0, 1) via Sigmoid.
     """
 
     def __init__(
@@ -87,63 +86,50 @@ class Discriminator(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """Classify latent vectors as prior (real) or encoder (fake).
+        """Classify latent representations as prior (real) or encoder (fake).
 
         Parameters
         ----------
         z : torch.Tensor
-            Latent vectors of shape ``(B, latent_dim)``.
+            Latent tensor: shape ``(B, latent_dim)`` or ``(B, latent_dim, T)``
+            or ``(B, T, latent_dim)``.
 
         Returns
         -------
         torch.Tensor
-            Probabilities of shape ``(B, 1)`` (or logits if ``use_sigmoid=False``).
+            Probabilities of shape ``(B, 1)``.
         """
-        return self.net(z)
+        if z.ndim == 3:
+            # If shape is (B, latent_dim, T), transpose to (B, T, latent_dim)
+            if z.shape[1] == self.latent_dim:
+                z_in = z.transpose(1, 2)
+            else:
+                z_in = z
+            out = self.net(z_in)  # (B, T, 1)
+            return out.mean(dim=1)  # aggregate over time -> (B, 1)
+        elif z.ndim == 2:
+            return self.net(z)  # (B, 1)
+        else:
+            raise ValueError(f"Expected 2D or 3D tensor, got shape {z.shape}")
 
 
 # ---------------------------------------------------------------------------
-# 2. Adversarial Autoencoder
+# 2. Adversarial Autoencoder Orchestrator
 # ---------------------------------------------------------------------------
 class AdversarialAutoencoder(nn.Module):
-    """Adversarial Autoencoder combining Encoder, Decoder, and Discriminator.
+    """Sequence-Aware Adversarial Autoencoder.
 
-    The encoder and decoder are **reused directly** from the vanilla AE (§4.1.3):
-    the adversarial component only adds a discriminator on the latent vector.
-
-    Parameters
-    ----------
-    input_dim : int, default=82
-        Number of sensor channels (features).
-    window_size : int, default=16
-        Number of consecutive timesteps per window (W).
-    latent_dim : int, default=16
-        Dimension of latent bottleneck vector z.
-    encoder_channels : tuple[int, int], default=(128, 64)
-        Conv channels in encoder (shared with AE).
-    encoder_kernels : tuple[int, int], default=(5, 3)
-        Conv kernel sizes in encoder.
-    pool_size : int, default=2
-        Pooling kernel size.
-    decoder_channels : tuple[int, int], default=(64, 128)
-        Conv channels in decoder (reverse of encoder).
-    activation : str, default="relu"
-        Activation in conv layers.
-    discriminator_hidden : tuple[int, ...], default=(32, 16)
-        Hidden layer widths of the discriminator MLP.
-    discriminator_activation : str, default="leaky_relu"
-        Activation in discriminator.
+    Combines ``Conv1dEncoder``, ``Conv1dDecoder``, and ``Discriminator``.
     """
 
     def __init__(
         self,
-        input_dim: int = 82,
-        window_size: int = 16,
+        input_dim: int = 86,
+        window_size: int = 256,
         latent_dim: int = 16,
-        encoder_channels: tuple[int, int] = (128, 64),
-        encoder_kernels: tuple[int, int] = (5, 3),
+        encoder_channels: tuple[int, int, int] = (64, 32, 16),
+        encoder_kernels: tuple[int, int, int] = (5, 3, 3),
         pool_size: int = 2,
-        decoder_channels: tuple[int, int] = (64, 128),
         activation: str = "relu",
         discriminator_hidden: tuple[int, ...] = (32, 16),
         discriminator_activation: str = "leaky_relu",
@@ -152,13 +138,19 @@ class AdversarialAutoencoder(nn.Module):
         self.input_dim = input_dim
         self.window_size = window_size
         self.latent_dim = latent_dim
+        self.encoder_channels = tuple(encoder_channels)
+        self.encoder_kernels = tuple(encoder_kernels)
+        self.pool_size = pool_size
+        self.activation = activation
+        self.discriminator_hidden = tuple(discriminator_hidden)
+        self.discriminator_activation = discriminator_activation
 
-        # --- Reused encoder + decoder from the vanilla AE ---
+        # --- Reused encoder + decoder from vanilla AE ---
         self.encoder = Conv1dEncoder(
             input_dim=input_dim,
             window_size=window_size,
-            conv_channels=encoder_channels,
-            conv_kernels=encoder_kernels,
+            conv_channels=self.encoder_channels,
+            conv_kernels=self.encoder_kernels,
             pool_size=pool_size,
             latent_dim=latent_dim,
             activation=activation,
@@ -167,44 +159,31 @@ class AdversarialAutoencoder(nn.Module):
             latent_dim=latent_dim,
             input_dim=input_dim,
             window_size=window_size,
-            conv_channels=decoder_channels,
+            encoder_channels=self.encoder_channels,
+            pool_size=pool_size,
             activation=activation,
         )
 
-        # --- Adversarial discriminator (new component) ---
+        # --- Adversarial discriminator ---
         self.discriminator = Discriminator(
             latent_dim=latent_dim,
-            hidden_layers=discriminator_hidden,
+            hidden_layers=self.discriminator_hidden,
             activation=discriminator_activation,
-            use_sigmoid=True,  # BCELoss expects probabilities
+            use_sigmoid=True,
         )
 
-    # ------------------------------------------------------------------
-    # Forward / encode / decode (mirror SequenceAutoencoder API)
-    # ------------------------------------------------------------------
     def _format_input(self, x: torch.Tensor) -> tuple[torch.Tensor, bool]:
-        """Verify and standardise input shape to ``(B, input_dim, W)``.
-
-        Accepts both ``(B, input_dim, W)`` and ``(B, W, input_dim)``.
-        Returns the formatted tensor and a flag indicating whether a
-        transpose is needed on the way out.
-        """
         if x.ndim != 3:
             raise ValueError(
-                f"Expected 3-D tensor (B, W, D) or (B, D, W), got ndim={x.ndim} "
-                f"with shape {x.shape}"
+                f"Expected 3-D tensor (B, W, D) or (B, D, W), got ndim={x.ndim} with shape {x.shape}"
             )
         _, d1, d2 = x.shape
-        # Case 1: already (B, input_dim, W)
         if d1 == self.input_dim and d2 == self.window_size:
             return x, False
-        # Case 2: sequence layout (B, W, input_dim) from DataLoader
         if d1 == self.window_size and d2 == self.input_dim:
             return x.transpose(1, 2), True
-        # Case 3: flexible W if d1 == input_dim
         if d1 == self.input_dim:
             return x, False
-        # Case 4: flexible W if d2 == input_dim
         if d2 == self.input_dim:
             return x.transpose(1, 2), True
         raise ValueError(
@@ -213,20 +192,16 @@ class AdversarialAutoencoder(nn.Module):
         )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode sequence to latent vector z (same API as ``SequenceAutoencoder``)."""
+        """Encode sequence to latent representation z."""
         x_conv, _ = self._format_input(x)
         return self.encoder(x_conv)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode latent vector z to reconstructed sequence ``(B, input_dim, W)``."""
+        """Decode latent representation z to reconstructed sequence."""
         return self.decoder(z)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """End-to-end adversarial autoencoder forward pass.
-
-        Reconstructs the input sequence (preserving caller layout).
-        Does **not** apply the discriminator; use :meth:`discriminate` for that.
-        """
+        """End-to-end forward pass (reconstruction). Preserves input layout."""
         x_conv, was_transposed = self._format_input(x)
         z = self.encoder(x_conv)
         x_hat = self.decoder(z)
@@ -235,39 +210,26 @@ class AdversarialAutoencoder(nn.Module):
         return x_hat
 
     def discriminate(self, z: torch.Tensor) -> torch.Tensor:
-        """Run the discriminator on latent vectors.
-
-        Parameters
-        ----------
-        z : torch.Tensor
-            Latent vectors of shape ``(B, latent_dim)``.
-
-        Returns
-        -------
-        torch.Tensor
-            Probabilities of shape ``(B, 1)``.
-        """
+        """Run discriminator on latent representations."""
         return self.discriminator(z)
 
     def compute_reconstruction_error(
         self,
         x: torch.Tensor,
         reduction: Literal["none", "mean", "sample"] = "sample",
-        metric: Literal["mse", "mae"] = "mse",
+        metric: Literal["mse", "mae"] = "mae",
     ) -> torch.Tensor:
-        """Compute per-sample reconstruction error (identical to vanilla AE).
-
-        The anomaly score for AAE is still reconstruction error; the adversarial
-        component regularises the latent space **during training** but does not
-        change the inference-time scoring.
-        """
+        """Compute per-sample reconstruction error (same API as vanilla AE)."""
         with torch.no_grad():
             x_hat = self.forward(x)
 
+        x_orig, _ = self._format_input(x)
+        x_rec, _ = self._format_input(x_hat)
+
         if metric == "mse":
-            diff = (x - x_hat) ** 2
+            diff = (x_orig - x_rec) ** 2
         elif metric == "mae":
-            diff = torch.abs(x - x_hat)
+            diff = torch.abs(x_orig - x_rec)
         else:
             raise ValueError(f"Unsupported metric: '{metric}', must be 'mse' or 'mae'")
 
@@ -278,31 +240,22 @@ class AdversarialAutoencoder(nn.Module):
         if reduction == "sample":
             dims = tuple(range(1, diff.ndim))
             return diff.mean(dim=dims)
-        raise ValueError(
-            f"Unsupported reduction: '{reduction}', must be 'none', 'mean', or 'sample'"
-        )
+        raise ValueError(f"Unsupported reduction: '{reduction}'")
 
-    # ------------------------------------------------------------------
-    # Config-driven factory
-    # ------------------------------------------------------------------
     @classmethod
     def from_config(cls, config: dict[str, Any] | None = None) -> AdversarialAutoencoder:
-        """Instantiate an ``AdversarialAutoencoder`` from a config dictionary.
-
-        Mirrors ``SequenceAutoencoder.from_config`` so that the same
-        ``params.yaml`` layout is used for both models.
-        """
+        """Instantiate an AdversarialAutoencoder from config dictionary."""
         if config is None:
             config = load_config()
 
-        input_dim = int(get_param(config, "model.input_dim", 82))
-        window_size = int(get_param(config, "model.window_size", 16))
+        runtime_params = SequenceAutoencoder._discover_runtime_params(config)
+        input_dim = int(runtime_params.get("input_dim", get_param(config, "model.input_dim", 86)))
+        window_size = int(get_param(config, "data.window_size", 256))
         latent_dim = int(get_param(config, "model.latent_dim", 16))
 
-        enc_channels = tuple(get_param(config, "model.encoder.conv_channels", [128, 64]))
-        enc_kernels = tuple(get_param(config, "model.encoder.conv_kernels", [5, 3]))
+        enc_channels = tuple(get_param(config, "model.encoder.conv_channels", [64, 32, 16]))
+        enc_kernels = tuple(get_param(config, "model.encoder.conv_kernels", [5, 3, 3]))
         pool_size = int(get_param(config, "model.encoder.pool_size", 2))
-        dec_channels = tuple(get_param(config, "model.decoder.conv_channels", [64, 128]))
         activation = str(get_param(config, "model.encoder.activation", "relu"))
 
         disc_hidden = tuple(
@@ -317,7 +270,6 @@ class AdversarialAutoencoder(nn.Module):
             encoder_channels=enc_channels,
             encoder_kernels=enc_kernels,
             pool_size=pool_size,
-            decoder_channels=dec_channels,
             activation=activation,
             discriminator_hidden=disc_hidden,
             discriminator_activation=disc_act,
@@ -325,14 +277,7 @@ class AdversarialAutoencoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 3. Early Stopping (re-exported from autoencoder for API parity)
-# ---------------------------------------------------------------------------
-# Reuse the same EarlyStopping from autoencoder — single source of truth.
-from src.models.autoencoder import EarlyStopping  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# 4. AAE Training Utilities
+# 3. Training Loop
 # ---------------------------------------------------------------------------
 def train_epoch_aae(
     model: AdversarialAutoencoder,
@@ -343,36 +288,9 @@ def train_epoch_aae(
     reconstruction_weight: float = 1.0,
     adversarial_weight: float = 0.1,
     discriminator_updates_per_gen: int = 1,
-    metric: str = "mse",
+    metric: Literal["mse", "mae"] = "mae",
 ) -> tuple[float, float, float]:
-    """Train the AAE for one epoch with alternating discriminator/generator updates.
-
-    Parameters
-    ----------
-    model : AdversarialAutoencoder
-        The AAE model (encoder + decoder + discriminator).
-    dataloader : DataLoader
-        Provides batches of ``(window, label)`` — only the window is used.
-    optimizer_ae : torch.optim.Optimizer
-        Optimizer for encoder + decoder parameters.
-    optimizer_disc : torch.optim.Optimizer
-        Optimizer for discriminator parameters (separate optimizer).
-    device : torch.device
-        Hardware device.
-    reconstruction_weight : float
-        Weight for the MSE/MAE reconstruction loss.
-    adversarial_weight : float
-        Weight for the adversarial (generator fooling) loss.
-    discriminator_updates_per_gen : int
-        Number of discriminator updates per one generator (encoder+decoder) update.
-    metric : {"mse", "mae"}
-        Reconstruction metric.
-
-    Returns
-    -------
-    tuple[float, float, float]
-        ``(avg_total_loss, avg_recon_loss, avg_adv_loss)`` over the epoch.
-    """
+    """Train AAE for one epoch with alternating Phase D and Phase G updates."""
     model.train()
     total_loss = 0.0
     total_recon_loss = 0.0
@@ -380,38 +298,30 @@ def train_epoch_aae(
     total_samples = 0
 
     bce = nn.BCELoss()
-    mse_loss = nn.MSELoss()
-    mae_loss = nn.L1Loss()
-    rec_criterion = mse_loss if metric == "mse" else mae_loss
-
-    latent_dim = model.latent_dim
+    rec_criterion = nn.L1Loss() if metric == "mae" else nn.MSELoss()
 
     for batch in dataloader:
         x = batch[0] if isinstance(batch, (list, tuple)) else batch
         x = x.to(device)
         bs = x.size(0)
 
-        # --- Format input to (B, input_dim, W) for Conv1d ---
         x_conv, _ = model._format_input(x)
 
-        # ==================================================================
-        # Phase 1 — Update Discriminator  D(x): maximize
-        #           log D(z_prior) + log(1 − D(E(x)))
-        # Repeated ``discriminator_updates_per_gen`` times per generator update.
-        # ==================================================================
+        # ------------------------------------------------------------------
+        # Phase 1: Discriminator updates
+        # ------------------------------------------------------------------
         for _ in range(discriminator_updates_per_gen):
             optimizer_disc.zero_grad()
 
-            # Real samples from prior
-            z_prior = torch.randn(bs, latent_dim, device=device)
-            d_real = model.discriminate(z_prior)
-
-            # Fake samples from encoder (detach so gradients don't flow to encoder)
             with torch.no_grad():
                 z_encoded = model.encode(x)
+
+            # Sample prior with matching shape
+            z_prior = torch.randn_like(z_encoded)
+
+            d_real = model.discriminate(z_prior)
             d_fake = model.discriminate(z_encoded)
 
-            # BCE for discriminator: real → 1, fake → 0
             loss_d_real = bce(d_real, torch.ones_like(d_real))
             loss_d_fake = bce(d_fake, torch.zeros_like(d_fake))
             loss_disc = (loss_d_real + loss_d_fake) / 2.0
@@ -419,26 +329,22 @@ def train_epoch_aae(
             loss_disc.backward()
             optimizer_disc.step()
 
-        # ==================================================================
-        # Phase 2 — Update Generator (encoder + decoder)  G(z): minimize
-        #           λ_rec · recon(x, x̂) + λ_adv · E[-log D(E(x))]   (non-saturating)
-        # ==================================================================
+        # ------------------------------------------------------------------
+        # Phase 2: Generator (Encoder + Decoder) update
+        # ------------------------------------------------------------------
         optimizer_ae.zero_grad()
 
         z = model.encode(x)
         x_hat = model.decode(z)
-        d_fake_new = model.discriminate(z)  # recompute with updated z (no grad to D here)
+        d_fake_new = model.discriminate(z)
 
         loss_recon = rec_criterion(x_hat, x_conv)
-        # Generator wants D to think encoded z is real → target = 1
         loss_adv = bce(d_fake_new, torch.ones_like(d_fake_new))
 
         loss_ae = reconstruction_weight * loss_recon + adversarial_weight * loss_adv
-
         loss_ae.backward()
         optimizer_ae.step()
 
-        # Accumulate stats
         total_loss += loss_ae.item() * bs
         total_recon_loss += loss_recon.item() * bs
         total_adv_loss += loss_adv.item() * bs
@@ -450,31 +356,30 @@ def train_epoch_aae(
     return avg_total, avg_recon, avg_adv
 
 
-def evaluate_epoch_aae(
+def validate_aae(
     model: AdversarialAutoencoder,
     dataloader: DataLoader,
     device: torch.device,
-    metric: str = "mse",
+    metric: Literal["mse", "mae"] = "mae",
 ) -> float:
-    """Evaluate reconstruction loss on validation data (no discriminator needed)."""
+    """Compute validation reconstruction loss (normal windows only)."""
     model.eval()
-    running_loss = 0.0
+    total_loss = 0.0
     total_samples = 0
-
-    rec_criterion = nn.MSELoss() if metric == "mse" else nn.L1Loss()
+    criterion = nn.L1Loss() if metric == "mae" else nn.MSELoss()
 
     with torch.no_grad():
         for batch in dataloader:
             x = batch[0] if isinstance(batch, (list, tuple)) else batch
             x = x.to(device)
+            bs = x.size(0)
             x_conv, _ = model._format_input(x)
-            x_hat = model(x)
-            x_hat_conv, _ = model._format_input(x_hat)
-            loss = rec_criterion(x_hat_conv, x_conv)
-            running_loss += loss.item() * x.size(0)
-            total_samples += x.size(0)
+            x_hat = model.decode(model.encode(x))
+            loss = criterion(x_hat, x_conv)
+            total_loss += loss.item() * bs
+            total_samples += bs
 
-    return running_loss / max(1, total_samples)
+    return total_loss / max(1, total_samples)
 
 
 def fit_aae(
@@ -490,56 +395,21 @@ def fit_aae(
     patience: int = 10,
     min_delta: float = 1e-4,
     checkpoint_path: str | Path | None = None,
-    device: str | torch.device = "cuda" if torch.cuda.is_available() else "cpu",
-    metric: str = "mse",
+    device: str | torch.device | None = None,
+    metric: Literal["mse", "mae"] = "mae",
 ) -> dict[str, list[float]]:
-    """Complete training loop for the AdversarialAutoencoder.
-
-    Uses **separate optimizers**: one for encoder+decoder (generator), one for
-    the discriminator.  Uses standard BCELoss for the adversarial objective.
-
-    Parameters
-    ----------
-    model : AdversarialAutoencoder
-    train_loader, val_loader : DataLoader
-    epochs : int
-        Maximum training epochs.
-    learning_rate : float
-    weight_decay : float
-    reconstruction_weight : float
-        Weight for MSE/MAE reconstruction loss.
-    adversarial_weight : float
-        Weight for adversarial (generator fooling) loss.
-    discriminator_updates_per_gen : int
-        Discriminator updates per encoder-decoder update.
-    patience : int
-        Early stopping patience on validation reconstruction loss.
-    min_delta : float
-        Minimum improvement for early stopping.
-    checkpoint_path : str | Path | None
-    device : str | torch.device
-    metric : {"mse", "mae"}
-
-    Returns
-    -------
-    dict[str, list[float]]
-        History with ``train_loss``, ``val_loss``, ``recon_loss``, ``adv_loss``.
-    """
+    """Complete AAE training loop with early stopping."""
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     dev = torch.device(device)
     model.to(dev)
 
-    # --- Separate optimizers ---
-    ae_params = list(model.encoder.parameters()) + list(model.decoder.parameters())
-    disc_params = list(model.discriminator.parameters())
-
-    optimizer_ae = torch.optim.Adam(
-        ae_params, lr=learning_rate, weight_decay=weight_decay, betas=(0.5, 0.999)
-    )
-    optimizer_disc = torch.optim.Adam(
-        disc_params, lr=learning_rate, weight_decay=weight_decay, betas=(0.5, 0.999)
-    )
-
+    from src.models.autoencoder import EarlyStopping
     early_stopping = EarlyStopping(patience=patience, min_delta=min_delta)
+
+    ae_params = list(model.encoder.parameters()) + list(model.decoder.parameters())
+    optimizer_ae = torch.optim.Adam(ae_params, lr=learning_rate, weight_decay=weight_decay)
+    optimizer_disc = torch.optim.Adam(model.discriminator.parameters(), lr=learning_rate, betas=(0.5, 0.999))
 
     history: dict[str, list[float]] = {
         "train_loss": [],
@@ -548,10 +418,12 @@ def fit_aae(
         "adv_loss": [],
     }
 
-    logger.info("Starting AdversarialAutoencoder training on %s (%d epochs)", dev, epochs)
+    ckpt_path = Path(checkpoint_path) if checkpoint_path else None
+    if ckpt_path:
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, epochs + 1):
-        train_loss, recon_loss, adv_loss = train_epoch_aae(
+        tr_total, tr_recon, tr_adv = train_epoch_aae(
             model=model,
             dataloader=train_loader,
             optimizer_ae=optimizer_ae,
@@ -562,44 +434,32 @@ def fit_aae(
             discriminator_updates_per_gen=discriminator_updates_per_gen,
             metric=metric,
         )
-        val_loss = evaluate_epoch_aae(model, val_loader, dev, metric=metric)
+        val_loss = validate_aae(model, val_loader, dev, metric=metric)
 
-        history["train_loss"].append(train_loss)
+        history["train_loss"].append(tr_total)
+        history["recon_loss"].append(tr_recon)
+        history["adv_loss"].append(tr_adv)
         history["val_loss"].append(val_loss)
-        history["recon_loss"].append(recon_loss)
-        history["adv_loss"].append(adv_loss)
-
-        if epoch % 5 == 0 or epoch == 1:
-            logger.info(
-                "Epoch %3d/%3d — Train Loss: %.6f — Val Loss: %.6f "
-                "(recon=%.4f adv=%.4f)",
-                epoch, epochs, train_loss, val_loss, recon_loss, adv_loss,
-            )
 
         if early_stopping(val_loss, model):
-            logger.info(
-                "Early stopping triggered at epoch %d",
-                epoch,
-            )
+            logger.info("Early stopping triggered at epoch %d", epoch)
             break
 
-    # Restore best checkpoint weights
-    early_stopping.restore_best_weights(model)
+    # Restore best weights
+    if early_stopping.best_state is not None:
+        model.load_state_dict(early_stopping.best_state)
 
-    if checkpoint_path is not None:
-        ckpt = Path(checkpoint_path)
-        ckpt.parent.mkdir(parents=True, exist_ok=True)
+    if ckpt_path:
+        best_val_loss = -early_stopping.best_score if early_stopping.best_score is not None else float("inf")
         torch.save(
             {
                 "model_state_dict": model.state_dict(),
                 "history": history,
-                "input_dim": model.input_dim,
-                "window_size": model.window_size,
-                "latent_dim": model.latent_dim,
-                "discriminator_hidden": list(model.discriminator.hidden_layers),
+                "best_epoch": early_stopping.best_epoch,
+                "best_val_loss": best_val_loss,
             },
-            ckpt,
+            ckpt_path,
         )
-        logger.info("Saved best AAE checkpoint to %s", ckpt)
+        logger.info("Saved AAE checkpoint to %s", ckpt_path)
 
     return history
