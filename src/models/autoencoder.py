@@ -616,5 +616,6 @@ class SequenceAutoencoder(nn.Module):
         )
 
 
-# Re-export EarlyStopping for backward compatibility
+# Re-export EarlyStopping and compute_errors_on_loader for backward compatibility
 from src.models.training import EarlyStopping  # noqa: F401
+from src.models.inference import compute_errors_on_loader  # noqa: F401

@@ -23,7 +23,7 @@ import numpy as np
 import torch
 
 from src.data.dataset import build_dataloaders
-from src.models.autoencoder import compute_errors_on_loader
+from src.models.inference import compute_errors_on_loader
 from src.models.adversarial_ae import AdversarialAutoencoder, fit_aae
 from src.utils.config import get_param
 from src.evaluation.metrics import calculate_auc
