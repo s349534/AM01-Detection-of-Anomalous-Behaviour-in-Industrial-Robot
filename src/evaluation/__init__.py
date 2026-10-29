@@ -16,7 +16,7 @@ from .metrics import (
     compute_anomaly_scores,
     evaluate_threshold,
 )
-from src.models.autoencoder import compute_errors_on_loader
+from src.models.inference import compute_errors_on_loader
 
 __all__ = [
     "evaluate_model",

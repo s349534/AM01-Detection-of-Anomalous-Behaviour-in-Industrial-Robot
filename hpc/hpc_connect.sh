@@ -236,12 +236,17 @@ code_fingerprint() {
 }
 
 # ── Upload the whole project (idempotent: rsync, excludes large/secret) ──────
-#   usage:  ./hpc_connect.sh upload-project [--dry-run]
+#   usage:  ./hpc_connect.sh upload-project [--dry-run] [--clean]
+#     --clean: also delete remote files that don't exist locally (--delete)
 cmd_upload_project() {
     local target
     target=$(ssh_target)
     local dry=0
-    [[ "${1:-}" == "--dry-run" ]] && dry=1
+    local clean=0
+    for arg in "$@"; do
+        [[ "${arg}" == "--dry-run" ]] && dry=1
+        [[ "${arg}" == "--clean" ]] && clean=1
+    done
     echo "Uploading project -> ${target}:${PROJECT_DIR_REMOTE}/"
     echo "Local source: ${PROJECT_ROOT}"
     if [[ "$dry" == "1" ]]; then
@@ -258,7 +263,9 @@ cmd_upload_project() {
     # expand ~ inside single quotes).
     ssh_run "$(ssh_target)" "mkdir -p ${PROJECT_DIR_REMOTE}"
     if command -v rsync >/dev/null 2>&1; then
-        rsync -avz -e "ssh ${SSH_OPTS}" "${RSYNC_EXCLUDES[@]}" "${PROJECT_ROOT}/" "${target}:${PROJECT_DIR_REMOTE}"
+        local delete_flag=()
+        [[ "$clean" == "1" ]] && delete_flag=(--delete)
+        rsync -avz -e "ssh ${SSH_OPTS}" "${delete_flag[@]}" "${RSYNC_EXCLUDES[@]}" "${PROJECT_ROOT}/" "${target}:${PROJECT_DIR_REMOTE}"
 
         # ── Code-only sync with --checksum (content-based) ──────────────────
         # Guarantees the HPC runs byte-identical sources even if the quick
@@ -311,10 +318,18 @@ cmd_upload_project() {
 # ── Full deploy: upload + one-shot environment setup ──────────────────────────
 #   usage:  ./hpc_connect.sh deploy            # [--dry-run] -> dry-run the upload only
 #           ./hpc_connect.sh deploy --dry-run  # show what would be uploaded + setup
+#           ./hpc_connect.sh deploy --clean    # also delete remote files not in local
 cmd_deploy() {
     local dry=0
-    [[ "${1:-}" == "--dry-run" ]] && dry=1
-    cmd_upload_project $([[ "$dry" == "1" ]] && echo "--dry-run")
+    local clean=0
+    for arg in "$@"; do
+        [[ "${arg}" == "--dry-run" ]] && dry=1
+        [[ "${arg}" == "--clean" ]] && clean=1
+    done
+    local upload_args=()
+    [[ "$dry" == "1" ]] && upload_args+=("--dry-run")
+    [[ "$clean" == "1" ]] && upload_args+=("--clean")
+    cmd_upload_project "${upload_args[@]}"
     if [[ "$dry" == "1" ]]; then
         echo "[dry-run] would then run setup_env.sh on the HPC (install uv, uv sync --frozen, register kernel)."
         return 0
@@ -333,17 +348,20 @@ cmd_deploy() {
 # ── Batch: deploy + submit + stream log + fetch results ──────────────────────
 #   usage:  ./hpc_connect.sh batch <slurm_script>
 #           ./hpc_connect.sh batch --dry-run <slurm_script>   # preview only
-#
-#   After submitting, streams the unified log (stdout+stderr) live via tail -f.
-#   Ctrl-C detaches the stream — the job keeps running on SLURM. When the job
-#   finishes, results (data/processed/*.npy, *.pkl) and the latest log are
-#   downloaded to the local project directory automatically.
+#           ./hpc_connect.sh batch --clean <slurm_script>     # clean remote before deploy
 cmd_batch() {
     local dry=0
+    local clean=0
     local script
-    if [[ "${1:-}" == "--dry-run" ]]; then dry=1; shift; fi
-    script="$1"
-    [[ -n "${script}" ]] || { echo "ERROR: usage: ./hpc_connect.sh batch [--dry-run] <slurm_script>"; exit 1; }
+    # Parse flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) dry=1; shift ;;
+            --clean) clean=1; shift ;;
+            *) script="$1"; shift; break ;;
+        esac
+    done
+    [[ -n "${script:-}" ]] || { echo "ERROR: usage: ./hpc_connect.sh batch [--dry-run] [--clean] <slurm_script>"; exit 1; }
 
     # Resolve absolute path to the SLURM script BEFORE any directory change
     local basename_script abs_script
@@ -361,7 +379,10 @@ cmd_batch() {
         return 1
     fi
 
-    cmd_deploy $([[ "$dry" == "1" ]] && echo "--dry-run")
+    local deploy_args=()
+    [[ "$dry" == "1" ]] && deploy_args+=("--dry-run")
+    [[ "$clean" == "1" ]] && deploy_args+=("--clean")
+    cmd_deploy "${deploy_args[@]}"
     [[ "$dry" == "1" ]] && { echo "[dry-run] would then submit ${script} (via upload+sbatch)."; return 0; }
 
     echo ""
@@ -479,7 +500,7 @@ EOFSRIPT
           "${PROJECT_ROOT}/reports/checkpoints/aae_final.pth" 2>/dev/null || true
 
     if command -v rsync >/dev/null 2>&1; then
-        rsync -av --progress \
+        rsync -av --progress --delete \
             "$(ssh_target):~/am01_project/data/processed/" \
             "${PROJECT_ROOT}/data/processed/" 2>/dev/null || true
 
@@ -498,7 +519,7 @@ EOFSRIPT
         scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
             "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null \
             && echo "Validated AE params → ${PROJECT_ROOT}/config/params_validated_ae.yaml" \
-            || echo "NOTE: params_validated_ae.yaml non trovato sul remoto"
+            || true
         scp "$(ssh_target):~/am01_project/config/params_validated_aae.yaml" \
             "${PROJECT_ROOT}/config/params_validated_aae.yaml" 2>/dev/null \
             && echo "Validated AAE params → ${PROJECT_ROOT}/config/params_validated_aae.yaml" \
@@ -506,23 +527,25 @@ EOFSRIPT
     else
         # Fallback: scp individual files (no rsync → no --delete, so we must
         # proactively remove stale files above and overwrite unconditionally)
-        for f in normal_scaled.npy slow_scaled.npy \
-                     plan_train.npy plan_val_normal.npy plan_val_anomaly.npy plan_test_normal.npy plan_test_anomaly.npy \
-                     scaler.pkl selected_columns.npy manifest.json; do
+        for f in normal_train.npy normal_val.npy anomaly_val.npy normal_test.npy anomaly_test.npy \
+                     scaler.pkl selected_columns.npy manifest.json stats.json; do
             scp "$(ssh_target):~/am01_project/data/processed/${f}" \
-                "${PROJECT_ROOT}/data/processed/" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/data/processed/${f}" || true
+                "${PROJECT_ROOT}/data/processed/" 2>/dev/null || true
         done
         # CSV results — fetch whatever exists on the remote
         for f in validation_results_ae.csv ae_final_metrics.csv ae_test_metrics.csv \
                  validation_results_aae.csv aae_final_metrics.csv; do
             scp "$(ssh_target):~/am01_project/reports/tables/${f}" \
-                "${PROJECT_ROOT}/reports/tables/" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/reports/tables/${f}" || true
+                "${PROJECT_ROOT}/reports/tables/" 2>/dev/null || true
         done
         # Checkpoints
         for f in ae_baseline.pth ae_baseline_seed*.pth aae_final.pth; do
             scp "$(ssh_target):~/am01_project/reports/checkpoints/${f}" \
-                "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/reports/checkpoints/${f}" || true
+                "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null || true
         done
+        # Figures
+        scp -r "$(ssh_target):~/am01_project/reports/figures/" \
+            "${PROJECT_ROOT}/reports/figures/" 2>/dev/null || true
         # Validated params
         scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
             "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/config/params_validated_ae.yaml" || true
@@ -537,9 +560,6 @@ EOFSRIPT
     latest_log=$(ssh_run "$(ssh_target)" "ls -t ~/jobs/logs/am01_*_${jid}.log ~/am01_project/logs/am01_*_${jid}.log 2>/dev/null | head -1")
     if [[ -n "${latest_log}" ]]; then
         scp "$(ssh_target):${latest_log}" "${PROJECT_ROOT}/logs/" 2>/dev/null || true
-        echo "Log downloaded → ${PROJECT_ROOT}/logs/$(basename "${latest_log}")"
-    else
-        echo "WARNING: No log file found for job ${jid} on remote (checked ~/jobs/logs/ and ~/am01_project/logs/)"
     fi
 
     echo ""
@@ -559,11 +579,11 @@ Usage:
   ./hpc_connect.sh interactive [partition] [walltime]       Interactive SLURM session
   ./hpc_connect.sh scratch                                  Compute node w/ BeeGFS access
   ./hpc_connect.sh upload <local_path> <remote_path>        Upload files to HPC
-  ./hpc_connect.sh upload-project                           rsync entire project to HPC
+  ./hpc_connect.sh upload-project [--clean]                 rsync entire project to HPC (--clean: delete remote files not in local)
   ./hpc_connect.sh download <remote_path> <local_path>      Download files from HPC
   ./hpc_connect.sh submit <slurm_script.sh>                 Submit SLURM batch job
-  ./hpc_connect.sh deploy                                   Upload-project + one-shot setup
-  ./hpc_connect.sh batch <slurm_script.sh>                Deploy + submit + stream log + fetch results
+  ./hpc_connect.sh deploy [--clean]                         Upload-project + one-shot setup
+  ./hpc_connect.sh batch [--clean] <slurm_script.sh>        Deploy + submit + stream log + fetch results
 
 Examples:
   ./hpc_connect.sh check
@@ -573,7 +593,9 @@ Examples:
   ./hpc_connect.sh upload data/ ~/jobs/data/
   ./hpc_connect.sh download ~/results/ ./local_results/
   ./hpc_connect.sh deploy
+  ./hpc_connect.sh deploy --clean
   ./hpc_connect.sh batch hpc/slurm_job_template.sh
+  ./hpc_connect.sh batch --clean hpc/slurm_job_template.sh
 
 Environment:
   HPC_USER           SSH username (default: mungolo)

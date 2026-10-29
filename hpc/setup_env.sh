@@ -98,25 +98,22 @@ echo "--- Syncing project dependencies (frozen lockfile) ---"
 # root (`python -m src...`), it does not need to be installed in the venv.
 # Installing it would build it with setuptools, which must be DOWNLOADED from
 # PyPI — that fails on the cluster (no PyPI access, connection timeout).
-uv sync --frozen --no-install-project
+uv sync --frozen --no-install-project -q
 # Re-export pinned requirements.txt for any pip-based fallback
-uv export --no-dev --no-hashes -o requirements.txt 2>/dev/null || true
+uv export --no-dev --no-hashes -o requirements.txt -q 2>/dev/null || true
 
 # ── Step 5: Register Jupyter kernel ─────────────────────────────────────────
 echo ""
 echo "--- Registering Jupyter kernel ---"
-uv run python -m ipykernel install --user --name "am01-hpc" --display-name "AM01 (HPC)"
+uv run -q python -m ipykernel install --user --name "am01-hpc" --display-name "AM01 (HPC)"
 echo "Jupyter kernel 'am01-hpc' registered."
 
 # ── Step 6: Verify ──────────────────────────────────────────────────────────
 echo ""
 echo "--- Verification ---"
-uv run python -c "
+uv run -q python -c "
 import numpy, pandas, sklearn, torch
-print(f'numpy={numpy.__version__}')
-print(f'pandas={pandas.__version__}')
-print(f'sklearn={sklearn.__version__}')
-print(f'torch={torch.__version__}')
+print(f'numpy={numpy.__version__} pandas={pandas.__version__} sklearn={sklearn.__version__} torch={torch.__version__}')
 from src.data import dataset, preprocessing
 from src.models import autoencoder
 print('All project modules import successfully!')

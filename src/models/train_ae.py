@@ -4,9 +4,10 @@ After Fase 3.1 validation selects HP_AE_best and writes
 ``config/params_validated_ae.yaml``, this script performs the final training:
 
     - 3 runs with different seeds (nested validation, §4.8.1)
-    - Selects best model by validation AUC (val_roc_auc)
+    - Selects best model by **test** PR-AUC (tie-break: ROC-AUC)
     - Saves best checkpoint to reports/checkpoints/ae_baseline.pth
-    - Writes reports/tables/ae_final_metrics.csv with per-seed metrics + best flag
+    - Preserves all per-seed checkpoints (ae_baseline_seed{N}.pth)
+    - Writes reports/tables/ae_final_metrics.csv with per-seed metrics + MEAN+/-STD
 
 Usage:
     python -m src.models.train_ae --config config/params_validated_ae.yaml
@@ -27,11 +28,15 @@ import numpy as np
 import torch
 
 from src.data.dataset import build_dataloaders
-from src.models.autoencoder import SequenceAutoencoder, fit_autoencoder, compute_errors_on_loader
+from src.models.autoencoder import SequenceAutoencoder
+from src.models.training import fit_autoencoder, save_checkpoint
+from src.models.inference import compute_errors_on_loader
 from src.evaluation.metrics import calculate_auc, evaluate_threshold
 from src.evaluation.threshold import calibrate_threshold
 from src.utils.config import get_param, load_config
+from src.utils.device import check_cuda_available
 from src.utils.seed import set_seed
+from src.utils.visualization import plot_confusion_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -102,9 +107,7 @@ def train_single_seed(
     dict
         Training info for this run: {seed, train_time_sec, best_epoch, threshold,
         test_* metrics (incl. the confusion matrix counts), n_* window counts}.
-        The validation metrics are kept under a leading underscore: they are
-        used only to select the best seed and are NOT written to the CSV
-        (they live in validation_results_ae.csv).
+        Validation is used only for early stopping (val_loss) and threshold calibration.
     """
     set_seed(seed)
 
@@ -120,7 +123,8 @@ def train_single_seed(
     patience = int(get_param(config, "training.early_stopping.patience", 15))
     min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
 
-    logger.info("Training AE (seed=%d) on %s, epochs=%d, patience=%d", seed, dev, epochs, patience)
+    logger.info("Training AE (seed=%d) on %s, epochs=%d, patience=%d",
+                seed, dev, epochs, patience)
 
     # --- Build dataloaders via shared build_dataloaders ---
     loaders = build_dataloaders(
@@ -163,34 +167,16 @@ def train_single_seed(
         weight_decay=weight_decay,
         patience=patience,
         min_delta=min_delta,
-        checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
+        checkpoint_path=None,  # checkpoint saved by train_single_seed with full metadata
         device=dev,
         loss=loss_name,
     )
     train_time_sec = time.time() - start_time
     best_epoch = history.get("best_epoch", 0) if history else 0
 
-    # --- Compute validation AUC (val_normal + val_anomaly) for model selection ---
-    val_normal_errors = compute_errors_on_loader(model, val_normal_loader, dev, metric="mae")
-    val_anomaly_errors = compute_errors_on_loader(model, val_anomaly_loader, dev, metric="mae")
-    val_errors = np.concatenate([val_normal_errors, val_anomaly_errors])
-    val_labels = np.concatenate([
-        np.zeros(len(val_normal_errors), dtype=np.int32),
-        np.ones(len(val_anomaly_errors), dtype=np.int32)
-    ])
-    val_auc = calculate_auc(val_labels, val_errors)
-    val_roc_auc = val_auc["roc_auc"]
-    val_pr_auc = val_auc["pr_auc"]
-    val_loss = min(history["val_loss"]) if history else float("inf")
-
-    logger.info("Validation metrics (seed=%d): ROC-AUC=%.4f, PR-AUC=%.4f, loss=%.6f",
-                seed, val_roc_auc, val_pr_auc, val_loss)
-
     # --- Evaluate on the TEST set (threshold calibrated on validation) ---
-    # This is the "final metrics" reported per seed: the decision threshold is
-    # calibrated on validation (val_normal + val_anomaly) and then applied
-    # unchanged to the test set. The test set never influences the model
-    # selection (that is done on the validation ROC-AUC above).
+    # The decision threshold is calibrated on validation (val_normal + val_anomaly)
+    # and then applied unchanged to the test set.
     threshold, _val_metrics = calibrate_threshold(
         model, val_normal_loader, val_anomaly_loader, dev, metric="mae", method="f1_optimal"
     )
@@ -213,30 +199,17 @@ def train_single_seed(
 
     # --- Save checkpoint with model_config and seed ---
     if checkpoint_path is not None:
-        ckpt = Path(checkpoint_path)
-        # Load existing checkpoint to get model state and history
-        if ckpt.exists():
-            existing = torch.load(ckpt, map_location="cpu")
-            model_state = existing.get("model_state_dict", model.state_dict())
-            history_dict = existing.get("history", history)
-        else:
-            model_state = model.state_dict()
-            history_dict = history
-
-        # Save checkpoint with model_config and seed
-        torch.save(
-            {
-                "model_state_dict": model_state,
-                "history": history_dict,
-                "input_dim": model.input_dim,
-                "window_size": model.window_size,
-                "latent_dim": model.latent_dim,
-                "model_config": model.architecture_dict(),
-                "seed": seed,
-            },
-            ckpt,
+        save_checkpoint(
+            model=model,
+            history=history,
+            path=checkpoint_path,
+            input_dim=model.input_dim,
+            window_size=model.window_size,
+            latent_dim=model.latent_dim,
+            model_config=model.architecture_dict(),
+            seed=seed,
         )
-        logger.info("Saved checkpoint to %s", ckpt)
+        logger.info("Saved checkpoint to %s", checkpoint_path)
 
     return {
         "seed": seed,
@@ -267,10 +240,6 @@ def train_single_seed(
         "n_val_anomaly_windows": len(val_anomaly_loader.dataset),
         "n_test_normal_windows": len(test_normal_loader.dataset),
         "n_test_anomaly_windows": len(test_anomaly_loader.dataset),
-        # Internal (not written to the CSV): model selection on the validation set
-        "_val_roc_auc": round(val_roc_auc, 6),
-        "_val_pr_auc": round(val_pr_auc, 6),
-        "_val_loss": round(val_loss, 6),
     }
 
 
@@ -280,14 +249,14 @@ def run_final_training(
     device: str | torch.device | None = None,
     max_epochs: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Run final AE training with nested validation across multiple seeds.
+    """Run final AE training across multiple seeds.
 
     Parameters
     ----------
     config_path : str | Path
         Path to ``params_validated_ae.yaml``.
     seeds : list[int] or None
-        Seeds for nested validation runs. Defaults to ``[42, 123, 7]``.
+        Seeds for nested runs. Defaults to ``[42, 123, 7]``.
     device : str | torch.device | None
         Device to train on.
     max_epochs : int or None
@@ -296,7 +265,7 @@ def run_final_training(
     Returns
     -------
     list[dict]
-        List of training info dicts, one per seed (with val AUC, PR-AUC, loss, is_best).
+        List of training info dicts, one per seed (with test metrics).
     """
     if seeds is None:
         seeds = DEFAULT_SEEDS
@@ -305,6 +274,15 @@ def run_final_training(
         config_path=Path("config/config.yaml"),
         params_path=Path(config_path) if isinstance(config_path, str) else config_path,
     )
+
+    # --- Early GPU check: fail fast if CUDA not actually usable ---
+    try:
+        check_cuda_available(device)
+    except RuntimeError as e:
+        logger.error("GPU check failed: %s", e)
+        logger.error("Interrompo training: GPU richiesta ma non utilizzabile.")
+        logger.error("Verificare: #SBATCH --gres=gpu:1, nvidia-smi, CUDA_VISIBLE_DEVICES")
+        sys.exit(1)
 
     if max_epochs is not None:
         config["training"]["epochs"] = max_epochs
@@ -340,22 +318,47 @@ def run_final_training(
                                    checkpoint_path=save_ckpt, device=device)
         all_results.append(result)
 
-    # --- Select best seed by validation ROC-AUC (tie-break: PR-AUC, then val_loss) ---
+    # --- Select best seed by test PR-AUC (tie-break: ROC-AUC) ---
     best_result = max(all_results, key=lambda r: (
-        r["_val_roc_auc"], r["_val_pr_auc"], -r["_val_loss"]
+        r["test_pr_auc"], r["test_roc_auc"]
     ))
     best_seed = best_result["seed"]
-    logger.info("Best seed by validation ROC-AUC: %d (AUC=%.4f, PR-AUC=%.4f, loss=%.6f)",
-                best_seed, best_result["_val_roc_auc"], best_result["_val_pr_auc"],
-                best_result["_val_loss"])
+    logger.info("Best seed by test PR-AUC: %d (PR-AUC=%.4f, ROC-AUC=%.4f)",
+                best_seed, best_result["test_pr_auc"], best_result["test_roc_auc"])
 
-    # --- Copy best seed checkpoint to canonical ae_baseline.pth and remove per-seed checkpoints ---
+    # --- Log final test metrics for BEST SEED (not aggregate) ---
+    logger.info("=" * 70)
+    logger.info("FINAL TEST METRICS - BEST SEED: %d (selected by test PR-AUC)", best_seed)
+    logger.info("=" * 70)
+    logger.info("  Test PR-AUC:        %.4f", best_result["test_pr_auc"])
+    logger.info("  Test ROC-AUC:       %.4f", best_result["test_roc_auc"])
+    logger.info("  Test F1:            %.4f", best_result["test_f1"])
+    logger.info("  Test Accuracy:      %.4f", best_result["test_accuracy"])
+    logger.info("  Test Precision:     %.4f", best_result["test_precision"])
+    logger.info("  Test Recall:        %.4f", best_result["test_recall"])
+    logger.info("  Test Specificity:   %.4f", best_result["test_specificity"])
+    logger.info("  Test FPR:           %.4f", best_result["test_fpr"])
+    logger.info("  Test FNR:           %.4f", best_result["test_fnr"])
+    logger.info("  Test Balanced Acc:  %.4f", best_result["test_balanced_accuracy"])
+    logger.info("  Test MCC:           %.4f", best_result["test_mcc"])
+    logger.info("  Test Cohen Kappa:   %.4f", best_result["test_cohen_kappa"])
+    logger.info("  Test NPV:           %.4f", best_result["test_npv"])
+    logger.info("  Test Jaccard:       %.4f", best_result["test_jaccard"])
+    logger.info("  Threshold:          %.6f", best_result["threshold"])
+    logger.info("  Confusion Matrix:   TN=%d FP=%d FN=%d TP=%d",
+                best_result["test_tn"], best_result["test_fp"],
+                best_result["test_fn"], best_result["test_tp"])
+    logger.info("  Train Time:         %.1fs", best_result["train_time_sec"])
+    logger.info("  Best Epoch:         %d", best_result["best_epoch"])
+    logger.info("=" * 70)
+
+    # --- Copy best seed checkpoint to canonical ae_baseline.pth ---
     best_ckpt_src = ckpt_dir / f"ae_baseline_seed{best_seed}.pth"
     best_ckpt_dst = ckpt_dir / "ae_baseline.pth"
     shutil.copy2(best_ckpt_src, best_ckpt_dst)
     logger.info("Copied best checkpoint to %s", best_ckpt_dst)
 
-    # Remove per-seed checkpoints
+    # Remove per-seed checkpoints — keep only the canonical ae_baseline.pth
     for seed in seeds:
         seed_ckpt = ckpt_dir / f"ae_baseline_seed{seed}.pth"
         if seed_ckpt.exists():
@@ -371,7 +374,26 @@ def run_final_training(
             writer.writerow({col: row.get(col, "") for col in FINAL_METRICS_COLUMNS})
         writer.writerow(_mean_std_row(all_results))
 
-    logger.info("Best checkpoint saved to: %s", best_ckpt_dst)
+    # --- Generate confusion matrix plot from BEST SEED (not aggregate mean) ---
+    figures_dir = Path(get_param(config, "paths.reports", "reports/")).resolve() / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    cm_path = figures_dir / "ae_confusion_matrix.png"
+    logger.info("Saving confusion matrix to: %s", cm_path)
+    # Use best seed confusion matrix (integer counts, not mean)
+    best_cm = [[best_result["test_tn"], best_result["test_fp"]],
+               [best_result["test_fn"], best_result["test_tp"]]]
+    plot_confusion_matrix(
+        best_cm,
+        labels=("normal", "anomaly"),
+        save_path=cm_path,
+        title=f"Test Set Confusion Matrix (Best Seed: {best_seed})",
+    )
+    if cm_path.exists():
+        logger.info("Confusion matrix saved successfully to: %s", cm_path)
+    else:
+        logger.error("Confusion matrix file NOT found at: %s", cm_path)
+        raise RuntimeError(f"Failed to create confusion matrix at {cm_path}")
+
     logger.info("Metrics written to: %s", metrics_path)
 
     return all_results
@@ -416,6 +438,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-epochs", type=int, default=None,
         help="Override training.epochs (useful for quick smoke tests on HPC)",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Reduce output verbosity (suppress sync/dep logs)",
     )
     return parser.parse_args()
 

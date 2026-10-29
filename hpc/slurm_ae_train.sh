@@ -122,8 +122,8 @@ fi
 eval "${TRAIN_CMD}"
 
 # ── Phase 3.3: Evaluation sul test set ─────────────────────────────────────────
-echo "=== Phase 3.3: Evaluation on test set ==="
-uv run python -m src.evaluation --checkpoint reports/checkpoints/ae_baseline.pth --config config/params_validated_ae.yaml --data-dir data/processed
+# Evaluation is already done inside train_ae.py (test metrics + confusion matrix).
+# No separate evaluation CLI call needed — avoids duplicate output.
 
 # ── Verify outputs ─────────────────────────────────────────────────────────────
 echo "=== Outputs ==="
@@ -133,19 +133,33 @@ ls -lh reports/checkpoints/ae_baseline.pth reports/tables/ae_final_metrics.csv r
 RESULTS_DIR="${SCRATCH_DIR}/${SCRATCH_PROJECT}"
 HOME_PROJECT="${HOME}/am01_project"
 
+# ── Debug: verify figures exist before sync ────────────────────────────────────
+echo "=== Debug: figures on scratch ==="
+ls -la "${RESULTS_DIR}/reports/figures/" 2>/dev/null || echo "No figures dir on scratch"
+
 mkdir -p "${HOME_PROJECT}/reports/checkpoints" "${HOME_PROJECT}/reports/tables" \
          "${HOME_PROJECT}/reports/figures" "${HOME_PROJECT}/logs"
 
 # No --ignore-existing: new results must overwrite stale ones
-rsync -a \
-    "${RESULTS_DIR}/reports/checkpoints/" "${HOME_PROJECT}/reports/checkpoints/" 2>/dev/null || true
-rsync -a \
-    "${RESULTS_DIR}/reports/tables/" "${HOME_PROJECT}/reports/tables/" 2>/dev/null || true
-rsync -a \
-    "${RESULTS_DIR}/reports/figures/" "${HOME_PROJECT}/reports/figures/" 2>/dev/null || true
+# --delete ensures stale artifacts are removed
+# Use --info=progress2 for visibility, no head truncation
+rsync -a --delete --info=progress2 \
+    "${RESULTS_DIR}/reports/checkpoints/" "${HOME_PROJECT}/reports/checkpoints/"
+rsync -a --delete --info=progress2 \
+    "${RESULTS_DIR}/reports/tables/" "${HOME_PROJECT}/reports/tables/"
+rsync -a --delete --info=progress2 \
+    "${RESULTS_DIR}/reports/figures/" "${HOME_PROJECT}/reports/figures/"
+
+# Sync processed data
+rsync -a --delete --info=progress2 --include='*.npy' --include='*.pkl' --include='*.json' --exclude='*' \
+    "${RESULTS_DIR}/data/processed/" "${HOME_PROJECT}/data/processed/"
 
 # Log — SLURM writes to ~/jobs/logs/ (relative to sbatch submission dir), not to scratch
 cp ~/jobs/logs/am01_ae_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+
+# Debug: verify figures synced to home
+echo "=== Debug: figures on home ==="
+ls -la "${HOME_PROJECT}/reports/figures/" 2>/dev/null || echo "No figures dir on home"
 
 echo "=== Results fetched to ${HOME_PROJECT}/reports/ ==="
 echo "Job completed."

@@ -9,6 +9,11 @@ slicing views costs ~0.18 GB.  The start indices are precomputed by
   - no overlap between partitions (R2a)
   - guard band gap ≥ W between partitions (R2b)
   - controlled stride within each partition (R1)
+
+The ``build_dataloaders`` function loads full scaled recordings and
+recomputes partition start indices for the current window_size,
+enabling hyperparameter search over different window sizes without
+re-running preprocessing.
 """
 
 from __future__ import annotations
@@ -116,20 +121,21 @@ class KukaDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Factory: build all loaders from new processed artifacts
+# Factory: build all loaders from scaled recordings + on-the-fly windowing
 # ---------------------------------------------------------------------------
 def build_dataloaders(
     config: dict[str, Any],
     partitions: list[str] | None = None,
     batch_size: int = 256,
-    num_workers: int = 2,
+    num_workers: int = 4,
+    use_prebuilt_partitions: bool = True,
 ) -> dict[str, DataLoader]:
-    """Load processed artifacts and create DataLoaders for requested partitions.
+    """Build DataLoaders for the specified partitions.
 
-    Reads the new artifact layout from ``processed_dir``:
-    - ``normal_scaled.npy``, ``slow_scaled.npy``
-    - ``plan_{partition}.npy`` (window start indices)
-    - Reconstructs partition plan from config (or loads manifest)
+    Loads the full scaled recordings (``normal_scaled.npy``, ``slow_scaled.npy``)
+    and recomputes partition start indices for the current ``config.window_size``
+    using the saved partitioning parameters. Windows are extracted on-the-fly
+    by :class:`KukaDataset` during iteration.
 
     Args:
         config: Full config dict.
@@ -137,40 +143,59 @@ def build_dataloaders(
                     Default: all five partitions.
         batch_size: Batch size.
         num_workers: DataLoader worker processes.
+        use_prebuilt_partitions: Kept for API compatibility (ignored).
 
     Returns:
         Dict mapping partition name -> DataLoader.
+
+    Raises:
+        FileNotFoundError: If required scaled recording files are missing.
     """
-    processed_dir = Path(config["paths"]["data_processed"])
+    processed_dir = Path(config.get("paths", {}).get("data_processed", "data/processed/"))
     window_size = int(config.get("data", {}).get("window_size", 256))
 
-    # Load scaled recordings
-    normal_scaled = np.load(processed_dir / "normal_scaled.npy")
-    slow_scaled = np.load(processed_dir / "slow_scaled.npy")
-
-    # Reconstruct partition plan from config (deterministic)
     if partitions is None:
         partitions = ["train", "val_normal", "val_anomaly", "test_normal", "test_anomaly"]
 
-    # Build plan from config
+    # Map partition names to source recording and label
+    partition_map = {
+        "train": ("normal", 0),
+        "val_normal": ("normal", 0),
+        "val_anomaly": ("slow", 1),
+        "test_normal": ("normal", 0),
+        "test_anomaly": ("slow", 1),
+    }
+
+    # Load full scaled recordings
+    normal_scaled_path = processed_dir / "normal_scaled.npy"
+    slow_scaled_path = processed_dir / "slow_scaled.npy"
+    if not normal_scaled_path.exists() or not slow_scaled_path.exists():
+        raise FileNotFoundError(
+            f"Scaled recordings not found in {processed_dir}. "
+            f"Run preprocessing first: python -m src.data.preprocessing"
+        )
+    normal_scaled = np.load(normal_scaled_path)
+    slow_scaled = np.load(slow_scaled_path)
+
+    # Recompute partition plan for current window_size
+    # We need the original recording lengths from the scaled data
     normal_n = normal_scaled.shape[0]
     slow_n = slow_scaled.shape[0]
-    plan = {}
-    for src in ("normal", "slow"):
-        src_plan = plan_from_config(config, src, normal_n, slow_n)
-        plan.update(src_plan)
+    plan = plan_from_config(config, "normal", normal_n, slow_n)
+    slow_plan = plan_from_config(config, "slow", normal_n, slow_n)
+    plan.update(slow_plan)
 
     loaders: dict[str, DataLoader] = {}
 
     for name in partitions:
-        if name not in plan:
-            logger.warning("Partition '%s' not in plan, skipping", name)
-            continue
+        if name not in partition_map:
+            raise ValueError(f"Partition '{name}' not recognized")
+        source_name, label = partition_map[name]
+        starts = plan.get(name, np.array([], dtype=np.int64))
 
-        starts = plan[name]
-        label = 1 if "anomaly" in name else 0
-        data = slow_scaled if "anomaly" in name else normal_scaled
+        data = normal_scaled if source_name == "normal" else slow_scaled
 
+        # Create KukaDataset with on-the-fly window extraction
         ds = KukaDataset(data, starts, window_size, label=label)
         shuffle = (name == "train")
         loaders[name] = DataLoader(

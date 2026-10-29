@@ -25,16 +25,23 @@ def parse_args() -> argparse.Namespace:
         help="Path(s) to model checkpoint(s) (.pth). Multiple checkpoints will be evaluated and aggregated."
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed"), help="Processed data directory")
-    parser.add_argument("--config", type=Path, default=Path("config/params_validated_ae.yaml"), help="Config file (default: params_validated_ae.yaml)")
+    parser.add_argument(
+        "--config", type=Path, default=Path("config/params_validated_ae.yaml"), help="Config file (default: params_validated_ae.yaml)")
     parser.add_argument("--threshold", type=float, default=None, help="Fixed threshold (default: calibrate on validation)")
     parser.add_argument("--metric", type=str, default="mae", choices=["mae", "mse"], help="Reconstruction metric")
     parser.add_argument("--device", type=str, default=None, help="Device (cuda/cpu)")
     parser.add_argument("--calibration-method", type=str, default="f1_optimal", choices=["f1_optimal", "percentile_99", "percentile_95"], help="Threshold calibration method")
+    parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    # Set logging level based on --quiet flag
+    if args.quiet:
+        level = logging.WARNING
+    else:
+        level = logging.INFO
 
     logging.basicConfig(
         level=logging.INFO,

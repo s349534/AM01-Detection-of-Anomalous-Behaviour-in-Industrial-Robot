@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.models.autoencoder import (
+from src.models import (
     Conv1dDecoder,
     Conv1dEncoder,
     EarlyStopping,
@@ -130,8 +130,8 @@ class TestSequenceAutoencoder:
     def test_from_config(self, default_config):
         model = SequenceAutoencoder.from_config(default_config)
         assert model.input_dim in (82, 86)
-        assert model.window_size in (128, 256)
-        assert model.latent_dim == 32
+        assert model.window_size in (32, 128, 256)
+        assert model.latent_dim in (8, 16, 32)
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +148,13 @@ class TestReconstructionError:
         model = SequenceAutoencoder(input_dim=86, window_size=16)
         mean_err = model.compute_reconstruction_error(batch_seq_format, reduction="mean")
         assert mean_err.ndim == 0, "Expected scalar"
-        assert mean_err.item() >= 0
+    def test_mae_metric(self, batch_seq_format):
+        model = SequenceAutoencoder(input_dim=86, window_size=16)
+        errors_mae = model.compute_reconstruction_error(
+            batch_seq_format, reduction="sample", metric="mae"
+        )
+        assert errors_mae.shape == (4,)
+        assert (errors_mae >= 0).all()
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +170,6 @@ class TestTrainingUtilities:
         assert not es(1.0, model)
         assert es(1.0, model)
         assert es.early_stop is True
-
     def test_fit_autoencoder_smoke(self):
         model = SequenceAutoencoder(input_dim=86, window_size=16, latent_dim=8)
 
@@ -252,7 +257,7 @@ class TestAdversarialAutoencoder:
         assert model.encoder is not None
         assert model.decoder is not None
         assert model.discriminator is not None
-        assert model.latent_dim == 32
+        assert model.latent_dim in (8, 16, 32)
 
 
 class TestAdversarialTraining:

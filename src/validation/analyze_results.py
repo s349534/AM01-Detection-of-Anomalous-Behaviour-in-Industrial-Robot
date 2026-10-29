@@ -13,8 +13,10 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import io
 import logging
+import math
 from pathlib import Path
 import sys
 from typing import Any
@@ -63,37 +65,94 @@ def get_default_params_path(is_aae: bool = False) -> Path:
 
 
 def load_results_csv(csv_path: Path, is_aae: bool = False) -> list[dict[str, Any]]:
-    """Load validation results from CSV."""
+    """Load validation results from CSV with robust error and encoding handling."""
     rows: list[dict[str, Any]] = []
-    with open(csv_path, mode="r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            row_data: dict[str, Any] = dict(row)
-            try:
-                row_data["run_id"] = int(row_data["run_id"])
-                row_data["best_val_pr_auc"] = float(row_data["best_val_pr_auc"])
-                row_data["best_val_f1"] = float(row_data.get("best_val_f1", 0.0))
-                row_data["best_epoch"] = int(float(row_data["best_epoch"]))
-                row_data["train_time_sec"] = float(row_data.get("train_time_sec", 0.0))
-                row_data["seed"] = int(row_data.get("seed", 42))
+    n_failed = 0
+    n_malformed = 0
+    n_nan_inf = 0
 
-                if is_aae:
-                    row_data["reconstruction_weight"] = float(row_data["reconstruction_weight"])
-                    row_data["adversarial_weight"] = float(row_data["adversarial_weight"])
-                    row_data["discriminator_hidden_layers"] = str(row_data["discriminator_hidden_layers"])
-                else:
-                    row_data["W"] = int(row_data["W"])
-                    row_data["latent_dim"] = int(row_data["latent_dim"])
-                    if "val_roc_auc" in row_data:
-                        row_data["val_roc_auc"] = float(row_data["val_roc_auc"])
-                    elif "best_val_roc_auc" in row_data:
-                        row_data["val_roc_auc"] = float(row_data["best_val_roc_auc"])
-                    else:
-                        row_data["val_roc_auc"] = 0.0
-            except (ValueError, KeyError) as e:
-                logger.warning("Skipping malformed row %s: %s", row, e)
+    encodings = ["utf-8-sig", "utf-8", "latin-1"]
+    file_content = None
+    used_encoding = None
+
+    for enc in encodings:
+        try:
+            with open(csv_path, "r", newline="", encoding=enc) as f:
+                file_content = f.read()
+            used_encoding = enc
+            break
+        except UnicodeDecodeError:
+            continue
+
+    if file_content is None:
+        logger.error("Failed to read CSV with any encoding: %s", encodings)
+        return rows
+
+    reader = csv.DictReader(io.StringIO(file_content))
+    for row_idx, row in enumerate(reader, start=1):
+        row_data: dict[str, Any] = dict(row)
+        try:
+            row_data["run_id"] = int(row_data["run_id"])
+            if row_data.get("config_id"):
+                row_data["config_id"] = int(row_data["config_id"])
+
+            row_data["best_epoch"] = int(float(row_data["best_epoch"]))
+            train_time = float(row_data.get("train_time_sec", 0.0))
+            if not math.isfinite(train_time):
+                n_nan_inf += 1
                 continue
+            row_data["train_time_sec"] = train_time
+            row_data["seed"] = int(row_data.get("seed", 42))
+
+            if is_aae:
+                row_data["reconstruction_weight"] = float(row_data["reconstruction_weight"])
+                row_data["adversarial_weight"] = float(row_data["adversarial_weight"])
+                row_data["discriminator_hidden_layers"] = str(row_data["discriminator_hidden_layers"])
+                pr_auc = float(row_data["best_val_pr_auc"])
+                if not math.isfinite(pr_auc) or pr_auc < 0:
+                    n_failed += 1
+                    continue
+                row_data["best_val_pr_auc"] = pr_auc
+                row_data["best_val_f1"] = float(row_data.get("best_val_f1", 0.0))
+            else:
+                row_data["W"] = int(row_data["W"])
+                row_data["latent_dim"] = int(row_data["latent_dim"])
+
+                # Handle different column names between AE runs
+                pr_key = "val_pr_auc" if "val_pr_auc" in row_data else "best_val_pr_auc"
+                roc_key = "val_roc_auc" if "val_roc_auc" in row_data else "best_val_roc_auc"
+
+                val_pr_auc = float(row_data[pr_key])
+                val_roc_auc = float(row_data[roc_key]) if roc_key in row_data and row_data[roc_key] != "" else 0.0
+
+                if not (math.isfinite(val_pr_auc) and math.isfinite(val_roc_auc)):
+                    n_nan_inf += 1
+                    continue
+                if val_pr_auc < 0 or val_roc_auc < 0:
+                    n_failed += 1
+                    continue
+
+                row_data["best_val_pr_auc"] = val_pr_auc
+                row_data["val_pr_auc"] = val_pr_auc
+                row_data["val_roc_auc"] = val_roc_auc
+
             rows.append(row_data)
+        except (ValueError, KeyError) as e:
+            n_malformed += 1
+            logger.warning("Row %d: malformed - %s (raw: %s)", row_idx, e, dict(row))
+            continue
+
+    if n_failed:
+        logger.warning("Skipped %d failed run(s)", n_failed)
+    if n_nan_inf:
+        logger.warning("Skipped %d row(s) with NaN/Inf values", n_nan_inf)
+    if n_malformed:
+        logger.warning("Skipped %d malformed row(s)", n_malformed)
+
+    if not rows:
+        logger.error("No valid rows found in %s", csv_path)
+    else:
+        logger.info("Loaded %d valid rows from %s (encoding: %s)", len(rows), csv_path, used_encoding)
     return rows
 
 

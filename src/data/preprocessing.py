@@ -7,8 +7,11 @@ Pipeline:
     load_kuka_data → plan_partitions (interleaved) → scale (fit on train chunks) → save
 
 Artifacts:
-    normal_scaled.npy, slow_scaled.npy, plan_*.npy, scaler.pkl,
-    selected_columns.npy, manifest.json
+    normal_scaled.npy, slow_scaled.npy (full scaled recordings, shape n_samples × n_features),
+    scaler.pkl, selected_columns.npy, manifest.json, stats.json
+
+Window extraction is done ON-THE-FLY at training/validation time using KukaDataset
+with partition start indices recomputed from saved partitioning parameters for any window_size.
 """
 
 from __future__ import annotations
@@ -147,7 +150,7 @@ def fit_scaler_on_train(
     plan: dict[str, np.ndarray],
     config: dict[str, Any],
     window_size: int,
-) -> tuple[MinMaxScaler, np.ndarray]:
+) -> tuple[MinMaxScaler, np.ndarray, np.ndarray, np.ndarray]:
     """Fit MinMaxScaler on TRAIN rows only (no leakage).
 
     The scaler is fitted only on the rows covered by train windows.
@@ -155,9 +158,7 @@ def fit_scaler_on_train(
     due to distribution drift and is reported as a warning.
     """
     # --- Build train mask from plan ---
-    train_mask = np.zeros(normal.shape[0], dtype=bool)
-    for s in plan.get("train", np.array([], dtype=np.int64)):
-        train_mask[s:s + window_size] = True
+    train_mask = _build_mask(plan.get("train", np.array([], dtype=np.int64)), window_size, normal.shape[0])
 
     train_rows = normal[train_mask]
 
@@ -185,40 +186,16 @@ def fit_scaler_on_train(
         if name == "train":
             continue
         if "anomaly" in name:
-            arr = slow_scaled
-            n_samples = slow.shape[0]
+            _check_out_of_range(slow_scaled, starts, window_size, name, suppress_warnings=clip_out_of_range)
         else:
-            arr = normal_scaled
-            n_samples = normal.shape[0]
-
-        covered = np.zeros(n_samples, dtype=bool)
-        for s in starts:
-            covered[s:s + window_size] = True
-        if not np.any(covered):
-            continue
-
-        vals = arr[covered]
-        out_of_range = (vals < -1.0) | (vals > 1.0)
-        n_out = int(out_of_range.sum())
-        if n_out > 0:
-            n_feats = int((out_of_range.sum(axis=0) > 0).sum())
-            logger.warning(
-                "Partition %s: %d samples (%d features) out of [-1,1] range after scaling. "
-                "This is expected due to distribution drift. Consider setting data.clip_out_of_range=true.",
-                name, n_out, n_feats
-            )
+            _check_out_of_range(normal_scaled, starts, window_size, name, suppress_warnings=clip_out_of_range)
 
     if clip_out_of_range:
         logger.info("Clipping scaled values to [-1, 1] range")
         normal_scaled = np.clip(normal_scaled, -1.0, 1.0)
         slow_scaled = np.clip(slow_scaled, -1.0, 1.0)
 
-    # Build train_mask from plan (for manifest)
-    train_mask = np.zeros(normal.shape[0], dtype=bool)
-    for s in plan.get("train", np.array([], dtype=np.int64)):
-        train_mask[s:s + window_size] = True
-
-    return scaler, train_mask
+    return scaler, train_mask, normal_scaled, slow_scaled
 
 def scale_recordings(    normal: np.ndarray,
     slow: np.ndarray,
@@ -235,9 +212,57 @@ def _checksum(arr: np.ndarray) -> str:
     return hashlib.sha256(arr.tobytes()).hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# Step 4 — save (new artifacts + manifest)
-# ---------------------------------------------------------------------------
+def _build_mask(starts: np.ndarray, window_size: int, n_samples: int) -> np.ndarray:
+    """Build a boolean mask from window start indices."""
+    mask = np.zeros(n_samples, dtype=bool)
+    if len(starts) > 0:
+        idx = np.repeat(starts, window_size) + np.tile(np.arange(window_size), len(starts))
+        idx = idx[idx < n_samples]
+        mask[idx] = True
+    return mask
+
+
+def _compute_stats(arr: np.ndarray) -> dict[str, list[float]]:
+    """Compute min, max, mean, std per feature."""
+    return {
+        "min": arr.min(axis=0).tolist(),
+        "max": arr.max(axis=0).tolist(),
+        "mean": arr.mean(axis=0).tolist(),
+        "std": arr.std(axis=0).tolist(),
+    }
+
+
+def _check_out_of_range(
+    arr: np.ndarray,
+    starts: np.ndarray,
+    window_size: int,
+    partition_name: str,
+    suppress_warnings: bool = False,
+) -> tuple[int, int]:
+    """Check for out-of-range values in a partition.
+
+    Returns:
+        (n_out_of_range_samples, n_features_with_out_of_range)
+    """
+    n_samples = arr.shape[0]
+    covered = np.zeros(n_samples, dtype=bool)
+    for s in starts:
+        covered[s:s + window_size] = True
+    if not np.any(covered):
+        return 0, 0
+    vals = arr[covered]
+    out_of_range = (vals < -1.0) | (vals > 1.0)
+    n_out = int(out_of_range.sum())
+    if n_out == 0:
+        return 0, 0
+    n_feats = int((out_of_range.sum(axis=0) > 0).sum())
+    if not suppress_warnings:
+        logger.warning(
+            "Partition %s: %d samples (%d features) out of [-1,1] range after scaling. "
+            "This is expected due to distribution drift. Consider setting data.clip_out_of_range=true.",
+            partition_name, n_out, n_feats,
+        )
+    return n_out, n_feats
 
 
 def compute_statistics(
@@ -263,36 +288,25 @@ def compute_statistics(
     Returns:
         Dictionary with statistics for recordings and partitions.
     """
-    def compute_stats(arr: np.ndarray) -> dict[str, list[float]]:
-        """Compute min, max, mean, std per feature."""
-        return {
-            "min": arr.min(axis=0).tolist(),
-            "max": arr.max(axis=0).tolist(),
-            "mean": arr.mean(axis=0).tolist(),
-            "std": arr.std(axis=0).tolist(),
-        }
-
     def partition_stats(scaled_arr: np.ndarray, starts: np.ndarray, n_samples: int) -> dict[str, Any]:
         if len(starts) == 0:
             return {"n_windows": 0, "n_covered_samples": 0, "coverage_ratio": 0.0,
                     "raw": None, "scaled": None}
-        covered = np.zeros(n_samples, dtype=bool)
-        for s in starts:
-            covered[s:s + window_size] = True
+        covered = _build_mask(starts, window_size, n_samples)
         n_covered = int(covered.sum())
         return {
             "n_windows": len(starts),
             "n_covered_samples": n_covered,
             "coverage_ratio": float(n_covered) / n_samples,
             "raw": None,  # raw stats would require accessing original data
-            "scaled": compute_stats(scaled_arr[covered]),
+            "scaled": _compute_stats(scaled_arr[covered]),
         }
 
     # Recording-level stats
-    normal_raw_stats = compute_stats(normal)
-    slow_raw_stats = compute_stats(slow)
-    normal_scaled_stats = compute_stats(normal_scaled)
-    slow_scaled_stats = compute_stats(slow_scaled)
+    normal_raw_stats = _compute_stats(normal)
+    slow_raw_stats = _compute_stats(slow)
+    normal_scaled_stats = _compute_stats(normal_scaled)
+    slow_scaled_stats = _compute_stats(slow_scaled)
 
     # Partition-level stats (using scaled data)
     partitions = {}
@@ -325,73 +339,21 @@ def compute_statistics(
     }
 
 
-def save_processed_data(
-    normal: np.ndarray,
-    slow: np.ndarray,
+def _build_manifest(
     normal_scaled: np.ndarray,
     slow_scaled: np.ndarray,
     plan: dict[str, np.ndarray],
     scaler: MinMaxScaler,
-    selected_col_names: np.ndarray,
     config: dict[str, Any],
     window_size: int,
-) -> None:
-    """Save all artifacts to data/processed/ including manifest.json."""
-    output_dir = Path(
-        config.get("paths", {}).get(
-            "data_processed",
-            config.get("paths", {}).get("processed_data_dir", "data/processed/"),
-        )
-    )
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Build train_mask from plan (for manifest)
-    window_size = int(config.get("data", {}).get("window_size", 256))
-    train_mask = np.zeros(normal.shape[0], dtype=bool)
-    for s in plan.get("train", np.array([], dtype=np.int64)):
-        train_mask[s:s + window_size] = True
-
-    # Remove legacy 5-file artifacts if present
-    legacy_files = [
-        "train.npy", "val_normal.npy", "val_anomaly.npy",
-        "test_normal.npy", "test_anomaly.npy"
-    ]
-    for fname in legacy_files:
-        fpath = output_dir / fname
-        if fpath.exists():
-            fpath.unlink()
-            logger.info("Removed legacy artifact: %s", fname)
-
-    # --- Save scaled recordings ---
-    np.save(output_dir / "normal_scaled.npy", normal_scaled)
-    logger.info("Saved normal_scaled.npy: shape=%s, dtype=%s", normal_scaled.shape, normal_scaled.dtype)
-
-    np.save(output_dir / "slow_scaled.npy", slow_scaled)
-    logger.info("Saved slow_scaled.npy: shape=%s, dtype=%s", slow_scaled.shape, slow_scaled.dtype)
-
-    # --- Save partition plans ---
-    for name, starts in plan.items():
-        path = output_dir / f"plan_{name}.npy"
-        np.save(path, starts)
-        logger.info("Saved %s: %d windows", path, len(starts))
-
-    # --- Save scaler ---
-    scaler_path = output_dir / "scaler.pkl"
-    joblib.dump(scaler, scaler_path)
-    logger.info("Saved %s", scaler_path)
-
-    # --- Save selected column names ---
-    cols_path = output_dir / "selected_columns.npy"
-    np.save(cols_path, selected_col_names)
-    logger.info("Saved %s: %d columns", cols_path, selected_col_names.shape[0])
-
-    # --- Build and save manifest ---
+    normal_checksum: np.ndarray,
+    slow_checksum: np.ndarray,
+    scaler_checksum_arr: np.ndarray,
+    train_mask: np.ndarray,
+) -> dict[str, Any]:
+    """Build manifest dictionary from precomputed components."""
     part_cfg = config.get("data", {}).get("partitioning", {})
-    train_mask = np.zeros(normal.shape[0], dtype=bool)
-    for s in plan.get("train", np.array([], dtype=np.int64)):
-        train_mask[s:s + window_size] = True
-    
-    part_cfg = config.get("data", {}).get("partitioning", {})
+
     manifest = {
         "version": "1.0",
         "timestamp": datetime.now().isoformat(),
@@ -413,85 +375,138 @@ def save_processed_data(
         "scaler_fit_max": scaler.data_max_.tolist(),
     }
 
+    window_size = int(window_size)
+    clip_out_of_range = config.get("data", {}).get("clip_out_of_range", False)
     for name, starts in plan.items():
         n_samples = normal_scaled.shape[0] if "anomaly" not in name else slow_scaled.shape[0]
-        covered = np.zeros(n_samples, dtype=bool)
-        for s in starts:
-            covered[s:s + window_size] = True
+        covered = _build_mask(starts, window_size, n_samples)
         guard_samples = n_samples - covered.sum()
-        
+
         # Count out-of-range features for this partition
         if "anomaly" in name:
-            arr = slow_scaled
-            n_samples = slow_scaled.shape[0]
+            _, n_feats = _check_out_of_range(slow_scaled, starts, window_size, name, suppress_warnings=clip_out_of_range)
         else:
-            arr = normal_scaled
-            n_samples = normal_scaled.shape[0]
-        
-        covered = np.zeros(n_samples, dtype=bool)
-        for s in starts:
-            covered[s:s + window_size] = True
-        vals = arr[covered] if np.any(covered) else np.array([])
-        n_out = 0
-        if len(vals) > 0:
-            out_of_range = (vals < -1.0) | (vals > 1.0)
-            n_out = int(out_of_range.sum())
-            n_feats = int((out_of_range.sum(axis=0) > 0).sum()) if n_out > 0 else 0
-        
+            _, n_feats = _check_out_of_range(normal_scaled, starts, window_size, name, suppress_warnings=clip_out_of_range)
+
         manifest["partitions"][name] = {
             "n_windows": len(starts),
             "n_covered_samples": int(covered.sum()),
             "guard_samples": int(guard_samples),
             "coverage_ratio": float(covered.sum()) / n_samples,
-            "n_features_out_of_range": n_feats if 'n_feats' in locals() else 0,
+            "n_features_out_of_range": n_feats,
         }
 
-    manifest_path = output_dir / "manifest.json"
+    manifest_path = Path(config.get("paths", {}).get("data_processed", "data/processed/")) / "manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
-    logger.info("Saved %s", manifest_path)
+    return manifest
+
+
+def save_processed_data(
+    normal: np.ndarray,
+    slow: np.ndarray,
+    normal_scaled: np.ndarray,
+    slow_scaled: np.ndarray,
+    plan: dict[str, np.ndarray],
+    scaler: MinMaxScaler,
+    selected_col_names: np.ndarray,
+    config: dict[str, Any],
+    window_size: int,
+) -> None:
+    """Save all artifacts to data/processed/ including manifest.json and stats.json."""
+    # Use config paths with fallback defaults
+    paths_cfg = config.get("paths", {})
+    output_dir = Path(paths_cfg.get("data_processed", "data/processed/"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / "manifest.json"
+
+    # --- Save scaled recordings (full, not windowed) ---
+    normal_scaled_path = output_dir / "normal_scaled.npy"
+    slow_scaled_path = output_dir / "slow_scaled.npy"
+    np.save(normal_scaled_path, normal_scaled)
+    np.save(slow_scaled_path, slow_scaled)
+    logger.info("Saved %s: shape=%s", normal_scaled_path, normal_scaled.shape)
+    logger.info("Saved %s: shape=%s", slow_scaled_path, slow_scaled.shape)
+
+    # --- Save scaler ---
+    scaler_path = output_dir / "scaler.pkl"
+    joblib.dump(scaler, scaler_path)
+    logger.info("Saved %s", scaler_path)
+
+    # --- Save selected column names ---
+    cols_path = output_dir / "selected_columns.npy"
+    np.save(cols_path, selected_col_names)
+    logger.info("Saved %s: %d columns", cols_path, selected_col_names.shape[0])
+
+    # --- Build train mask ONCE (reused for manifest + stats) ---
+    train_mask = _build_mask(plan.get("train", np.array([], dtype=np.int64)), window_size, normal.shape[0])
+
+    # --- Build and save manifest ---
+    normal_checksum = _checksum(normal_scaled)
+    slow_checksum = _checksum(slow_scaled)
+    scaler_checksum_arr = np.concatenate([scaler.data_min_, scaler.data_max_])
+
+    manifest = _build_manifest(
+        normal_scaled, slow_scaled, plan, scaler, config, window_size,
+        normal_checksum, slow_checksum, scaler_checksum_arr, train_mask,
+    )
 
     # --- Save statistics ---
-    stats = compute_statistics(normal, slow, normal_scaled, slow_scaled, plan, window_size, selected_col_names)
+    # Recording-level stats
+    normal_raw_stats = _compute_stats(normal)
+    slow_raw_stats = _compute_stats(slow)
+    normal_scaled_stats = _compute_stats(normal_scaled)
+    slow_scaled_stats = _compute_stats(slow_scaled)
+
+    # Partition-level stats (using scaled data)
+    partitions = {}
+    for name, starts in plan.items():
+        if "anomaly" in name:
+            arr_scaled = slow_scaled
+            n_total = slow.shape[0]
+        else:
+            arr_scaled = normal_scaled
+            n_total = normal.shape[0]
+        covered = _build_mask(starts, window_size, n_total)
+        n_covered = int(covered.sum())
+        partitions[name] = {
+            "n_windows": len(starts),
+            "n_covered_samples": n_covered,
+            "coverage_ratio": float(n_covered) / n_total,
+            "raw": None,
+            "scaled": _compute_stats(arr_scaled[covered]) if n_covered > 0 else {"min": [], "max": [], "mean": [], "std": []},
+        }
+
+    stats = {
+        "window_size": window_size,
+        "n_features": int(normal.shape[1]),
+        "feature_names": selected_col_names.tolist(),
+        "recordings": {
+            "normal": {
+                "n_samples": int(normal.shape[0]),
+                "raw": normal_raw_stats,
+                "scaled": normal_scaled_stats,
+            },
+            "slow": {
+                "n_samples": int(slow.shape[0]),
+                "raw": slow_raw_stats,
+                "scaled": slow_scaled_stats,
+            },
+        },
+        "partitions": partitions,
+    }
+
     stats_path = output_dir / "stats.json"
     with open(stats_path, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2, sort_keys=True)
     logger.info("Saved %s", stats_path)
     manifest["stats_file"] = "stats.json"
 
-    # --- Update params.yaml with discovered input_dim ---
-    _update_params_input_dim(config, int(selected_col_names.shape[0]))
-
     # Rewrite manifest with stats_file reference
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
-
-
-def _update_params_input_dim(config: dict[str, Any], input_dim: int) -> None:
-    """Update params.yaml with the discovered input_dim from preprocessing."""
-    project_root = Path(__file__).resolve().parents[2]
-    params_path = project_root / "config" / "params.yaml"
-
-    if not params_path.exists():
-        logger.warning("params.yaml not found at %s, skipping input_dim update", params_path)
-        return
-
-    try:
-        with open(params_path, "r", encoding="utf-8") as f:
-            params = yaml.safe_load(f) or {}
-
-        if "model" not in params:
-            params["model"] = {}
-        old_dim = params["model"].get("input_dim", "unset")
-        params["model"]["input_dim"] = input_dim
-
-        with open(params_path, "w", encoding="utf-8") as f:
-            yaml.dump(params, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-
-        logger.info("Updated params.yaml: model.input_dim %s → %d", old_dim, input_dim)
-
-    except Exception as e:
-        logger.warning("Failed to update params.yaml with input_dim: %s", e)
+    manifest["stats_file"] = "stats.json"
+    logger.info("Saved %s", manifest_path)
+    logger.info("Preprocessing completed successfully.")
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -528,13 +543,11 @@ def run_preprocessing(config: dict[str, Any]) -> dict[str, np.ndarray]:
 
     # --- Step 3: Scale ---
     logger.info("[3/5] Fitting scaler on normal data...")
-    scaler, train_mask = fit_scaler_on_train(normal, slow, plan, config, window_size)
+    scaler, train_mask, normal_scaled, slow_scaled = fit_scaler_on_train(
+        normal, slow, plan, config, window_size
+    )
 
-    logger.info("[4/5] Scaling recordings...")
-    normal_scaled, slow_scaled = scale_recordings(normal, slow, scaler)
-
-    # --- Step 4: Save ---
-    logger.info("[5/5] Saving processed data...")
+    logger.info("[4/5] Saving processed data...")
     save_processed_data(
         normal, slow, normal_scaled, slow_scaled, plan, scaler, selected_cols,
         config, window_size

@@ -43,6 +43,11 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help="Which pipeline phase to run (default: all)",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Reduce output verbosity (suppress sync/dep logs)",
+    )
     return parser.parse_args()
 
 
