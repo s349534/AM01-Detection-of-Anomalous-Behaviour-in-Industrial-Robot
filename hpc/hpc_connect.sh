@@ -489,15 +489,6 @@ EOFSRIPT
              "${PROJECT_ROOT}/logs" \
              "${PROJECT_ROOT}/config"
 
-    # Always clear training-only artefacts first so that stale local copies do
-    # not survive a validation-only run (where these files are NOT produced).
-    # If the SLURM job DID produce them, they will be re-downloaded below.
-    rm -f "${PROJECT_ROOT}/reports/tables/ae_final_metrics.csv" \
-          "${PROJECT_ROOT}/reports/tables/aae_final_metrics.csv" \
-          "${PROJECT_ROOT}/reports/tables/ae_test_metrics.csv" \
-          "${PROJECT_ROOT}/reports/checkpoints/ae_baseline.pth" \
-          "${PROJECT_ROOT}/reports/checkpoints/ae_baseline_seed*.pth" \
-          "${PROJECT_ROOT}/reports/checkpoints/aae_final.pth" 2>/dev/null || true
 
     if command -v rsync >/dev/null 2>&1; then
         rsync -av --progress --delete \
