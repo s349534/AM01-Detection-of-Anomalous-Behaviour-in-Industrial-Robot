@@ -44,11 +44,9 @@ Anomaly Scoring:
 """
 from __future__ import annotations
 
-import copy
 import logging
-from collections.abc import Sized
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -269,6 +267,7 @@ class Conv1dDecoder(nn.Module):
         """
         h = self.channel_proj(z)
         x_rec = self.deconv(h)
+        x_rec = torch.tanh(x_rec)
 
         # Safety adjustment if window_size doesn't match exactly
         if x_rec.size(-1) != self.window_size:
@@ -368,7 +367,7 @@ class SequenceAutoencoder(nn.Module):
                 f"with shape {x.shape}"
             )
 
-        _, d1, d2 = x.shape
+        b, d1, d2 = x.shape
 
         # Case 1: already (B, input_dim, W)
         if d1 == self.input_dim and d2 == self.window_size:
@@ -448,9 +447,9 @@ class SequenceAutoencoder(nn.Module):
             x_hat = self.forward(x)
 
         if metric == "mse":
-            diff = (x - x_hat) ** 2
+            diff = (x - x_hat).pow(2)
         elif metric == "mae":
-            diff = torch.abs(x - x_hat)
+            diff = (x - x_hat).abs()
         else:
             raise ValueError(f"Unsupported metric: '{metric}', must be 'mse' or 'mae'")
 
@@ -460,8 +459,7 @@ class SequenceAutoencoder(nn.Module):
             return diff.mean()
         if reduction == "sample":
             # Average across all feature and timestep dimensions for each sample
-            dims = tuple(range(1, diff.ndim))
-            return diff.mean(dim=dims)
+            return diff.mean(dim=(1, 2))
 
         raise ValueError(
             f"Unsupported reduction: '{reduction}', must be 'none', 'mean', or 'sample'"
@@ -619,302 +617,5 @@ class SequenceAutoencoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 4. Early Stopping Helper
-# ---------------------------------------------------------------------------
-class EarlyStopping:
-    """Early stopping handler to monitor validation loss during training."""
-
-    def __init__(
-        self,
-        patience: int = 10,
-        min_delta: float = 1e-4,
-        mode: Literal["min", "max"] = "min",
-    ) -> None:
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.counter = 0
-        self.best_score: float | None = None
-        self.best_state: dict[str, Any] | None = None
-        self.best_epoch: int = 0
-        self.early_stop = False
-
-    def __call__(self, val_loss: float, model: nn.Module, epoch: int = 0) -> bool:
-        score = -val_loss if self.mode == "min" else val_loss
-
-        if self.best_score is None:
-            self.best_score = score
-            self.best_state = copy.deepcopy(model.state_dict())
-            self.best_epoch = epoch
-            return False
-
-        if score < self.best_score + self.min_delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-                return True
-        else:
-            self.best_score = score
-            self.best_state = copy.deepcopy(model.state_dict())
-            self.best_epoch = epoch
-            self.counter = 0
-
-        return False
-
-    def restore_best_weights(self, model: nn.Module) -> None:
-        """Restore the best observed model weights."""
-        if self.best_state is not None:
-            model.load_state_dict(self.best_state)
-
-
-# ---------------------------------------------------------------------------
 # 5. Shared inference helper
 # ---------------------------------------------------------------------------
-def compute_errors_on_loader(
-    model: SequenceAutoencoder,
-    loader: DataLoader,
-    device: torch.device,
-    metric: str = "mae",
-    *,
-    collect_labels: bool = False,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-    """Compute per-sample reconstruction errors from a DataLoader.
-
-    A shared helper used by both the training scripts (``train_ae.py``) and
-    the validation scripts (``run_experiment_ae.py``) to eliminate the
-    previously duplicated ``_compute_errors`` / ``_compute_errors_for_loader``
-    logic.
-
-    Parameters
-    ----------
-    model : SequenceAutoencoder
-        Model in eval mode (or will be set to eval).
-    loader : DataLoader
-        Yields batches of ``(window, label)`` or just ``window``.
-    device : torch.device
-        Device for inference.
-    metric : {"mae", "mse"}, default="mae"
-        Reconstruction error metric.
-    collect_labels : bool, default=False
-        If ``True``, also return per-sample labels alongside errors.
-        If ``False`` (default), return only the error array.
-
-    Returns
-    -------
-    np.ndarray
-        Per-sample mean reconstruction errors of shape ``(n_samples,)``.
-    tuple[np.ndarray, np.ndarray]
-        ``(errors, labels)`` when ``collect_labels=True``.
-    """
-    model.eval()
-    all_errors: list[np.ndarray] = []
-    all_labels: list[np.ndarray] = []
-
-    with torch.no_grad():
-        for batch in loader:
-            x = batch[0] if isinstance(batch, (list, tuple)) else batch
-            x = x.to(device)
-            y = batch[1] if isinstance(batch, (list, tuple)) else None
-
-            errors = model.compute_reconstruction_error(
-                x,
-                reduction="sample",
-                metric=cast("Literal['mae', 'mse']", metric),
-            )
-            all_errors.append(errors.cpu().numpy())
-            if collect_labels and y is not None:
-                all_labels.append(y.cpu().numpy().flatten())
-
-    if not all_errors:
-        ds = loader.dataset
-        ds_len = len(ds) if isinstance(ds, Sized) else "?"
-        raise ValueError(
-            f"No batches yielded from DataLoader — dataset may be empty. "
-            f"Check: window_size exceeds samples, "
-            f"or DataLoader num_workers > 0 causing multiprocessing issues. "
-            f"Dataset length: {ds_len}"
-        )
-
-    errors = np.concatenate(all_errors)
-    if collect_labels:
-        labels = np.concatenate(all_labels) if all_labels else np.array([], dtype=np.int32)
-        return errors, labels
-    return errors
-
-
-# ---------------------------------------------------------------------------
-# 6. Training & Evaluation Loop
-# ---------------------------------------------------------------------------
-def train_epoch(
-    model: nn.Module,
-    dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    device: torch.device,
-) -> float:
-    """Execute one training epoch on normal robot time-series windows."""
-    model.train()
-    running_loss = 0.0
-    total_samples = 0
-
-    for batch in dataloader:
-        # Handle both batch formats: (windows, labels) or windows
-        x = batch[0] if isinstance(batch, (list, tuple)) else batch
-        x = x.to(device)
-
-        optimizer.zero_grad()
-        x_rec = model(x)
-        loss = criterion(x_rec, x)
-        loss.backward()
-        optimizer.step()
-
-        batch_size = x.size(0)
-        running_loss += loss.item() * batch_size
-        total_samples += batch_size
-
-    return running_loss / max(1, total_samples)
-
-
-def evaluate_epoch(
-    model: nn.Module,
-    dataloader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> float:
-    """Evaluate model reconstruction loss on validation data."""
-    model.eval()
-    running_loss = 0.0
-    total_samples = 0
-
-    with torch.no_grad():
-        for batch in dataloader:
-            x = batch[0] if isinstance(batch, (list, tuple)) else batch
-            x = x.to(device)
-
-            x_rec = model(x)
-            loss = criterion(x_rec, x)
-
-            batch_size = x.size(0)
-            running_loss += loss.item() * batch_size
-            total_samples += batch_size
-
-    return running_loss / max(1, total_samples)
-
-
-def fit_autoencoder(
-    model: SequenceAutoencoder,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    epochs: int = 100,
-    learning_rate: float = 1e-3,
-    weight_decay: float = 1e-4,
-    patience: int = 10,
-    min_delta: float = 1e-4,
-    checkpoint_path: str | Path | None = None,
-    device: str | torch.device | None = None,
-    criterion: nn.Module | None = None,
-    loss: str | None = None,
-) -> dict[str, list[float]]:
-    """Complete training loop for the baseline SequenceAutoencoder.
-
-    Includes Adam optimizer, early stopping on validation loss, and optional
-    checkpoint serialization.
-
-    Parameters
-    ----------
-    model : SequenceAutoencoder
-        The autoencoder model to train.
-    train_loader : DataLoader
-        DataLoader providing training batches (normal movements only).
-    val_loader : DataLoader
-        DataLoader providing validation batches.
-    epochs : int, default=100
-        Maximum training epochs.
-    learning_rate : float, default=1e-3
-        Adam learning rate.
-    weight_decay : float, default=1e-4
-        L2 regularization coefficient.
-    patience : int, default=10
-        Number of epochs without improvement before early stopping.
-    min_delta : float, default=1e-4
-        Minimum required improvement in validation loss.
-    checkpoint_path : str | Path | None, default=None
-        Path to save the best model weights.
-    device : str | torch.device
-        Hardware device to train on.
-    criterion : nn.Module | None
-        Loss function instance. If None, ``loss`` is used to build it.
-    loss : str | None
-        Loss name ("mae" or "mse"), used to build ``criterion`` when ``criterion``
-        is None.  Defaults to "mae" (robust to sensor saturation, see §7 #9).
-
-    Returns
-    -------
-    dict
-        History with keys "train_loss" (list[float]), "val_loss" (list[float]),
-        and "best_epoch" (int — the epoch with the best validation loss).
-    """
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    dev = torch.device(device)
-    model.to(dev)
-
-    if criterion is None:
-        if loss is None or loss == "mae":
-            criterion = nn.L1Loss()
-        elif loss == "mse":
-            criterion = nn.MSELoss()
-        else:
-            raise ValueError(f"Unsupported loss '{loss}', must be 'mae' or 'mse'")
-
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay
-    )
-    early_stopping = EarlyStopping(patience=patience, min_delta=min_delta)
-
-    history: dict[str, Any] = {"train_loss": [], "val_loss": [], "best_epoch": 0}
-
-    logger.info("Starting SequenceAutoencoder training on %s (%d epochs)", dev, epochs)
-
-    for epoch in range(1, epochs + 1):
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, dev)
-        val_loss = evaluate_epoch(model, val_loader, criterion, dev)
-
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-
-        if epoch % 5 == 0 or epoch == 1:
-            logger.info(
-                "Epoch %3d/%3d — Train Loss: %.6f — Val Loss: %.6f",
-                epoch, epochs, train_loss, val_loss,
-            )
-
-        if early_stopping(val_loss, model, epoch):
-            logger.info(
-                "Early stopping triggered at epoch %d (best val loss: %.6f)",
-                epoch, -early_stopping.best_score if early_stopping.best_score else 0.0,
-            )
-            break
-
-    # Record the actual best epoch (tracked by EarlyStopping)
-    history["best_epoch"] = early_stopping.best_epoch
-
-    # Restore best checkpoint weights
-    early_stopping.restore_best_weights(model)
-
-    if checkpoint_path is not None:
-        ckpt = Path(checkpoint_path)
-        ckpt.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "history": history,
-                "input_dim": model.input_dim,
-                "window_size": model.window_size,
-                "latent_dim": model.latent_dim,
-            },
-            ckpt,
-        )
-        logger.info("Saved best checkpoint to %s", ckpt)
-
-    return history
