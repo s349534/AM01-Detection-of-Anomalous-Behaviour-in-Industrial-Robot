@@ -54,7 +54,7 @@ def evaluate_model(
                     test_precision, test_recall, threshold, confusion_matrix,
                     confusion_matrix_array
     """
-    from src.models.autoencoder import compute_errors_on_loader
+    from src.models.inference import compute_errors_on_loader
 
     test_normal_errors = compute_errors_on_loader(model, test_normal_loader, device, metric=metric)
     test_anomaly_errors = compute_errors_on_loader(model, test_anomaly_loader, device, metric=metric)

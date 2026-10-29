@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.evaluation.metrics import find_optimal_threshold, percentile_threshold, calculate_auc
-from src.models.autoencoder import compute_errors_on_loader
+from src.models.inference import compute_errors_on_loader
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checkers
     from src.models.autoencoder import SequenceAutoencoder
