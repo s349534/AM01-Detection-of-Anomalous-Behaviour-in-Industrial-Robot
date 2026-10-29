@@ -94,7 +94,8 @@ echo "=== Phase 4.1: AAE validation search (${N_ITER} iterations, max ${MAX_VAL_
 uv run python -m src.validation.run_search_aae \
     --n-iter "${N_ITER}" \
     --seed 42 \
-    --max-val-epochs "${MAX_VAL_EPOCHS}"
+    --max-val-epochs "${MAX_VAL_EPOCHS}" \
+    --no-resume
 
 # ── Phase 4.1b: Analyze results → params_validated_aae.yaml + plots (§4.8.8) ─
 echo "=== Phase 4.1b: Analyzing AAE results ==="

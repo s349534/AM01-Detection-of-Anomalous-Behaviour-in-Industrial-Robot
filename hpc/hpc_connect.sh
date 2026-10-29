@@ -505,13 +505,13 @@ EOFSRIPT
             "${PROJECT_ROOT}/data/processed/" 2>/dev/null || true
 
         # Download reports/ (CSV + plots) — populated by AE search / training jobs
-        rsync -av --progress --delete \
+        rsync -av --progress \
             "$(ssh_target):~/am01_project/reports/tables/" \
             "${PROJECT_ROOT}/reports/tables/" 2>/dev/null || true
-        rsync -av --progress --delete \
+        rsync -av --progress \
             "$(ssh_target):~/am01_project/reports/figures/" \
             "${PROJECT_ROOT}/reports/figures/" 2>/dev/null || true
-        rsync -av --progress --delete \
+        rsync -av --progress \
             "$(ssh_target):~/am01_project/reports/checkpoints/" \
             "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null || true
 
