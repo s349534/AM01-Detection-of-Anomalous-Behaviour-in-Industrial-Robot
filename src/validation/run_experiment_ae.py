@@ -34,19 +34,15 @@ import numpy as np
 import torch
 
 from src.data.dataset import build_dataloaders
-from src.models.autoencoder import (
-    SequenceAutoencoder,
-    compute_errors_on_loader,
-    fit_autoencoder,
-)
+from src.models.autoencoder import SequenceAutoencoder
+from src.models.training import fit_autoencoder
+from src.models.inference import compute_errors_on_loader, compute_val_auc
 from src.utils.config import get_param
+from src.utils.device import check_cuda_available
 from src.evaluation.metrics import calculate_auc
 from src.utils.seed import set_seed
 
 logger = logging.getLogger(__name__)
-
-# Default epochs for validation search runs (full training happens in Fase 3.2)
-DEFAULT_VAL_EPOCHS = 50
 
 
 def train_and_evaluate_ae(
@@ -75,8 +71,8 @@ def train_and_evaluate_ae(
     seed : int
         Random seed for reproducibility.
     max_val_epochs : int or None
-        Max epochs for this validation run.  Defaults to
-        ``DEFAULT_VAL_EPOCHS``.
+        Max epochs for this validation run. Overrides config ``training.validation_epochs``
+        if provided. If not provided, reads from ``config["training"]["validation_epochs"]``.
     device : str | torch.device | None
         Device to train/evaluate on. ``None`` → auto-detect.
     patience : int or None
@@ -109,12 +105,27 @@ def train_and_evaluate_ae(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     dev = torch.device(device)
 
+    # --- Early GPU check: fail fast if CUDA not actually usable ---
+    if dev.type == "cuda":
+        try:
+            check_cuda_available(dev)
+        except RuntimeError as e:
+            logger.error("GPU check failed in run_id=%d: %s", run_id, e)
+            raise
+
     # --- Extract hyperparameters from config ---
     window_size = int(get_param(config, "data.window_size", 256))
     latent_dim = int(get_param(config, "model.latent_dim", 16))
     enc_channels = tuple(get_param(config, "model.encoder.conv_channels", [64, 32, 16]))
     batch_size = int(get_param(config, "training.batch_size", 256))
-    epochs = max_val_epochs or int(get_param(config, "training.epochs", DEFAULT_VAL_EPOCHS))
+    # Use validation_epochs from config; CLI max_val_epochs overrides if provided
+    val_epochs_cfg = get_param(config, "training.validation_epochs", None)
+    if val_epochs_cfg is not None:
+        epochs = int(val_epochs_cfg)
+    elif max_val_epochs is not None:
+        epochs = int(max_val_epochs)
+    else:
+        raise ValueError("training.validation_epochs not set in config and --max-val-epochs not provided")
     lr = float(get_param(config, "training.learning_rate", 1e-3))
     weight_decay = float(get_param(config, "training.weight_decay", 0.0))
     patience = patience if patience is not None else int(
@@ -170,18 +181,13 @@ def train_and_evaluate_ae(
 
     # --- HP Selection: ROC-AUC + PR-AUC on Validation (val_normal + val_anomaly) ---
     # Using classic MAE scoring (inference only).
-    val_normal_errors = compute_errors_on_loader(model, val_normal_loader, dev, metric=metric)
-    val_anomaly_errors = compute_errors_on_loader(model, val_anomaly_loader, dev, metric=metric)
-
-    # Concatenate errors and create labels (0 = normal, 1 = anomaly)
-    val_errors = np.concatenate([val_normal_errors, val_anomaly_errors])
-    val_labels = np.concatenate([
-        np.zeros(len(val_normal_errors), dtype=np.int32),
-        np.ones(len(val_anomaly_errors), dtype=np.int32)
-    ])
-
-    # Compute AUC metrics (threshold-free: no binarization, no fixed threshold)
-    val_auc = calculate_auc(val_labels, val_errors)   # returns {"roc_auc": ..., "pr_auc": ...}
+    val_auc = compute_val_auc(
+        model=model,
+        val_normal_loader=val_normal_loader,
+        val_anomaly_loader=val_anomaly_loader,
+        device=dev,
+        metric=metric,
+    )
 
     logger.info(
         "Run %d done: val_roc_auc=%.4f, val_pr_auc=%.4f, best_epoch=%d, time=%.1fs",

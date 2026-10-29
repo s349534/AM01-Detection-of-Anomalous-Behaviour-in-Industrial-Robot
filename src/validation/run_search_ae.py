@@ -18,17 +18,17 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import math
 import sys
 import time
 from pathlib import Path
 
-import numpy as np
 from sklearn.model_selection import ParameterGrid, ParameterSampler
 
 from src.utils.config import load_config
+from src.utils.device import check_cuda_available
 from src.validation.run_experiment_ae import train_and_evaluate_ae
 from src.validation.search_space import get_search_space_ae, merge_search_sample
-from src.data.partitioning import plan_from_config
 
 logger = logging.getLogger(__name__)
 
@@ -62,14 +62,50 @@ def get_output_path(config: dict | None = None) -> Path:
 
 
 def write_result_row_csv(path: Path, row: dict, write_header: bool) -> None:
-    """Append a single result dict to the CSV (append mode)."""
+    """Append a single result dict to the CSV (append mode).
+
+    Validates that numeric fields are finite and in valid range before writing.
+    If val_roc_auc or val_pr_auc are NaN/Inf or out of [0,1] range, writes a failure row instead.
+    """
+    # Validate numeric fields before writing
+    csv_row = {col: row.get(col, "") for col in CSV_COLUMNS}
+    
+    # Check critical numeric fields for NaN/Inf and range
+    try:
+        val_roc_auc = float(csv_row.get("val_roc_auc", -1.0))
+        val_pr_auc = float(csv_row.get("val_pr_auc", -1.0))
+        best_epoch = int(csv_row.get("best_epoch", 0))
+        train_time_sec = float(csv_row.get("train_time_sec", 0.0))
+        
+        # If AUC values are NaN/Inf or out of valid range [0, 1], convert to failure row
+        if not (math.isfinite(val_roc_auc) and math.isfinite(val_pr_auc)) or \
+           not (0.0 <= val_roc_auc <= 1.0) or not (0.0 <= val_pr_auc <= 1.0):
+            logger.warning("Invalid AUC values (roc_auc=%s, pr_auc=%s) for run_id=%s - writing failure row",
+                          csv_row.get("val_roc_auc"), csv_row.get("val_pr_auc"), csv_row.get("run_id"))
+            csv_row["val_roc_auc"] = -1.0
+            csv_row["val_pr_auc"] = -1.0
+            csv_row["best_epoch"] = 0
+            csv_row["train_time_sec"] = 0.0
+        
+        # Validate train_time_sec
+        if not math.isfinite(train_time_sec):
+            logger.warning("Invalid train_time_sec=%s for run_id=%s - setting to 0.0",
+                          csv_row.get("train_time_sec"), csv_row.get("run_id"))
+            csv_row["train_time_sec"] = 0.0
+            
+    except (ValueError, TypeError) as e:
+        logger.warning("Error validating row for run_id=%s: %s - writing failure row", csv_row.get("run_id"), e)
+        csv_row["val_roc_auc"] = -1.0
+        csv_row["val_pr_auc"] = -1.0
+        csv_row["best_epoch"] = 0
+        csv_row["train_time_sec"] = 0.0
+    
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, quoting=csv.QUOTE_MINIMAL)
         if write_header:
             writer.writeheader()
-        # Only write the columns defined in CSV_COLUMNS (drop _test_metrics)
-        csv_row = {col: row.get(col, "") for col in CSV_COLUMNS}
         writer.writerow(csv_row)
+        f.flush()  # Ensure data is written to disk immediately
 
 
 def run_search(
@@ -127,6 +163,16 @@ def run_search(
         Path(params_path) if params_path else None,
     )
 
+    # --- Early GPU check: fail fast if CUDA not actually usable ---
+    # This catches "CUDA busy/unavailable" before wasting time on search
+    try:
+        check_cuda_available()
+    except RuntimeError as e:
+        logger.error("GPU check failed: %s", e)
+        logger.error("Interrompo search: GPU richiesta ma non utilizzabile.")
+        logger.error("Verificare: #SBATCH --gres=gpu:1, nvidia-smi, CUDA_VISIBLE_DEVICES")
+        sys.exit(1)
+
     output_csv = get_output_path(base_config)
 
     # --- Determine which run_ids already exist (for resume) ---
@@ -168,22 +214,6 @@ def run_search(
         len(val_seeds), val_seeds, len(samples) * len(val_seeds),
     )
 
-    # --- Run experiments ---
-    # Pre-load validation data shape for window_size validation
-    processed_dir = Path(base_config.get("paths", {}).get("data_processed", "data/processed/"))
-    normal_path = processed_dir / "normal_scaled.npy"
-    val_windows = None
-    if normal_path.exists():
-        # Use the new partitioning to check planned val windows
-        normal_n = np.load(normal_path, mmap_mode="r").shape[0]
-        slow_path = processed_dir / "slow_scaled.npy"
-        slow_n = np.load(slow_path, mmap_mode="r").shape[0] if slow_path.exists() else 0
-        base_plan = plan_from_config(base_config, "normal", normal_n, slow_n)
-        val_windows = len(base_plan.get("val_normal", []))
-        logger.info("Planned val_normal windows: %d", val_windows)
-    else:
-        logger.warning("Validation data not found at %s -- cannot validate window_size", normal_path)
-
     global_run_id = 0
 
     for config_idx, sample in enumerate(samples):
@@ -191,29 +221,6 @@ def run_search(
 
         # Merge sampled HP into config (shared across all seeds for this config)
         run_config = merge_search_sample(base_config, sample)
-
-        # --- Validate window_size against planned validation windows ---
-        window_size = int(run_config.get("data", {}).get("window_size", 256))
-        if val_windows is not None and val_windows == 0:
-            logger.warning(
-                "Skipping config_id=%d: window_size=%d yields 0 validation windows",
-                config_id, window_size
-            )
-            global_run_id += 1
-            fail_row = {
-                "run_id": global_run_id,
-                "config_id": config_id,
-                "W": window_size,
-                "latent_dim": run_config.get("model", {}).get("latent_dim", ""),
-                "val_roc_auc": -1.0,
-                "val_pr_auc": -1.0,
-                "best_epoch": 0,
-                "train_time_sec": 0.0,
-                "seed": "",
-            }
-            write_result_row_csv(output_csv, fail_row, write_header=write_header)
-            write_header = False
-            continue
 
         logger.info(
             "[Config %d/%d] Sample: %s",
@@ -299,6 +306,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--val-seeds", type=int, nargs="+", default=None,
         help="Fixed seeds for validation runs per configuration (default: 7 42 123, §4.8.6)",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="Reduce output verbosity (suppress sync/dep logs)",
     )
     return parser.parse_args()
 

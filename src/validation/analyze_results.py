@@ -18,6 +18,7 @@ import argparse
 import copy
 import csv
 import logging
+import math
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -75,38 +76,94 @@ def load_results_csv(csv_path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     n_failed = 0
     n_malformed = 0
-    with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            row_data: dict[str, Any] = dict(row)
-            try:
-                row_data["run_id"] = int(row_data["run_id"])
-                # config_id is optional (legacy CSVs don't have it)
-                if row_data.get("config_id"):
-                    row_data["config_id"] = int(row_data["config_id"])
-                row_data["W"] = int(row_data["W"])
-                row_data["latent_dim"] = int(row_data["latent_dim"])
-                row_data["val_roc_auc"] = float(row_data["val_roc_auc"])
-                row_data["val_pr_auc"] = float(row_data["val_pr_auc"])
-                row_data["best_epoch"] = int(row_data["best_epoch"])
-                row_data["train_time_sec"] = float(row_data["train_time_sec"])
-                row_data["seed"] = int(row_data["seed"]) if row_data.get("seed") else 0
-                # Skip failed runs (sentinel val_roc_auc/val_pr_auc == -1)
-                if row_data["val_pr_auc"] < 0 or row_data["val_roc_auc"] < 0:
-                    n_failed += 1
-                    continue
-                rows.append(row_data)
-            except (ValueError, KeyError):
-                n_malformed += 1
+    n_nan_inf = 0
+    
+    # Try multiple encodings for robustness
+    encodings = ["utf-8-sig", "utf-8", "latin-1"]
+    file_content = None
+    used_encoding = None
+    
+    for enc in encodings:
+        try:
+            with open(csv_path, "r", newline="", encoding=enc) as f:
+                file_content = f.read()
+            used_encoding = enc
+            break
+        except UnicodeDecodeError:
+            continue
+    
+    if file_content is None:
+        logger.error("Failed to read CSV with any encoding: %s", encodings)
+        return rows
+
+    logger.debug("Successfully read CSV with encoding: %s", used_encoding)
+    
+    # Parse with csv.DictReader from the string content
+    import io
+    reader = csv.DictReader(io.StringIO(file_content))
+    
+    for row_idx, row in enumerate(reader, start=1):
+        row_data: dict[str, Any] = dict(row)
+        try:
+            row_data["run_id"] = int(row_data["run_id"])
+            # config_id is optional (legacy CSVs don't have it)
+            if row_data.get("config_id"):
+                row_data["config_id"] = int(row_data["config_id"])
+            row_data["W"] = int(row_data["W"])
+            row_data["latent_dim"] = int(row_data["latent_dim"])
+            
+            # Parse float fields with NaN/Inf checking
+            val_roc_auc = float(row_data["val_roc_auc"])
+            val_pr_auc = float(row_data["val_pr_auc"])
+            
+            # Check for NaN/Inf
+            if not (math.isfinite(val_roc_auc) and math.isfinite(val_pr_auc)):
+                n_nan_inf += 1
+                logger.warning("Row %d: NaN/Inf in AUC values (roc_auc=%s, pr_auc=%s) - skipping",
+                              row_idx, row_data["val_roc_auc"], row_data["val_pr_auc"])
                 continue
+            
+            # Validate range [0, 1] for AUC values
+            if not (0.0 <= val_roc_auc <= 1.0) or not (0.0 <= val_pr_auc <= 1.0):
+                n_malformed += 1
+                logger.warning("Row %d: AUC values out of range [0,1] (roc_auc=%.4f, pr_auc=%.4f) - skipping",
+                              row_idx, val_roc_auc, val_pr_auc)
+                continue
+            
+            row_data["val_roc_auc"] = val_roc_auc
+            row_data["val_pr_auc"] = val_pr_auc
+            row_data["best_epoch"] = int(row_data["best_epoch"])
+            
+            train_time = float(row_data["train_time_sec"])
+            if not math.isfinite(train_time):
+                n_nan_inf += 1
+                logger.warning("Row %d: NaN/Inf in train_time_sec (%s) - skipping", row_idx, row_data["train_time_sec"])
+                continue
+            row_data["train_time_sec"] = train_time
+            
+            row_data["seed"] = int(row_data["seed"]) if row_data.get("seed") else 0
+            
+            # Skip failed runs (sentinel val_roc_auc/val_pr_auc == -1)
+            if row_data["val_pr_auc"] < 0 or row_data["val_roc_auc"] < 0:
+                n_failed += 1
+                continue
+            rows.append(row_data)
+        except (ValueError, KeyError) as e:
+            n_malformed += 1
+            logger.warning("Row %d: malformed - %s (raw: %s)", row_idx, e, dict(row))
+            continue
 
     if n_failed:
         logger.warning("Skipped %d failed run(s) (val_roc_auc/val_pr_auc == -1)", n_failed)
+    if n_nan_inf:
+        logger.warning("Skipped %d row(s) with NaN/Inf values", n_nan_inf)
     if n_malformed:
         logger.warning("Skipped %d malformed row(s)", n_malformed)
 
     if not rows:
         logger.error("No valid rows found in %s", csv_path)
+    else:
+        logger.info("Loaded %d valid rows from %s (encoding: %s)", len(rows), csv_path, used_encoding)
     return rows
 
 
