@@ -68,7 +68,7 @@ export SCRATCH_PROJECT="am01"
 # UV_NO_SYNC=1 keeps the `uv run` calls from re-syncing (and re-building).
 export UV_NO_SYNC=1
 
-# ── Main execution ──────────────────────────────────────────────────────────
+# ── Main execution ────────────────────────────────────────────────────────
 
 # On compute nodes, BeeGFS scratch ($SCRATCH) is set; on the login node (or some
 # batch contexts) it is NOT exported, so guard it under `set -u` — this fixes
@@ -126,8 +126,6 @@ if torch.cuda.is_available():
 "
 fi
 
-
-
 # ── Preprocessing (always executed) ──────────────────────────────────────────
 # data/processed/ may be stale from a previous run (different hyperparameters,
 # window size, or scaler), so re-generate it every time to guarantee consistency.
@@ -149,18 +147,36 @@ HOME_PROJECT="${HOME}/am01_project"
 
 # data/processed/*.npy, *.pkl, *.json (no --ignore-existing: overwrite stale)
 mkdir -p "${HOME_PROJECT}/data/processed"
-rsync -a \
+rsync -a --info=progress2 \
     --include='*.npy' --include='*.pkl' --include='*.json' --exclude='*' \
-    "${RESULTS_DIR}/data/processed/" "${HOME_PROJECT}/data/processed/" 2>/dev/null || true
+    "${RESULTS_DIR}/data/processed/" "${HOME_PROJECT}/data/processed/"
 
 # data/models/*.pth (se esistono)
 mkdir -p "${HOME_PROJECT}/data/models"
-rsync -a \
+rsync -a --info=progress2 \
     --include='*.pth' --include='*.pt' --exclude='*' \
-    "${RESULTS_DIR}/data/models/" "${HOME_PROJECT}/data/models/" 2>/dev/null || true
+    "${RESULTS_DIR}/data/models/" "${HOME_PROJECT}/data/models/"
+
+# reports/figures/*.png (confusion matrix, sensitivity plots, etc.)
+mkdir -p "${HOME_PROJECT}/reports/figures"
+rsync -a --info=progress2 \
+    --include='*.png' --exclude='*' \
+    "${RESULTS_DIR}/reports/figures/" "${HOME_PROJECT}/reports/figures/"
+
+# reports/tables/*.csv (validation results, final metrics)
+mkdir -p "${HOME_PROJECT}/reports/tables"
+rsync -a --info=progress2 \
+    --include='*.csv' --exclude='*' \
+    "${RESULTS_DIR}/reports/tables/" "${HOME_PROJECT}/reports/tables/"
+
+# reports/checkpoints/*.pth
+mkdir -p "${HOME_PROJECT}/reports/checkpoints"
+rsync -a --info=progress2 \
+    --include='*.pth' --exclude='*' \
+    "${RESULTS_DIR}/reports/checkpoints/" "${HOME_PROJECT}/reports/checkpoints/"
 
 # Log — SLURM writes to ~/jobs/logs/ (relative to sbatch submission dir), not to scratch
 mkdir -p "${HOME_PROJECT}/logs"
 cp ~/jobs/logs/am01_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
 
-echo "Results fetched to ${HOME_PROJECT}/data/processed/ and ${HOME_PROJECT}/logs/"
+echo "Results fetched to ${HOME_PROJECT}/data/processed/, ${HOME_PROJECT}/reports/ and ${HOME_PROJECT}/logs/"

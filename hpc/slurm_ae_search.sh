@@ -145,6 +145,10 @@ uv run python -m src.validation.analyze_results
 echo "=== Outputs ==="
 ls -lh reports/tables/validation_results_ae.csv reports/figures/sensitivity_*.png config/params_validated_ae.yaml 2>/dev/null || true
 
+# ── Debug: verify figures exist before sync ────────────────────────────────────
+echo "=== Debug: figures on scratch ==="
+ls -la "${RESULTS_DIR}/reports/figures/" 2>/dev/null || echo "No figures dir on scratch"
+
 # ── Fetch results back to $HOME (so hpc_connect.sh batch can download) ──────
 RESULTS_DIR="${SCRATCH_DIR}/${SCRATCH_PROJECT}"
 HOME_PROJECT="${HOME}/am01_project"
@@ -160,21 +164,26 @@ rm -f "${RESULTS_DIR}/reports/tables/ae_final_metrics.csv" \
       "${HOME_PROJECT}/reports/tables/ae_final_metrics.csv" 2>/dev/null || true
 
 # CSV + YAML + plots --delete: remove stale files not present in this run's output.
-rsync -a --delete \
-    "${RESULTS_DIR}/reports/tables/" "${HOME_PROJECT}/reports/tables/" 2>/dev/null || true
-rsync -a --delete \
-    "${RESULTS_DIR}/reports/figures/" "${HOME_PROJECT}/reports/figures/" 2>/dev/null || true
+rsync -a --delete --info=progress2 \
+    "${RESULTS_DIR}/reports/tables/" "${HOME_PROJECT}/reports/tables/"
+rsync -a --delete --info=progress2 \
+    "${RESULTS_DIR}/reports/figures/" "${HOME_PROJECT}/reports/figures/"
 
 # params_validated_ae.yaml (produced by analyze_results)
-rsync -a \
-    "${RESULTS_DIR}/config/" "${HOME_PROJECT}/config/" 2>/dev/null || true
+rsync -a --info=progress2 \
+    "${RESULTS_DIR}/config/" "${HOME_PROJECT}/config/"
 
 # data/processed/ — sync from scratch to home so cmd_batch can download
-rsync -a --include='*.npy' --include='*.pkl' --include='*.json' --exclude='*' \
-    "${RESULTS_DIR}/data/processed/" "${HOME_PROJECT}/data/processed/" 2>/dev/null || true
+# --delete removes stale artifacts (e.g., old plan_*.npy no longer generated)
+rsync -a --delete --info=progress2 --include='*.npy' --include='*.pkl' --include='*.json' --exclude='*' \
+    "${RESULTS_DIR}/data/processed/" "${HOME_PROJECT}/data/processed/"
 
 # Log — SLURM writes to ~/jobs/logs/ (relative to sbatch submission dir), not to scratch
 cp ~/jobs/logs/am01_ae_search_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+
+# Debug: verify figures synced to home
+echo "=== Debug: figures on home ==="
+ls -la "${HOME_PROJECT}/reports/figures/" 2>/dev/null || echo "No figures dir on home"
 
 echo "=== Results fetched to ${HOME_PROJECT}/reports/ and ${HOME_PROJECT}/config/ ==="
 echo "Job completed."
