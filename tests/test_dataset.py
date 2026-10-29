@@ -353,7 +353,7 @@ class TestPreprocessingOutput:
             assert 0 < info["coverage_ratio"] <= 1
 
     def test_build_dataloaders(self, config):
-        loaders = build_dataloaders(config, partitions=["train", "val_normal", "val_anomaly"], num_workers=0)
+        loaders = build_dataloaders(config, partitions=["train", "val_normal", "val_anomaly"], num_workers=0, use_prebuilt_partitions=False)
         assert "train" in loaders
         assert "val_normal" in loaders
         assert "val_anomaly" in loaders

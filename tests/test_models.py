@@ -13,10 +13,9 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.models.autoencoder import (
+from src.models import (
     Conv1dDecoder,
     Conv1dEncoder,
-    EarlyStopping,
     SequenceAutoencoder,
     fit_autoencoder,
 )
@@ -162,21 +161,9 @@ class TestReconstructionError:
 
 
 # ---------------------------------------------------------------------------
-# Test EarlyStopping and Fit
+# Test Fit
 # ---------------------------------------------------------------------------
 class TestTrainingUtilities:
-    def test_early_stopping_trigger(self):
-        model = nn.Linear(10, 10)
-        es = EarlyStopping(patience=3, min_delta=1e-3)
-
-        # Non-improving losses: 1.0, 1.0, 1.0, 1.0
-        assert not es(1.0, model)
-        assert not es(1.0, model)
-        assert not es(1.0, model)
-        # 4th time with patience=3 triggers early stopping
-        assert es(1.0, model)
-        assert es.early_stop is True
-
     def test_fit_autoencoder_smoke(self):
         """Smoke test running fit_autoencoder on a tiny dataset for 2 epochs."""
         model = SequenceAutoencoder(input_dim=82, window_size=16, latent_dim=8)

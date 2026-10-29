@@ -22,6 +22,7 @@ from src.evaluation import (
     evaluate_threshold,
 )
 from src.models.autoencoder import SequenceAutoencoder
+from src.models.inference import compute_errors_on_loader
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +172,7 @@ class TestCalibrateThreshold:
 # ---------------------------------------------------------------------------
 class TestEvaluateModel:
     def test_evaluate_model(self, mock_model, dummy_loaders):
-        with patch("src.models.autoencoder.compute_errors_on_loader") as mock_compute:
+        with patch("src.models.inference.compute_errors_on_loader") as mock_compute:
             mock_compute.side_effect = [
                 np.array([0.1, 0.15, 0.2]),
                 np.array([0.8, 0.9, 1.0]),
