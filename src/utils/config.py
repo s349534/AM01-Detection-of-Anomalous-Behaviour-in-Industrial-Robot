@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import yaml
 
@@ -21,6 +21,36 @@ import yaml
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config" / "config.yaml"
 _DEFAULT_PARAMS_PATH = _PROJECT_ROOT / "config" / "params.yaml"
+
+
+class PathsConfig(TypedDict, total=False):
+    """Typed dict for config paths section."""
+    data_raw: str
+    data_processed: str
+    models: str
+    reports: str
+    notebooks: str
+
+
+class ConfigDict(TypedDict, total=False):
+    """Typed dict for full config structure."""
+    project: dict
+    environment: dict
+    paths: PathsConfig
+    logging: dict
+    data: dict
+    model: dict
+    training: dict
+
+
+# Default paths centralizzati (non sparsi nel codice)
+_DEFAULT_PATHS: PathsConfig = {
+    "data_raw": "data/raw/",
+    "data_processed": "data/processed/",
+    "models": "src/models/",
+    "reports": "reports/",
+    "notebooks": "notebooks/",
+}
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -75,10 +105,15 @@ def load_config(
         return base
 
     _deep_merge(merged, params)
+
+    # Ensure paths section exists with defaults (config.yaml may be missing on HPC)
+    if "paths" not in merged:
+        merged["paths"] = dict(_DEFAULT_PATHS)  # type: ignore[assignment]
+
     return merged
 
 
-def get_param(config: dict[str, Any], key: str, default: Any = None) -> Any:
+def get_param(config: ConfigDict, key: str, default: Any = None) -> Any:
     """Retrieve a nested config value using dot-notation.
 
     Examples

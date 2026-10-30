@@ -1,0 +1,69 @@
+{
+  "config": {
+    "window_len": 128,
+    "forecast_half": 64,
+    "enc_channels": [
+      64,
+      32
+    ],
+    "batch_size": 256,
+    "epochs_cap": 60,
+    "patience": 10,
+    "lr": 0.001,
+    "aae_lambda_adv": 0.01,
+    "aae_lr_G": 0.001,
+    "aae_lr_D": 0.0001,
+    "data": "KukaNormal (action dropped, 85 features), chronological split",
+    "slow_split": "first 50% slow windows for threshold validation; remaining for final test",
+    "n_slow_val": 162,
+    "n_slow_test": 162,
+    "n_val_normal": 273,
+    "n_test_normal": 273
+  },
+  "models": {
+    "Reconstruction AE": {
+      "val_roc_auc": 0.010355899244788132,
+      "val_pr_auc": 0.21644530701295633,
+      "test_roc_auc": 0.9565414009858454,
+      "test_pr_auc": 0.9549695522037356,
+      "threshold_mu2": 0.03171555697917938,
+      "threshold_pct": 0.025696150958538055,
+      "best_percentile": 80,
+      "test_f1_mu2": 0.734375,
+      "test_f1_pct": 0.9114754098360656
+    },
+    "Forecasting AE": {
+      "val_roc_auc": 0.34922896034007145,
+      "val_pr_auc": 0.30893469523821826,
+      "test_roc_auc": 0.9647266313932981,
+      "test_pr_auc": 0.9561387374057371,
+      "threshold_mu2": 0.06691595166921616,
+      "threshold_pct": 0.04800806939601898,
+      "best_percentile": 80,
+      "test_f1_mu2": 0.8936170212765957,
+      "test_f1_pct": 0.773067331670823
+    },
+    "AAE": {
+      "val_roc_auc": 0.005675394564283452,
+      "val_pr_auc": 0.2161335550115489,
+      "test_roc_auc": 0.9453715009270566,
+      "test_pr_auc": 0.9517668354538751,
+      "threshold_mu2": 0.04112374037504196,
+      "threshold_pct": 0.036314815282821655,
+      "best_percentile": 80,
+      "test_f1_mu2": 0.9385113268608414,
+      "test_f1_pct": 0.8902439024390244
+    },
+    "Forecasting AAE": {
+      "val_roc_auc": 0.2627187627187627,
+      "val_pr_auc": 0.26961582024494324,
+      "test_roc_auc": 0.9788133677022566,
+      "test_pr_auc": 0.9682374810254664,
+      "threshold_mu2": 0.08336678892374039,
+      "threshold_pct": 0.06835033744573593,
+      "best_percentile": 85,
+      "test_f1_mu2": 0.7384615384615385,
+      "test_f1_pct": 0.9493670886075949
+    }
+  }
+}

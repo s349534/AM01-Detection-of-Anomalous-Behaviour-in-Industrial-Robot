@@ -1,0 +1,87 @@
+project:
+  name: AM01-AnomalyDetection
+  version: 0.1.0
+  description: Detection of Anomalous Behaviour in Industrial Robot using Adversarial
+    Autoencoders
+  author: Student Group
+  course: Machine Learning in Applications
+  university: Politecnico di Torino
+environment:
+  python_version: '>=3.10'
+  framework: pytorch
+  device: cuda
+paths:
+  data_raw: data/raw/
+  data_processed: data/processed/
+  models: src/models/
+  reports: reports/
+  notebooks: notebooks/
+logging:
+  level: INFO
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+model:
+  name: adversarial_autoencoder
+  input_dim: 86
+  encoding_dim: 32
+  latent_dim: 16
+  encoder:
+    conv_channels:
+    - 64
+    - 32
+    - 16
+    conv_kernels:
+    - 5
+    - 3
+    - 3
+    pool_size: 2
+    activation: relu
+  discriminator:
+    hidden_layers:
+    - 32
+    - 16
+    activation: leaky_relu
+training:
+  batch_size: 256
+  epochs: 300
+  validation_epochs: 150
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  beta1: 0.5
+  beta2: 0.999
+  num_workers: 4
+  adversarial_weight: 0.1
+  reconstruction_weight: 1.0
+  loss: mae
+  reconstruction_metric: mae
+  early_stopping:
+    patience: 15
+    min_delta: 0.001
+  train_split: 0.7
+  val_split: 0.15
+  slow_val_split: 0.5
+data:
+  normal_data_path: data/raw/KukaNormal.npy
+  slow_data_path: data/raw/KukaSlow.npy
+  column_names_path: data/raw/KukaColumnNames.npy
+  window_size: 32
+  normalization: minmax
+  clip_out_of_range: true
+  augmentation: false
+  partitioning:
+    mode: interleaved
+    chunk_size: 1024
+    gap: window
+    quotas:
+      normal:
+        train: 0.7
+        val_normal: 0.15
+        test_normal: 0.15
+      slow:
+        val_anomaly: 0.5
+        test_anomaly: 0.5
+    stride_multipliers:
+      train: 0.25
+      val_normal: 0.5
+      test_normal: 0.5
+      val_anomaly: 0.5
+      test_anomaly: 0.5

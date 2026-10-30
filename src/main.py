@@ -46,6 +46,11 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help="Which pipeline phase to run (default: all)",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Reduce output verbosity (suppress sync/dep logs)",
+    )
     return parser.parse_args()
 
 
@@ -64,11 +69,10 @@ def import_modules() -> None:
     print("--- Importing project modules ---")
     from src.data import dataset, preprocessing  # noqa: F401
     try:
-        from src.models import autoencoder, adversarial_ae, compare_models  # noqa: F401
+        from src.models import autoencoder  # noqa: F401
         print("models import OK.")
     except ImportError as e:
         print(f"models import skipped (scaffolding): {e}")
-    from src.utils import metrics, visualization  # noqa: F401
     print("All src.* modules import OK.")
 
 
@@ -81,14 +85,37 @@ def run_phase_preprocess(config: dict) -> None:
 
 
 def run_phase_train(config: dict) -> None:
-    """Fase 3–4 placeholder (AE / AAE training)."""
-    print("\n[Not yet implemented] Fase 3: Train baseline Autoencoder")
-    print("[Not yet implemented] Fase 4: Train Adversarial Autoencoder")
+    """Run Fase 3 — Train baseline SequenceAutoencoder."""
+    from src.models.train_ae import run_final_training
+
+    print("\n=== Fase 3: Train Baseline SequenceAutoencoder ===")
+    run_final_training(
+        config_path="config/params_validated_ae.yaml",
+        seeds=[42, 123, 7],
+    )
 
 
 def run_phase_evaluate(config: dict) -> None:
-    """Fase 5 placeholder (model comparison + metrics)."""
-    print("\n[Not yet implemented] Fase 5: Evaluate and compare models")
+    """Fase 5 — Evaluate trained model on test set."""
+    from src.evaluation.evaluate import evaluate_checkpoints
+    from pathlib import Path
+
+    checkpoint_path = Path("reports/checkpoints/ae_baseline.pth")
+    if not checkpoint_path.exists():
+        print(f"Checkpoint not found: {checkpoint_path}. Train first with --phase train")
+        return
+
+    print("\n=== Fase 5: Evaluate Model ===")
+    result = evaluate_checkpoints(
+        checkpoint_paths=[checkpoint_path],
+        config=config,
+    )
+    tm = result["per_seed"][0]
+    print(f"Test ROC-AUC: {tm['roc_auc']:.4f} | PR-AUC: {tm['pr_auc']:.4f} | F1: {tm['f1']:.4f}")
+    cm = tm["confusion_matrix"]
+    print(f"Confusion matrix: TN={cm['tn']} FP={cm['fp']} FN={cm['fn']} TP={cm['tp']}")
+    print("For the full report (figure + metrics CSV) run: python -m src.evaluation "
+          "--checkpoint reports/checkpoints/ae_baseline.pth")
 
 
 def main() -> None:
@@ -98,7 +125,7 @@ def main() -> None:
     # Ensure UTF-8 output on Windows (cp1252 can't encode em-dashes etc.)
     # On Linux this is a no-op.
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     except AttributeError:
         pass
 
@@ -131,7 +158,7 @@ def main() -> None:
     }
 
     if args.phase == "all":
-        for phase_name, phase_fn in phases.items():
+        for phase_fn in phases.values():
             phase_fn(config)
     else:
         phases[args.phase](config)

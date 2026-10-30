@@ -43,6 +43,12 @@ echo "  PolitO Legion Cluster"
 echo "=========================================="
 echo ""
 
+# The project is an APPLICATION run from the project root: it is NOT installed
+# into the venv (building it would need setuptools downloaded from PyPI, which
+# fails on the cluster). UV_NO_SYNC=1 stops the `uv run` calls below from
+# re-syncing (and therefore re-building) the project.
+export UV_NO_SYNC=1
+
 # ── Step 1: Check system info ───────────────────────────────────────────────
 echo "--- System Information ---"
 echo "User:  $(whoami)"
@@ -79,28 +85,28 @@ fi
 # ── Step 4: Sync dependencies from the frozen lockfile ──────────────────────
 echo ""
 echo "--- Syncing project dependencies (frozen lockfile) ---"
-uv sync --frozen
+# --no-install-project: the project is an APPLICATION run from the project
+# root (`python -m src...`), it does not need to be installed in the venv.
+# Installing it would build it with setuptools, which must be DOWNLOADED from
+# PyPI — that fails on the cluster (no PyPI access, connection timeout).
+uv sync --frozen --no-install-project -q
 # Re-export pinned requirements.txt for any pip-based fallback
-uv export --no-dev --no-hashes -o requirements.txt 2>/dev/null || true
+uv export --no-dev --no-hashes -o requirements.txt -q 2>/dev/null || true
 
 # ── Step 5: Register Jupyter kernel ─────────────────────────────────────────
 echo ""
 echo "--- Registering Jupyter kernel ---"
-uv run python -m ipykernel install --user --name "am01-hpc" --display-name "AM01 (HPC)"
+uv run -q python -m ipykernel install --user --name "am01-hpc" --display-name "AM01 (HPC)"
 echo "Jupyter kernel 'am01-hpc' registered."
 
 # ── Step 6: Verify ──────────────────────────────────────────────────────────
 echo ""
 echo "--- Verification ---"
-uv run python -c "
+uv run -q python -c "
 import numpy, pandas, sklearn, torch
-print(f'numpy={numpy.__version__}')
-print(f'pandas={pandas.__version__}')
-print(f'sklearn={sklearn.__version__}')
-print(f'torch={torch.__version__}')
+print(f'numpy={numpy.__version__} pandas={pandas.__version__} sklearn={sklearn.__version__} torch={torch.__version__}')
 from src.data import dataset, preprocessing
-from src.models import autoencoder, adversarial_ae
-from src.utils import metrics, visualization
+from src.models import autoencoder
 print('All project modules import successfully!')
 "
 
@@ -109,8 +115,9 @@ echo ""
 if [[ ! -d "${PROJECT_DIR}/data/raw" ]]; then
     echo ""
     echo "WARNING: data/raw/ not found on cluster."
-    echo "  Preprocesing will fail without the Kuka .npy files."
-    echo "  Upload once:  ./hpc_connect.sh upload data/raw/ ~/am01_project/data/raw/"
+    echo "  Preprocessing will fail without the Kuka .npy files."
+    echo "  They are included in deploy. If absent, upload once:"
+    echo "  ./hpc_connect.sh upload data/raw/ ~/am01_project/data/raw/"
 else
     echo "data/raw/ present — preprocessing can run."
 fi

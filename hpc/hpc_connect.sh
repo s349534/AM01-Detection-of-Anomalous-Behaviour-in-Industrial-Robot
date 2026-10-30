@@ -31,7 +31,9 @@
 set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────────────────
-HPC_USER="${HPC_USER:-mungolo}"
+# Priority: 1) env var (loaded from .env via `source .env`)
+#           2) empty default — forces explicit configuration per user
+HPC_USER="${HPC_USER:-}"
 HPC_HOST="${HPC_HOST:-polito-hpc}"
 # Use $HOME literal (NOT $HOME expanded locally, NOT ~/ which POSIX sh
 # inside ssh neutralises when single-quoted) so the REMOTE shell expands it
@@ -39,17 +41,19 @@ HPC_HOST="${HPC_HOST:-polito-hpc}"
 PROJECT_DIR_REMOTE="${PROJECT_DIR_REMOTE:-\$HOME/am01_project}"
 SSH_OPTS="-o StrictHostKeyChecking=yes -o ConnectTimeout=10"
 # Things never to upload to the HPC (large / secret / local-only)
+# NOTE: data/raw/ IS included — the preprocessing step on the compute node needs
+#       the Kuka .npy files.  rsync is incremental so they are only transferred once.
 RSYNC_EXCLUDES=(
     --exclude='.git/'
     --exclude='.venv/'
     --exclude='__pycache__/'
     --exclude='.ipynb_checkpoints/'
-    --exclude='data/raw/'
     --exclude='*.pth'
     --exclude='*.pt'
     --exclude='*.ckpt'
     --exclude='outputs/'
     --exclude='reports/figures/'
+    --exclude='reports/tables/ae_final_metrics.csv'
 )
 
 # ── Resolve paths relative to this script & project root (cwd-independent)
@@ -100,8 +104,8 @@ cmd_exec() {
 }
 
 cmd_interactive() {
-    local partition="${2:-gpu_a40}"
-    local time="${3:-04:00:00}"
+    local partition="${1:-gpu_a40}"
+    local time="${2:-04:00:00}"
     echo "Requesting interactive SLURM session..."
     echo "  Partition: ${partition}"
     echo "  Walltime:  ${time}"
@@ -207,13 +211,34 @@ cmd_keycopy() {
     echo "Key registered. Verify with: ./hpc_connect.sh keycheck"
 }
 
+# ── Code fingerprint (content-based, immune to timestamp drift) ───────────────
+# rsync's default "quick check" (size + mtime) can SKIP a file whose local
+# timestamp was not bumped (e.g. restored by OneDrive) -> the HPC would keep
+# running a STALE copy of the code. The fingerprint compares file CONTENTS.
+code_fingerprint() {
+    local root="$1"
+    (
+        cd "${root}" 2>/dev/null || exit 1
+        find src config hpc -type f \( -name '*.py' -o -name '*.yaml' -o -name '*.sh' \) 2>/dev/null \
+            | sort \
+            | xargs -r sha256sum 2>/dev/null \
+            | sha256sum \
+            | cut -d' ' -f1
+    )
+}
+
 # ── Upload the whole project (idempotent: rsync, excludes large/secret) ──────
-#   usage:  ./hpc_connect.sh upload-project [--dry-run]
+#   usage:  ./hpc_connect.sh upload-project [--dry-run] [--clean]
+#     --clean: also delete remote files that don't exist locally (--delete)
 cmd_upload_project() {
     local target
     target=$(ssh_target)
     local dry=0
-    [[ "${1:-}" == "--dry-run" ]] && dry=1
+    local clean=0
+    for arg in "$@"; do
+        [[ "${arg}" == "--dry-run" ]] && dry=1
+        [[ "${arg}" == "--clean" ]] && clean=1
+    done
     echo "Uploading project -> ${target}:${PROJECT_DIR_REMOTE}/"
     echo "Local source: ${PROJECT_ROOT}"
     if [[ "$dry" == "1" ]]; then
@@ -230,7 +255,35 @@ cmd_upload_project() {
     # expand ~ inside single quotes).
     ssh_run "$(ssh_target)" "mkdir -p ${PROJECT_DIR_REMOTE}"
     if command -v rsync >/dev/null 2>&1; then
-        rsync -avz -e "ssh ${SSH_OPTS}" "${RSYNC_EXCLUDES[@]}" "${PROJECT_ROOT}/" "${target}:${PROJECT_DIR_REMOTE}"
+        local delete_flag=()
+        [[ "$clean" == "1" ]] && delete_flag=(--delete)
+        rsync -avz -e "ssh ${SSH_OPTS}" "${delete_flag[@]}" "${RSYNC_EXCLUDES[@]}" "${PROJECT_ROOT}/" "${target}:${PROJECT_DIR_REMOTE}"
+
+        # ── Code-only sync with --checksum (content-based) ──────────────────
+        # Guarantees the HPC runs byte-identical sources even if the quick
+        # check above skipped a file because of a stale timestamp.
+        rsync -avz --checksum -e "ssh ${SSH_OPTS}" \
+            --include='*/' --include='*.py' --include='*.yaml' --include='*.sh' --exclude='*' \
+            "${PROJECT_ROOT}/src/" "${target}:${PROJECT_DIR_REMOTE}/src/"
+        rsync -avz --checksum -e "ssh ${SSH_OPTS}" \
+            --include='*/' --include='*.yaml' --include='*.sh' --exclude='*' \
+            "${PROJECT_ROOT}/config/" "${target}:${PROJECT_DIR_REMOTE}/config/"
+        rsync -avz --checksum -e "ssh ${SSH_OPTS}" \
+            --include='*/' --include='*.sh' --exclude='*' \
+            "${PROJECT_ROOT}/hpc/" "${target}:${PROJECT_DIR_REMOTE}/hpc/"
+
+        # ── Verify the deployed code matches the local code ────────────────
+        local local_fp remote_fp
+        local_fp="$(code_fingerprint "${PROJECT_ROOT}")"
+        remote_fp="$(ssh_run "$(ssh_target)" "cd ${PROJECT_DIR_REMOTE} && find src config hpc -type f \( -name '*.py' -o -name '*.yaml' -o -name '*.sh' \) 2>/dev/null | sort | xargs -r sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1" 2>/dev/null | tr -d '\r\n')"
+        if [[ -n "${local_fp}" && -n "${remote_fp}" && "${local_fp}" != "${remote_fp}" ]]; then
+            echo "ERROR: deployed code does NOT match the local code (fingerprint mismatch)."
+            echo "  local : ${local_fp}"
+            echo "  remote: ${remote_fp}"
+            echo "  The HPC would run a STALE copy — aborting to avoid a broken job."
+            exit 1
+        fi
+        echo "Code fingerprint verified: ${local_fp}"
     else
         # Fallback: pipe a tar stream over ssh so the EXCLUDES are still honoured
         # (plain scp has no --exclude support and would upload .venv/.git).
@@ -257,10 +310,18 @@ cmd_upload_project() {
 # ── Full deploy: upload + one-shot environment setup ──────────────────────────
 #   usage:  ./hpc_connect.sh deploy            # [--dry-run] -> dry-run the upload only
 #           ./hpc_connect.sh deploy --dry-run  # show what would be uploaded + setup
+#           ./hpc_connect.sh deploy --clean    # also delete remote files not in local
 cmd_deploy() {
     local dry=0
-    [[ "${1:-}" == "--dry-run" ]] && dry=1
-    cmd_upload_project $([[ "$dry" == "1" ]] && echo "--dry-run")
+    local clean=0
+    for arg in "$@"; do
+        [[ "${arg}" == "--dry-run" ]] && dry=1
+        [[ "${arg}" == "--clean" ]] && clean=1
+    done
+    local upload_args=()
+    [[ "$dry" == "1" ]] && upload_args+=("--dry-run")
+    [[ "$clean" == "1" ]] && upload_args+=("--clean")
+    cmd_upload_project "${upload_args[@]}"
     if [[ "$dry" == "1" ]]; then
         echo "[dry-run] would then run setup_env.sh on the HPC (install uv, uv sync --frozen, register kernel)."
         return 0
@@ -279,36 +340,80 @@ cmd_deploy() {
 # ── Batch: deploy + submit + stream log + fetch results ──────────────────────
 #   usage:  ./hpc_connect.sh batch <slurm_script>
 #           ./hpc_connect.sh batch --dry-run <slurm_script>   # preview only
-#
-#   After submitting, streams the unified log (stdout+stderr) live via tail -f.
-#   Ctrl-C detaches the stream — the job keeps running on SLURM. When the job
-#   finishes, results (data/processed/*.npy, *.pkl) and the latest log are
-#   downloaded to the local project directory automatically.
+#           ./hpc_connect.sh batch --clean <slurm_script>     # clean remote before deploy
 cmd_batch() {
     local dry=0
+    local clean=0
     local script
-    if [[ "${1:-}" == "--dry-run" ]]; then dry=1; shift; fi
-    script="$1"
-    [[ -n "${script}" ]] || { echo "ERROR: usage: ./hpc_connect.sh batch [--dry-run] <slurm_script>"; exit 1; }
+    # Parse flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) dry=1; shift ;;
+            --clean) clean=1; shift ;;
+            *) script="$1"; shift; break ;;
+        esac
+    done
+    [[ -n "${script:-}" ]] || { echo "ERROR: usage: ./hpc_connect.sh batch [--dry-run] [--clean] <slurm_script>"; exit 1; }
 
-    cmd_deploy $([[ "$dry" == "1" ]] && echo "--dry-run")
+    local deploy_args=()
+    [[ "$dry" == "1" ]] && deploy_args+=("--dry-run")
+    [[ "$clean" == "1" ]] && deploy_args+=("--clean")
+    cmd_deploy "${deploy_args[@]}"
     [[ "$dry" == "1" ]] && { echo "[dry-run] would then submit ${script} (via upload+sbatch)."; return 0; }
 
     echo ""
 
+    # ── Resolve project root ────────────────────────────────────────────────
+    # cd to PROJECT_ROOT for consistency (fetch uses ${PROJECT_ROOT} abs paths)
+    if [[ ! -f "pyproject.toml" ]]; then
+        cd "${PROJECT_ROOT}" || return 1
+    fi
     # ── Upload SLURM script ─────────────────────────────────────────────────
-    local basename_script
+    local basename_script abs_script
     basename_script=$(basename "${script}")
+    abs_script="$(cd "$(dirname "${script}")" 2>/dev/null && pwd)/$(basename "${script}")"
+    [[ -f "${abs_script}" ]] || abs_script="${script}"
     ssh_run "$(ssh_target)" "mkdir -p ~/jobs/logs"
-    scp "${script}" "$(ssh_target):~/jobs/${basename_script}"
+    scp "${abs_script}" "$(ssh_target):~/jobs/${basename_script}"
     echo "Uploaded ${basename_script} → ~/jobs/"
 
     # ── Submit and capture job ID ───────────────────────────────────────────
     local jid
-    jid=$(ssh_run "$(ssh_target)" "cd ~/jobs && sbatch ${basename_script}" 2>&1 \
-          | sed -n 's/.*Submitted batch job \([0-9]*\).*/\1/p')
+    # Propagate env vars to the SLURM job
+    local sbatch_env=""
+    for _v in N_ITER MAX_VAL_EPOCHS SEEDS MAX_EPOCHS; do
+        if [[ -n "${!_v:-}" ]]; then
+            sbatch_env="${sbatch_env} ${_v}='${!_v}'"
+        fi
+    done
+    # Use --parsable so sbatch outputs ONLY the job ID (no extra text).
+    # This makes extraction robust against cluster-specific message formats
+    # that broke the classic "Submitted batch job N" sed pattern.
+    local sbatch_cmd="sbatch --parsable ${basename_script}"
+    if [[ -n "${sbatch_env}" ]]; then
+        sbatch_cmd="env ${sbatch_env} ${sbatch_cmd}"
+    fi
+    set +e
+    local sbatch_out
+    sbatch_out=$(ssh_run "$(ssh_target)" "cd ~/jobs && ${sbatch_cmd}" 2>&1)
+    local sbatch_rc=$?
+    set -e
+    if [[ ${sbatch_rc} -ne 0 ]]; then
+        echo "ERROR: sbatch failed (rc=${sbatch_rc}). Output:"
+        echo "${sbatch_out}"
+        echo "Try manually: ssh $(ssh_target) 'cd ~/jobs && sbatch ${basename_script}'"
+        return 1
+    fi
+    # --parsable prints just the JID, but fall back to the classic pattern
+    # in case this SLURM version ignores --parsable.
+    jid=$(echo "${sbatch_out}" | sed -n 's/.*Submitted batch job \([0-9]*\).*/\1/p')
+    if [[ -z "${jid:-}" ]]; then
+        jid=$(echo "${sbatch_out}" | grep -oE '[0-9]+' | head -1)
+    fi
     if [[ -z "${jid:-}" ]]; then
         echo "ERROR: could not extract job ID from sbatch output."
+        echo "Raw sbatch output:"
+        echo "${sbatch_out}"
         echo "Try manually: ssh $(ssh_target) 'cd ~/jobs && sbatch ${basename_script}'"
         return 1
     fi
@@ -316,61 +421,125 @@ cmd_batch() {
     echo ""
 
     # ── Stream log live until job completes ─────────────────────────────────
-    # The SLURM template writes to logs/am01_train_<JID>.log (unified stdout+stderr).
+    # The SLURM template writes to logs/am01_<jobname>_<JID>.log (unified stdout+stderr).
+    # Job names vary: am01_train, am01_ae_search, am01_ae_train — use glob to match.
     # Ctrl-C detaches — the job continues on SLURM.
     echo "=== Live log (Ctrl-C to detach, job continues) ==="
-    echo "  tail -f ~/jobs/logs/am01_train_${jid}.log"
+    echo "  tail -f ~/jobs/logs/am01_*_${jid}.log"
     echo ""
-    ssh_run "$(ssh_target)" "
-        set +e
-        LOG=\"~/jobs/logs/am01_train_${jid}.log\"
-        # Wait for log file to appear (job may be PENDING)
-        for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-            [[ -f \$LOG ]] && break
-            sleep 5
-        done
-        # Stream live
-        tail -n +1 -f \$LOG 2>/dev/null &
-        TAIL_PID=\$!
-        # Poll every 15s until the job leaves the queue
-        while squeue -j ${jid} -h -o '%T' 2>/dev/null | grep -q .; do
-            sleep 15
-        done
-        kill \$TAIL_PID 2>/dev/null || true
-        wait \$TAIL_PID 2>/dev/null || true
-        echo ''
-        echo '=== Job ${jid} completed ==='
-        tail -8 \$LOG 2>/dev/null || true
-    "
+    # Run log streaming on HPC via a single ssh_run invocation.
+    # Use a temp script to avoid fragile quoting of variables inside a nested string.
+    # The stream script polls every 60s for the log file to appear (the cluster
+    # may still be starting the job, so the log does not exist yet) and retries
+    # indefinitely — it does not stop after the first 60s window.
+    local _stream_script="/tmp/am01_stream_${jid}.sh"
+    cat > "${_stream_script}.base" <<'EOFSRIPT'
+#!/bin/bash
+set +e
+JID="$1"
+# Poll every 60s for the log file. The cluster may still be starting the job
+# (PENDING/QUEUED), so the log does not exist yet; keep retrying indefinitely
+# instead of giving up after the first 60s window.
+log_file=""
+while [[ -z "$log_file" ]]; do
+    log_file=$(ls ~/jobs/logs/am01_*_${JID}.log 2>/dev/null | head -1)
+    sleep 60
+done
+# Stream live (use resolved log_file, not the glob)
+tail -n +1 -f "$log_file" 2>/dev/null &
+TAIL_PID=$!
+# Poll every 15s until the job leaves the queue
+while squeue -j ${JID} -h -o '%T' 2>/dev/null | grep -q .; do
+    sleep 15
+done
+kill $TAIL_PID 2>/dev/null || true
+wait $TAIL_PID 2>/dev/null || true
+echo ''
+echo "=== Job ${JID} completed ==="
+tail -8 "$log_file" 2>/dev/null || true
+EOFSRIPT
+    # JID is passed as $1 to the stream script (no sed substitution needed)
+    cp "${_stream_script}.base" "${_stream_script}"
+    chmod +x "${_stream_script}" 2>/dev/null || true
+    # Upload and execute on HPC (run in foreground so Ctrl-C detaches cleanly)
+    scp "${_stream_script}" "$(ssh_target):~/am01_stream_${jid}.sh" 2>/dev/null || true
+    ssh_run "$(ssh_target)" "bash ~/am01_stream_${jid}.sh ${jid}"
 
     # ── Auto-download results ───────────────────────────────────────────────
     echo ""
     echo "=== Fetching results to local ==="
-    mkdir -p ./data/processed ./logs
+    mkdir -p "${PROJECT_ROOT}/data/processed" "${PROJECT_ROOT}/reports/tables" \
+             "${PROJECT_ROOT}/reports/figures" "${PROJECT_ROOT}/reports/checkpoints" \
+             "${PROJECT_ROOT}/logs" \
+             "${PROJECT_ROOT}/config"
+
+    # Always clear training-only artefacts first so that stale local copies do
+    # not survive a validation-only run (where these files are NOT produced).
+    # If the SLURM job DID produce them, they will be re-downloaded below.
+    rm -f "${PROJECT_ROOT}/reports/tables/ae_final_metrics.csv" \
+          "${PROJECT_ROOT}/reports/tables/aae_final_metrics.csv" \
+          "${PROJECT_ROOT}/reports/tables/ae_test_metrics.csv" \
+          "${PROJECT_ROOT}/reports/checkpoints/ae_baseline.pth" \
+          "${PROJECT_ROOT}/reports/checkpoints/ae_baseline_seed*.pth" \
+          "${PROJECT_ROOT}/reports/checkpoints/aae_final.pth" 2>/dev/null || true
 
     if command -v rsync >/dev/null 2>&1; then
-        rsync -av --progress \
+        rsync -av --progress --delete \
             "$(ssh_target):~/am01_project/data/processed/" \
-            ./data/processed/ 2>/dev/null || true
+            "${PROJECT_ROOT}/data/processed/" 2>/dev/null || true
+
+        # Download reports/ (CSV + plots) — populated by AE search / training jobs
+        rsync -av --progress --delete \
+            "$(ssh_target):~/am01_project/reports/tables/" \
+            "${PROJECT_ROOT}/reports/tables/" 2>/dev/null || true
+        rsync -av --progress --delete \
+            "$(ssh_target):~/am01_project/reports/figures/" \
+            "${PROJECT_ROOT}/reports/figures/" 2>/dev/null || true
+        rsync -av --progress --delete \
+            "$(ssh_target):~/am01_project/reports/checkpoints/" \
+            "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null || true
+
+        # Download validated params (produced by analyze_results on the remote)
+        scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
+            "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null || true
     else
-        # Fallback: scp individual files
-        for f in train.npy val.npy test_normal.npy test_anomaly.npy \
-                 scaler.pkl selected_columns.npy preprocessing_config.json; do
+        # Fallback: scp individual files (no rsync → no --delete, so we must
+        # proactively remove stale files above and overwrite unconditionally)
+        for f in normal_train.npy normal_val.npy anomaly_val.npy normal_test.npy anomaly_test.npy \
+                     scaler.pkl selected_columns.npy manifest.json stats.json; do
             scp "$(ssh_target):~/am01_project/data/processed/${f}" \
-                ./data/processed/ 2>/dev/null || true
+                "${PROJECT_ROOT}/data/processed/" 2>/dev/null || true
         done
+        # CSV results — fetch whatever exists on the remote
+        for f in validation_results_ae.csv ae_final_metrics.csv ae_test_metrics.csv \
+                 validation_results_aae.csv aae_final_metrics.csv; do
+            scp "$(ssh_target):~/am01_project/reports/tables/${f}" \
+                "${PROJECT_ROOT}/reports/tables/" 2>/dev/null || true
+        done
+        # Checkpoints
+        for f in ae_baseline.pth ae_baseline_seed*.pth aae_final.pth; do
+            scp "$(ssh_target):~/am01_project/reports/checkpoints/${f}" \
+                "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null || true
+        done
+        # Figures
+        scp -r "$(ssh_target):~/am01_project/reports/figures/" \
+            "${PROJECT_ROOT}/reports/figures/" 2>/dev/null || true
+        # Validated params
+        scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
+            "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null || true
     fi
 
     # Download latest log (fetched to ~/am01_project/logs/ by SLURM post-run rsync)
+    # Also check ~/jobs/logs/ directly as fallback (for jobs that fail before post-run rsync)
+    # SPECIFICALLY look for the log of the job we just ran (using JID)
     local latest_log
-    latest_log=$(ssh_run "$(ssh_target)" "ls -t ~/am01_project/logs/am01_train_*.log 2>/dev/null | head -1")
+    latest_log=$(ssh_run "$(ssh_target)" "ls -t ~/jobs/logs/am01_*_${jid}.log ~/am01_project/logs/am01_*_${jid}.log 2>/dev/null | head -1")
     if [[ -n "${latest_log}" ]]; then
-        scp "$(ssh_target):${latest_log}" ./logs/ 2>/dev/null || true
-        echo "Log downloaded → ./logs/$(basename "${latest_log}")"
+        scp "$(ssh_target):${latest_log}" "${PROJECT_ROOT}/logs/" 2>/dev/null || true
     fi
 
     echo ""
-    echo "Done.  Results: ./data/processed/   Log: ./logs/"
+    echo "Done.  Data: ${PROJECT_ROOT}/data/processed/   Reports: ${PROJECT_ROOT}/reports/   Config: ${PROJECT_ROOT}/config/params_validated_ae.yaml   Log: ${PROJECT_ROOT}/logs/"
 }
 
 cmd_help() {
@@ -386,11 +555,11 @@ Usage:
   ./hpc_connect.sh interactive [partition] [walltime]       Interactive SLURM session
   ./hpc_connect.sh scratch                                  Compute node w/ BeeGFS access
   ./hpc_connect.sh upload <local_path> <remote_path>        Upload files to HPC
-  ./hpc_connect.sh upload-project                           rsync entire project to HPC
+  ./hpc_connect.sh upload-project [--clean]                 rsync entire project to HPC (--clean: delete remote files not in local)
   ./hpc_connect.sh download <remote_path> <local_path>      Download files from HPC
   ./hpc_connect.sh submit <slurm_script.sh>                 Submit SLURM batch job
-  ./hpc_connect.sh deploy                                   Upload-project + one-shot setup
-  ./hpc_connect.sh batch <slurm_script.sh>                Deploy + submit + stream log + fetch results
+  ./hpc_connect.sh deploy [--clean]                         Upload-project + one-shot setup
+  ./hpc_connect.sh batch [--clean] <slurm_script.sh>        Deploy + submit + stream log + fetch results
 
 Examples:
   ./hpc_connect.sh check
@@ -400,7 +569,9 @@ Examples:
   ./hpc_connect.sh upload data/ ~/jobs/data/
   ./hpc_connect.sh download ~/results/ ./local_results/
   ./hpc_connect.sh deploy
+  ./hpc_connect.sh deploy --clean
   ./hpc_connect.sh batch hpc/slurm_job_template.sh
+  ./hpc_connect.sh batch --clean hpc/slurm_job_template.sh
 
 Environment:
   HPC_USER           SSH username (default: mungolo)

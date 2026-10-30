@@ -3,9 +3,8 @@
 Modules
 -------
 - config : YAML config loader (merge config.yaml + params.yaml)
-- metrics : anomaly-detection metrics (PR-AUC, ROC-AUC, F1, …)
 - visualization : plotting utilities (ROC, PR, error distributions)
 """
-from src.utils.config import load_config, get_param
+from src.utils.config import get_param, load_config
 
-__all__ = ["load_config", "get_param"]
+__all__ = ["get_param", "load_config"]
