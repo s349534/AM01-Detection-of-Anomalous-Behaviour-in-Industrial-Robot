@@ -34,8 +34,8 @@ export PATH="/share/apps/miniconda3/bin:$HOME/.local/bin:$PATH"
 
 echo "Allocated GPU (SLURM GRES): CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 
-# Resolve N_ITER / MAX_VAL_EPOCHS from env (with defaults)
-N_ITER="${N_ITER:-25}"
+# Resolve N_ITER / MAX_VAL_EPOCHS from env (with defaults: 15 configs x 3 seeds = 45 runs)
+N_ITER="${N_ITER:-15}"
 MAX_VAL_EPOCHS="${MAX_VAL_EPOCHS:-50}"
 
 # ── Working directory on scratch ────────────────────────────────────────────

@@ -27,8 +27,14 @@ from src.validation.search_space import get_search_space_aae, merge_search_sampl
 
 logger = logging.getLogger(__name__)
 
+# Fixed validation seeds for robust hyperparameter selection (§4.8.6).
+# Each configuration is trained with these 3 seeds; results are aggregated
+# (mean +/- std) in analyze_results.py before best-config selection.
+VALIDATION_SEEDS = [7, 42, 123]
+
 CSV_COLUMNS = [
     "run_id",
+    "config_id",
     "reconstruction_weight",
     "adversarial_weight",
     "discriminator_hidden_layers",
@@ -62,14 +68,15 @@ def write_result_row_csv(path: Path, row: dict, write_header: bool) -> None:
 
 
 def run_search(
-    n_iter: int = 25,
+    n_iter: int = 15,
     seed: int = 42,
     config_path: str | Path | None = None,
     params_path: str | Path | None = None,
     max_val_epochs: int | None = None,
     resume: bool = True,
+    val_seeds: list[int] | None = None,
 ) -> Path:
-    """Run the random search over AAE hyperparameters.
+    """Run the random search over AAE hyperparameters across multiple seeds per config.
 
     Parameters
     ----------
@@ -85,12 +92,17 @@ def run_search(
         Override max epochs per run (useful for quick testing).
     resume : bool
         If True and the CSV already exists, skip run_ids already present.
+    val_seeds : list[int] or None
+        Fixed validation seeds per config (default: [7, 42, 123]).
 
     Returns
     -------
     Path
         Path to the output CSV file.
     """
+    if val_seeds is None:
+        val_seeds = VALIDATION_SEEDS
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -138,65 +150,75 @@ def run_search(
     samples = list(sampler)
 
     logger.info(
-        "Starting AAE validation: %d iterations (seed=%d), %d unique configs",
-        len(samples), seed, len(samples),
+        "Starting AAE validation: %d configs (seed=%d), %d seeds/config %s, total runs=%d",
+        len(samples), seed, len(val_seeds), val_seeds, len(samples) * len(val_seeds),
     )
 
-    # --- Run experiments ---
-    for i, sample in enumerate(samples):
-        run_id = i + 1
-        if resume and run_id in existing_run_ids:
-            logger.info("Skipping run_id=%d (already completed)", run_id)
-            continue
+    global_run_id = 0
 
-        # Merge sampled HP into config
+    # --- Run experiments ---
+    for config_idx, sample in enumerate(samples):
+        config_id = config_idx + 1
+
+        # Merge sampled HP into config (shared across all seeds for this config)
         run_config = merge_search_sample(base_config, sample)
 
         logger.info(
-            "[Run %d/%d] Sample: recon_w=%s, adv_w=%s, disc_hidden=%s",
-            run_id, n_iter,
+            "[Config %d/%d] Sample: recon_w=%s, adv_w=%s, disc_hidden=%s",
+            config_id, len(samples),
             sample.get("training.reconstruction_weight", ""),
             sample.get("training.adversarial_weight", ""),
             sample.get("model.discriminator.hidden_layers", ""),
         )
 
-        try:
-            result = train_and_evaluate_aae(
-                config=run_config,
-                run_id=run_id,
-                seed=seed + run_id,  # varied seed per run
-                max_val_epochs=max_val_epochs,
-            )
+        for seed_idx, val_seed in enumerate(val_seeds):
+            global_run_id += 1
+            run_id = global_run_id
 
-            write_result_row_csv(output_csv, result, write_header=write_header)
-            write_header = False  # header written after first row
-            logger.info(
-                "  -> recon_w=%.2f adv_w=%.3f disc=%s pr_auc=%.4f f1=%.4f time=%.1fs",
-                result["reconstruction_weight"],
-                result["adversarial_weight"],
-                result["discriminator_hidden_layers"],
-                result["best_val_pr_auc"],
-                result["best_val_f1"],
-                result["train_time_sec"],
-            )
+            if resume and run_id in existing_run_ids:
+                logger.info("Skipping run_id=%d (already completed)", run_id)
+                continue
 
-        except Exception as e:
-            logger.error("Run %d failed: %s", run_id, e, exc_info=True)
-            fail_row = {
-                "run_id": run_id,
-                "reconstruction_weight": sample.get("training.reconstruction_weight", ""),
-                "adversarial_weight": sample.get("training.adversarial_weight", ""),
-                "discriminator_hidden_layers": str(
-                    sample.get("model.discriminator.hidden_layers", "")
-                ),
-                "best_val_pr_auc": -1.0,     # sentinel for failure
-                "best_val_f1": -1.0,
-                "best_epoch": 0,
-                "train_time_sec": 0.0,
-                "seed": seed + run_id,
-            }
-            write_result_row_csv(output_csv, fail_row, write_header=write_header)
-            write_header = False
+            try:
+                result = train_and_evaluate_aae(
+                    config=run_config,
+                    run_id=run_id,
+                    seed=val_seed,  # fixed seed per configuration
+                    max_val_epochs=max_val_epochs,
+                )
+                result["config_id"] = config_id
+                write_result_row_csv(output_csv, result, write_header=write_header)
+                write_header = False  # header written after first row
+                logger.info(
+                    "  [Config %d, Seed %d] -> recon_w=%.2f adv_w=%.3f disc=%s pr_auc=%.4f f1=%.4f time=%.1fs",
+                    config_id,
+                    val_seed,
+                    result["reconstruction_weight"],
+                    result["adversarial_weight"],
+                    result["discriminator_hidden_layers"],
+                    result["best_val_pr_auc"],
+                    result["best_val_f1"],
+                    result["train_time_sec"],
+                )
+
+            except Exception as e:
+                logger.error("Run %d (config %d, seed %d) failed: %s", run_id, config_id, val_seed, e, exc_info=True)
+                fail_row = {
+                    "run_id": run_id,
+                    "config_id": config_id,
+                    "reconstruction_weight": sample.get("training.reconstruction_weight", ""),
+                    "adversarial_weight": sample.get("training.adversarial_weight", ""),
+                    "discriminator_hidden_layers": str(
+                        sample.get("model.discriminator.hidden_layers", "")
+                    ),
+                    "best_val_pr_auc": -1.0,     # sentinel for failure
+                    "best_val_f1": -1.0,
+                    "best_epoch": 0,
+                    "train_time_sec": 0.0,
+                    "seed": val_seed,
+                }
+                write_result_row_csv(output_csv, fail_row, write_header=write_header)
+                write_header = False
 
     logger.info("AAE search complete. Results: %s", output_csv)
     return output_csv
@@ -215,12 +237,16 @@ def parse_args() -> argparse.Namespace:
         help="Path to params yaml (default: config/params_validated_ae.yaml if exists, else config/params.yaml)",
     )
     parser.add_argument(
-        "--n-iter", type=int, default=25,
-        help="Number of random configurations to sample (default: 25)",
+        "--n-iter", type=int, default=15,
+        help="Number of random configurations to sample (default: 15)",
     )
     parser.add_argument(
         "--seed", type=int, default=42,
         help="Random seed for ParameterSampler (default: 42)",
+    )
+    parser.add_argument(
+        "--val-seeds", type=int, nargs="+", default=None,
+        help="Validation seeds per configuration (default: 7 42 123)",
     )
     parser.add_argument(
         "--max-val-epochs", type=int, default=None,
@@ -244,6 +270,7 @@ def main() -> None:
         params_path=args.params,
         max_val_epochs=args.max_val_epochs,
         resume=not args.no_resume,
+        val_seeds=args.val_seeds,
     )
 
     elapsed = time.time() - start

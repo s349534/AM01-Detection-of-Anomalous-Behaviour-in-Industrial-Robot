@@ -49,6 +49,24 @@ class AggregatedConfig:
     seeds: list[int]
 
 
+@dataclass
+class AggregatedConfigAAE:
+    """Aggregated metrics for one AAE hyperparameter configuration across multiple seeds."""
+    config_id: int
+    reconstruction_weight: float
+    adversarial_weight: float
+    discriminator_hidden_layers: list[int]
+    mean_val_pr_auc: float
+    std_val_pr_auc: float
+    mean_val_roc_auc: float
+    std_val_roc_auc: float
+    mean_best_epoch: float
+    std_best_epoch: float
+    mean_train_time_sec: float
+    n_seeds: int
+    seeds: list[int]
+
+
 def get_default_results_path(config: dict, is_aae: bool = False) -> Path:
     tables_dir = Path(config.get("paths", {}).get("reports_tables", "reports/tables/"))
     fname = "validation_results_aae.csv" if is_aae else "validation_results_ae.csv"
@@ -205,10 +223,75 @@ def select_best_config_ae(aggregated: list[AggregatedConfig]) -> AggregatedConfi
     )
 
 
-def select_best_config_aae(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Select best AAE config: max best_val_pr_auc, max best_val_f1, min best_epoch."""
+def aggregate_by_config_aae(rows: list[dict[str, Any]]) -> list[AggregatedConfigAAE]:
+    """Group rows by AAE hyperparameters and compute mean +/- std across seeds."""
+    groups: dict[Any, list[dict[str, Any]]] = {}
+    for r in rows:
+        if "config_id" in r and r["config_id"] != "":
+            key = r["config_id"]
+        else:
+            key = (
+                r["reconstruction_weight"],
+                r["adversarial_weight"],
+                str(r["discriminator_hidden_layers"]),
+            )
+        groups.setdefault(key, []).append(r)
+
+    aggregated: list[AggregatedConfigAAE] = []
+    for config_id, (key, group) in enumerate(groups.items(), start=1):
+        pr_aucs = [g["best_val_pr_auc"] for g in group if g.get("best_val_pr_auc", -1.0) >= 0]
+        roc_aucs = [g.get("val_roc_auc", 0.0) for g in group if g.get("val_roc_auc", 0.0) >= 0]
+        epochs = [g["best_epoch"] for g in group]
+        times = [g["train_time_sec"] for g in group]
+        seeds = [g["seed"] for g in group]
+        n = len(pr_aucs)
+        if n == 0:
+            continue
+
+        ddof = 1 if n > 1 else 0
+        first = group[0]
+        disc_layers = first["discriminator_hidden_layers"]
+        if isinstance(disc_layers, str):
+            disc_layers = eval(disc_layers)
+
+        aggregated.append(
+            AggregatedConfigAAE(
+                config_id=int(first.get("config_id", config_id)),
+                reconstruction_weight=float(first["reconstruction_weight"]),
+                adversarial_weight=float(first["adversarial_weight"]),
+                discriminator_hidden_layers=disc_layers,
+                mean_val_pr_auc=float(np.mean(pr_aucs)),
+                std_val_pr_auc=float(np.std(pr_aucs, ddof=ddof)),
+                mean_val_roc_auc=float(np.mean(roc_aucs)) if roc_aucs else 0.0,
+                std_val_roc_auc=float(np.std(roc_aucs, ddof=ddof)) if roc_aucs else 0.0,
+                mean_best_epoch=float(np.mean(epochs)),
+                std_best_epoch=float(np.std(epochs, ddof=ddof)),
+                mean_train_time_sec=float(np.mean(times)),
+                n_seeds=n,
+                seeds=seeds,
+            )
+        )
+    return aggregated
+
+
+def select_best_config_aae(
+    aggregated: list[AggregatedConfigAAE] | list[dict[str, Any]],
+) -> AggregatedConfigAAE | dict[str, Any]:
+    """Select best AAE config: max mean PR-AUC, min std PR-AUC, max mean ROC-AUC, min epoch."""
+    if not aggregated:
+        raise ValueError("No configurations to select from.")
+    if isinstance(aggregated[0], AggregatedConfigAAE):
+        return max(
+            aggregated,
+            key=lambda c: (
+                c.mean_val_pr_auc,
+                -c.std_val_pr_auc,
+                c.mean_val_roc_auc,
+                -c.mean_best_epoch,
+            ),
+        )
     return max(
-        rows,
+        aggregated,
         key=lambda r: (
             r["best_val_pr_auc"],
             r.get("best_val_f1", 0.0),
@@ -353,18 +436,23 @@ def write_validated_params_ae(
 
 
 def write_validated_params_aae(
-    best_row: dict[str, Any],
+    best: AggregatedConfigAAE | dict[str, Any],
     base_config: dict,
     output_path: Path,
 ) -> None:
     """Write params_validated_aae.yaml with the best AAE hyperparameters."""
     validated = copy.deepcopy(base_config)
-    validated["training"]["reconstruction_weight"] = float(best_row["reconstruction_weight"])
-    validated["training"]["adversarial_weight"] = float(best_row["adversarial_weight"])
-
-    disc_str = str(best_row["discriminator_hidden_layers"])
-    disc_layers = eval(disc_str)  # noqa: S306
-    validated["model"]["discriminator"]["hidden_layers"] = disc_layers
+    if isinstance(best, AggregatedConfigAAE):
+        validated["training"]["reconstruction_weight"] = float(best.reconstruction_weight)
+        validated["training"]["adversarial_weight"] = float(best.adversarial_weight)
+        validated["model"]["discriminator"]["hidden_layers"] = list(best.discriminator_hidden_layers)
+    else:
+        validated["training"]["reconstruction_weight"] = float(best["reconstruction_weight"])
+        validated["training"]["adversarial_weight"] = float(best["adversarial_weight"])
+        disc_layers = best["discriminator_hidden_layers"]
+        if isinstance(disc_layers, str):
+            disc_layers = eval(disc_layers)
+        validated["model"]["discriminator"]["hidden_layers"] = list(disc_layers)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
@@ -405,32 +493,37 @@ def run_analysis(
     plot_paths: list[Path] = []
 
     if is_aae:
-        best_row = select_best_config_aae(rows)
+        aggregated_aae = aggregate_by_config_aae(rows)
+        best_aae = select_best_config_aae(aggregated_aae)
+
         logger.info("=" * 70)
-        logger.info("AAE VALIDATION RESULTS SUMMARY: %d runs", len(rows))
+        logger.info("AAE VALIDATION RESULTS SUMMARY: %d runs, %d configs", len(rows), len(aggregated_aae))
         logger.info("=" * 70)
-        for r in rows:
-            flag = " <-- BEST" if r == best_row else ""
+        for agg in aggregated_aae:
+            flag = " <-- BEST" if agg == best_aae else ""
             logger.info(
-                "  Run %2d | recon_w=%.2f adv_w=%.3f disc=%-12s | pr_auc=%.4f f1=%.4f epoch=%-3d%s",
-                r["run_id"], r["reconstruction_weight"], r["adversarial_weight"],
-                r["discriminator_hidden_layers"], r["best_val_pr_auc"], r["best_val_f1"],
-                r["best_epoch"], flag,
+                "  Config %2d | recon_w=%.2f adv_w=%.3f disc=%-12s | pr_auc=%.4f +/- %.4f | epoch=%.1f%s",
+                agg.config_id, agg.reconstruction_weight, agg.adversarial_weight,
+                str(agg.discriminator_hidden_layers), agg.mean_val_pr_auc, agg.std_val_pr_auc,
+                agg.mean_best_epoch, flag,
             )
         logger.info("=" * 70)
         logger.info(
-            "HP_AAE_best: recon_w=%.2f, adv_w=%.3f, disc=%s | pr_auc=%.4f",
-            best_row["reconstruction_weight"], best_row["adversarial_weight"],
-            best_row["discriminator_hidden_layers"], best_row["best_val_pr_auc"],
+            "HP_AAE_best: recon_w=%.2f, adv_w=%.3f, disc=%s | pr_auc=%.4f +/- %.4f",
+            best_aae.reconstruction_weight, best_aae.adversarial_weight,
+            best_aae.discriminator_hidden_layers, best_aae.mean_val_pr_auc,
+            best_aae.std_val_pr_auc,
         )
 
         if generate_plots:
             plot_paths = generate_sensitivity_plots_aae(rows, output_dir)
-        write_validated_params_aae(best_row, config, params_path)
+        write_validated_params_aae(best_aae, config, params_path)
 
         return {
-            "best_config": best_row,
+            "best_config": best_aae,
+            "aggregated": aggregated_aae,
             "n_runs": len(rows),
+            "n_configs": len(aggregated_aae),
             "csv_path": str(csv_path),
             "plot_paths": [str(p) for p in plot_paths],
             "params_path": str(params_path),
