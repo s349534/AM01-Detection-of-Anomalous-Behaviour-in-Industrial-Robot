@@ -264,6 +264,31 @@ def run_final_training(
             shutil.copy2(seed_ckpt, final_ckpt)
             logger.info("New best AAE model (seed=%d, val_roc_auc=%.4f) -> %s", seed, best_val_auc, final_ckpt)
 
+_MEAN_PRECISION = {
+    "train_time_sec": 2,
+    "best_epoch": 1,
+    "threshold": 6,
+}
+
+
+def _mean_std_row(results: list[dict[str, Any]]) -> dict[str, str]:
+    """Build the MEAN+/-STD summary row from the per-seed rows."""
+    row: dict[str, str] = {"seed": "MEAN+/-STD"}
+    for col in FINAL_METRICS_COLUMNS[1:]:
+        values = [r[col] for r in results if isinstance(r.get(col), (int, float))]
+        if not values:
+            row[col] = ""
+            continue
+        if col.startswith("n_"):
+            row[col] = ""
+            continue
+        mean = sum(values) / len(values)
+        std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+        prec = _MEAN_PRECISION.get(col, 4)
+        row[col] = f"{mean:.{prec}f} +/- {std:.{prec}f}"
+    return row
+
+
     # Write metrics CSV
     with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=FINAL_METRICS_COLUMNS)
@@ -271,6 +296,8 @@ def run_final_training(
         for r in results:
             row = {k: r[k] for k in FINAL_METRICS_COLUMNS if k in r}
             writer.writerow(row)
+        if len(results) > 1:
+            writer.writerow(_mean_std_row(results))
 
     logger.info("AAE Final metrics saved to %s", csv_path)
 
