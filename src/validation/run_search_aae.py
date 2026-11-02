@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-from sklearn.model_selection import ParameterSampler
+from sklearn.model_selection import ParameterGrid, ParameterSampler
 
 from src.utils.config import load_config
 from src.validation.run_experiment_aae import train_and_evaluate_aae
@@ -146,12 +146,18 @@ def run_search(
 
     # --- Build search space and sample ---
     search_space = get_search_space_aae()
-    sampler = ParameterSampler(search_space, n_iter=n_iter, random_state=seed)
-    samples = list(sampler)
+    if n_iter is None:
+        grid = ParameterGrid(search_space)
+        samples = list(grid)
+        mode_str = f"exhaustive ({len(samples)} configs)"
+    else:
+        sampler = ParameterSampler(search_space, n_iter=n_iter, random_state=seed)
+        samples = list(sampler)
+        mode_str = f"random ({n_iter} configs, seed={seed})"
 
     logger.info(
-        "Starting AAE validation: %d configs (seed=%d), %d seeds/config %s, total runs=%d",
-        len(samples), seed, len(val_seeds), val_seeds, len(samples) * len(val_seeds),
+        "Starting AAE validation: %s, %d seeds/config %s, total runs=%d",
+        mode_str, len(val_seeds), val_seeds, len(samples) * len(val_seeds),
     )
 
     global_run_id = 0
