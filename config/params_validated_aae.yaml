@@ -23,7 +23,7 @@ model:
   name: adversarial_autoencoder
   input_dim: 86
   encoding_dim: 32
-  latent_dim: 8
+  latent_dim: 16
   encoder:
     conv_channels:
     - 64
@@ -49,8 +49,8 @@ training:
   beta1: 0.5
   beta2: 0.999
   num_workers: 4
-  adversarial_weight: 0.05
-  reconstruction_weight: 1.4
+  adversarial_weight: 0.15
+  reconstruction_weight: 2.0
   loss: mae
   reconstruction_metric: mae
   early_stopping:
