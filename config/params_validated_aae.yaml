@@ -49,8 +49,8 @@ training:
   beta1: 0.5
   beta2: 0.999
   num_workers: 4
-  adversarial_weight: 0.15
-  reconstruction_weight: 2.0
+  adversarial_weight: 0.01
+  reconstruction_weight: 1.4
   loss: mae
   reconstruction_metric: mae
   early_stopping:
