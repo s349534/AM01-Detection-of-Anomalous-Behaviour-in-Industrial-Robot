@@ -2,7 +2,7 @@ model:
   name: adversarial_autoencoder
   input_dim: 86
   encoding_dim: 32
-  latent_dim: 8
+  latent_dim: 16
   encoder:
     conv_channels:
     - 64

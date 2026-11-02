@@ -381,7 +381,11 @@ def run_analysis(
     is_aae: bool = False,
 ) -> dict[str, Any]:
     """Run the analysis pipeline."""
-    config = load_config()
+    if is_aae:
+        val_ae_path = Path("config/params_validated_ae.yaml")
+        config = load_config(params_path=val_ae_path if val_ae_path.exists() else None)
+    else:
+        config = load_config()
 
     if csv_path is None:
         csv_path = get_default_results_path(config, is_aae=is_aae)

@@ -98,8 +98,17 @@ def run_search(
         stream=sys.stdout,
     )
 
-    # --- Load base config ---
+    # --- Load base config (default to validated AE params to inherit HP_AE_best) ---
+    if params_path is None:
+        validated_ae_path = Path("config/params_validated_ae.yaml")
+        if validated_ae_path.exists():
+            params_path = validated_ae_path
+            logger.info("Inheriting HP_AE_best from %s", validated_ae_path)
+
     base_config = load_config(config_path, params_path)
+    inherited_w = base_config.get("data", {}).get("window_size", "unset")
+    inherited_latent = base_config.get("model", {}).get("latent_dim", "unset")
+    logger.info("AAE base configuration: W=%s, latent_dim=%s", inherited_w, inherited_latent)
 
     output_csv = get_output_path(base_config)
 
@@ -198,6 +207,14 @@ def parse_args() -> argparse.Namespace:
         description="Random search for AAE hyperparameter validation (§4.8.3)"
     )
     parser.add_argument(
+        "--config", type=Path, default=None,
+        help="Path to config.yaml (default: config/config.yaml)",
+    )
+    parser.add_argument(
+        "--params", type=Path, default=None,
+        help="Path to params yaml (default: config/params_validated_ae.yaml if exists, else config/params.yaml)",
+    )
+    parser.add_argument(
         "--n-iter", type=int, default=25,
         help="Number of random configurations to sample (default: 25)",
     )
@@ -223,6 +240,8 @@ def main() -> None:
     output_csv = run_search(
         n_iter=args.n_iter,
         seed=args.seed,
+        config_path=args.config,
+        params_path=args.params,
         max_val_epochs=args.max_val_epochs,
         resume=not args.no_resume,
     )

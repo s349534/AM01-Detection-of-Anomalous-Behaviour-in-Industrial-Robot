@@ -92,6 +92,7 @@ fi
 # ── Phase 4.1: AAE Validation search (§4.8.6) ───────────────────────────────
 echo "=== Phase 4.1: AAE validation search (${N_ITER} iterations, max ${MAX_VAL_EPOCHS} epochs) ==="
 uv run python -m src.validation.run_search_aae \
+    --params config/params_validated_ae.yaml \
     --n-iter "${N_ITER}" \
     --seed 42 \
     --max-val-epochs "${MAX_VAL_EPOCHS}" \
