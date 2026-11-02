@@ -535,7 +535,7 @@ EOFSRIPT
                 "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null || true
         done
         # Figures
-        scp -r "$(ssh_target):~/am01_project/reports/figures/" \
+        scp -r "$(ssh_target):~/am01_project/reports/figures/*" \
             "${PROJECT_ROOT}/reports/figures/" 2>/dev/null || true
         # Validated params
         scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
