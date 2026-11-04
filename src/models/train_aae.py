@@ -34,6 +34,7 @@ from src.evaluation.metrics import calculate_auc, evaluate_threshold
 from src.evaluation.threshold import calibrate_threshold
 from src.utils.config import get_param, load_config
 from src.utils.seed import set_seed
+from src.utils.visualization import plot_confusion_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -300,6 +301,21 @@ def run_final_training(
             writer.writerow(_mean_std_row(results))
 
     logger.info("AAE Final metrics saved to %s", csv_path)
+
+    # Save best confusion matrix
+    figures_dir = Path(get_param(config, "paths.reports_figures", "reports/figures/"))
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    cm_path = figures_dir / "aae_confusion_matrix.png"
+    best_res = next((r for r in results if r.get("seed") == best_seed), results[0])
+    best_cm = [[best_res["test_tn"], best_res["test_fp"]],
+               [best_res["test_fn"], best_res["test_tp"]]]
+    plot_confusion_matrix(
+        best_cm,
+        labels=("normal", "anomaly"),
+        save_path=cm_path,
+        title=f"Test Set Confusion Matrix - AAE (Best Seed: {best_seed})",
+    )
+    logger.info("AAE Confusion matrix saved to: %s", cm_path)
 
 
 run_final_training_aae = run_final_training
