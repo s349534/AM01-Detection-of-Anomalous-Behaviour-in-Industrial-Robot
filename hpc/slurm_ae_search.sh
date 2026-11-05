@@ -17,7 +17,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1          # 1 task = 1 processo Python (NO MPI)
 #SBATCH --cpus-per-task=6            # 6 core per quel task (1 main + 4 worker + 1 margine)
-#SBATCH --gpus=1
+#SBATCH --gres=gpu:1
 #SBATCH --time=04:30:00              # 4.5h: 50 configs × 3 seeds = 150 runs con num_workers=4
 #SBATCH --mem=64GB
 #SBATCH --output=logs/%x_%j.log
@@ -31,8 +31,8 @@ module load cuda 2>/dev/null || true
 
 export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES=0
 export SCRATCH_PROJECT="am01"
+echo "Allocated GPU (SLURM GRES): CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 # The project is an APPLICATION run from the project root (`python -m src...`):
 # it is not installed into the venv. Building it would require downloading
 # setuptools from PyPI, which fails on the cluster (no PyPI access).

@@ -1,33 +1,26 @@
-"""Post-search analysis: select best config + generate sensitivity plots.
+"""Analyze validation search results, select the best hyperparameter config,
+generate sensitivity plots, and write params_validated_{ae|aae}.yaml.
+
+Supports both:
+- Baseline AE (with multi-seed aggregation over W and latent_dim)
+- Adversarial AE (AAE with reconstruction_weight, adversarial_weight, discriminator_hidden_layers)
 
 Usage:
-    python -m src.validation.analyze_results
-    python -m src.validation.analyze_results --input reports/tables/validation_results_ae.csv
-
-Actions:
-    1. Read the validation results CSV
-    2. **Aggregate** per-config rows by mean ± std (val_pr_auc, val_roc_auc, best_epoch)
-    3. Select HP_AE_best (max mean val_pr_auc, tie-break min std val_pr_auc,
-       then max mean val_roc_auc, then min mean best_epoch)
-    4. Generate sensitivity plots using aggregated metrics
-    5. Write config/params_validated_ae.yaml with the best parameters
+    python -m src.validation.analyze_results [--aae] [--input PATH] [--no-plots]
 """
 from __future__ import annotations
 
 import argparse
 import copy
 import csv
+from dataclasses import dataclass, field
+import io
 import logging
 import math
-import sys
-from collections import defaultdict
-from dataclasses import dataclass, field
 from pathlib import Path
+import sys
 from typing import Any
 
-import matplotlib
-
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
@@ -36,53 +29,70 @@ from src.utils.config import load_config
 
 logger = logging.getLogger(__name__)
 
-# Sensitivity plot specs: (hparam column, plot filename suffix, title, xlabel)
-SENSITIVITY_SPECS = [
-    ("W", "ae_W", "Sensitivity to Window Size (W)", "Window Size (timesteps)"),
-    ("latent_dim", "ae_latent_dim", "Sensitivity to Latent Dimension", "Latent Dimension"),
-]
+# ---------------------------------------------------------------------------
+# AE Aggregated Configuration & Helpers
+# ---------------------------------------------------------------------------
+@dataclass
+class AggregatedConfig:
+    """Aggregated metrics for one hyperparameter configuration across multiple seeds."""
+    config_id: int
+    W: int
+    latent_dim: int
+    mean_val_pr_auc: float
+    std_val_pr_auc: float
+    mean_val_roc_auc: float
+    std_val_roc_auc: float
+    mean_best_epoch: float
+    std_best_epoch: float
+    mean_train_time_sec: float
+    n_seeds: int
+    seeds: list[int]
 
 
-def get_default_results_path(config: dict | None = None) -> Path:
-    """Resolve default CSV path."""
-    if config:
-        reports_dir = Path(config.get("paths", {}).get("reports", "reports/"))
-    else:
-        reports_dir = Path("reports/")
-    return reports_dir / "tables" / "validation_results_ae.csv"
+@dataclass
+class AggregatedConfigAAE:
+    """Aggregated metrics for one AAE hyperparameter configuration across multiple seeds."""
+    config_id: int
+    reconstruction_weight: float
+    adversarial_weight: float
+    discriminator_hidden_layers: list[int]
+    mean_val_pr_auc: float
+    std_val_pr_auc: float
+    mean_val_roc_auc: float
+    std_val_roc_auc: float
+    mean_best_epoch: float
+    std_best_epoch: float
+    mean_train_time_sec: float
+    n_seeds: int
+    seeds: list[int]
 
 
-def get_default_output_dir(config: dict | None = None) -> Path:
-    """Resolve default figures directory."""
-    if config:
-        reports_dir = Path(config.get("paths", {}).get("reports", "reports/"))
-    else:
-        reports_dir = Path("reports/")
-    return reports_dir / "figures"
+def get_default_results_path(config: dict, is_aae: bool = False) -> Path:
+    tables_dir = Path(config.get("paths", {}).get("reports_tables", "reports/tables/"))
+    fname = "validation_results_aae.csv" if is_aae else "validation_results_ae.csv"
+    return tables_dir / fname
 
 
-def get_default_params_path() -> Path:
-    """Resolve default params_validated_ae.yaml path."""
-    return Path("config/params_validated_ae.yaml")
+def get_default_output_dir(config: dict) -> Path:
+    return Path(config.get("paths", {}).get("reports_figures", "reports/figures/"))
 
 
-def load_results_csv(csv_path: Path) -> list[dict[str, Any]]:
-    """Load validation results from CSV.
+def get_default_params_path(is_aae: bool = False) -> Path:
+    fname = "params_validated_aae.yaml" if is_aae else "params_validated_ae.yaml"
+    return Path("config") / fname
 
-    Returns a list of dicts, skipping failure rows (val_pr_auc == -1).
-    Handles both the new CSV format (with ``config_id``) and legacy
-    format (without ``config_id`` — will be aggregated by W/latent_dim).
-    """
+
+def load_results_csv(csv_path: Path, is_aae: bool = False) -> list[dict[str, Any]]:
+    """Load validation results from CSV with robust error and encoding handling."""
     rows: list[dict[str, Any]] = []
     n_failed = 0
     n_malformed = 0
     n_nan_inf = 0
-    
-    # Try multiple encodings for robustness
+
     encodings = ["utf-8-sig", "utf-8", "latin-1"]
     file_content = None
     used_encoding = None
-    
+
     for enc in encodings:
         try:
             with open(csv_path, "r", newline="", encoding=enc) as f:
@@ -91,62 +101,59 @@ def load_results_csv(csv_path: Path) -> list[dict[str, Any]]:
             break
         except UnicodeDecodeError:
             continue
-    
+
     if file_content is None:
         logger.error("Failed to read CSV with any encoding: %s", encodings)
         return rows
 
-    logger.debug("Successfully read CSV with encoding: %s", used_encoding)
-    
-    # Parse with csv.DictReader from the string content
-    import io
     reader = csv.DictReader(io.StringIO(file_content))
-    
     for row_idx, row in enumerate(reader, start=1):
         row_data: dict[str, Any] = dict(row)
         try:
             row_data["run_id"] = int(row_data["run_id"])
-            # config_id is optional (legacy CSVs don't have it)
             if row_data.get("config_id"):
                 row_data["config_id"] = int(row_data["config_id"])
-            row_data["W"] = int(row_data["W"])
-            row_data["latent_dim"] = int(row_data["latent_dim"])
-            
-            # Parse float fields with NaN/Inf checking
-            val_roc_auc = float(row_data["val_roc_auc"])
-            val_pr_auc = float(row_data["val_pr_auc"])
-            
-            # Check for NaN/Inf
-            if not (math.isfinite(val_roc_auc) and math.isfinite(val_pr_auc)):
-                n_nan_inf += 1
-                logger.warning("Row %d: NaN/Inf in AUC values (roc_auc=%s, pr_auc=%s) - skipping",
-                              row_idx, row_data["val_roc_auc"], row_data["val_pr_auc"])
-                continue
-            
-            # Validate range [0, 1] for AUC values
-            if not (0.0 <= val_roc_auc <= 1.0) or not (0.0 <= val_pr_auc <= 1.0):
-                n_malformed += 1
-                logger.warning("Row %d: AUC values out of range [0,1] (roc_auc=%.4f, pr_auc=%.4f) - skipping",
-                              row_idx, val_roc_auc, val_pr_auc)
-                continue
-            
-            row_data["val_roc_auc"] = val_roc_auc
-            row_data["val_pr_auc"] = val_pr_auc
-            row_data["best_epoch"] = int(row_data["best_epoch"])
-            
-            train_time = float(row_data["train_time_sec"])
+
+            row_data["best_epoch"] = int(float(row_data["best_epoch"]))
+            train_time = float(row_data.get("train_time_sec", 0.0))
             if not math.isfinite(train_time):
                 n_nan_inf += 1
-                logger.warning("Row %d: NaN/Inf in train_time_sec (%s) - skipping", row_idx, row_data["train_time_sec"])
                 continue
             row_data["train_time_sec"] = train_time
-            
-            row_data["seed"] = int(row_data["seed"]) if row_data.get("seed") else 0
-            
-            # Skip failed runs (sentinel val_roc_auc/val_pr_auc == -1)
-            if row_data["val_pr_auc"] < 0 or row_data["val_roc_auc"] < 0:
-                n_failed += 1
-                continue
+            row_data["seed"] = int(row_data.get("seed", 42))
+
+            if is_aae:
+                row_data["reconstruction_weight"] = float(row_data["reconstruction_weight"])
+                row_data["adversarial_weight"] = float(row_data["adversarial_weight"])
+                row_data["discriminator_hidden_layers"] = str(row_data["discriminator_hidden_layers"])
+                pr_auc = float(row_data["best_val_pr_auc"])
+                if not math.isfinite(pr_auc) or pr_auc < 0:
+                    n_failed += 1
+                    continue
+                row_data["best_val_pr_auc"] = pr_auc
+                row_data["best_val_f1"] = float(row_data.get("best_val_f1", 0.0))
+            else:
+                row_data["W"] = int(row_data["W"])
+                row_data["latent_dim"] = int(row_data["latent_dim"])
+
+                # Handle different column names between AE runs
+                pr_key = "val_pr_auc" if "val_pr_auc" in row_data else "best_val_pr_auc"
+                roc_key = "val_roc_auc" if "val_roc_auc" in row_data else "best_val_roc_auc"
+
+                val_pr_auc = float(row_data[pr_key])
+                val_roc_auc = float(row_data[roc_key]) if roc_key in row_data and row_data[roc_key] != "" else 0.0
+
+                if not (math.isfinite(val_pr_auc) and math.isfinite(val_roc_auc)):
+                    n_nan_inf += 1
+                    continue
+                if val_pr_auc < 0 or val_roc_auc < 0:
+                    n_failed += 1
+                    continue
+
+                row_data["best_val_pr_auc"] = val_pr_auc
+                row_data["val_pr_auc"] = val_pr_auc
+                row_data["val_roc_auc"] = val_roc_auc
+
             rows.append(row_data)
         except (ValueError, KeyError) as e:
             n_malformed += 1
@@ -154,7 +161,7 @@ def load_results_csv(csv_path: Path) -> list[dict[str, Any]]:
             continue
 
     if n_failed:
-        logger.warning("Skipped %d failed run(s) (val_roc_auc/val_pr_auc == -1)", n_failed)
+        logger.warning("Skipped %d failed run(s)", n_failed)
     if n_nan_inf:
         logger.warning("Skipped %d row(s) with NaN/Inf values", n_nan_inf)
     if n_malformed:
@@ -167,163 +174,161 @@ def load_results_csv(csv_path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-@dataclass
-class AggregatedConfig:
-    """Aggregated metrics for one hyperparameter configuration across multiple seeds.
-
-    Produced by :func:`aggregate_by_config`, one instance per unique
-    ``(config_id, W, latent_dim)`` triple.
-    """
-    config_id: int
-    W: int
-    latent_dim: int
-    mean_val_pr_auc: float
-    std_val_pr_auc: float
-    mean_val_roc_auc: float
-    std_val_roc_auc: float
-    mean_best_epoch: float
-    std_best_epoch: float
-    mean_train_time_sec: float
-    seeds: list[int] = field(default_factory=list)
-    n_seeds: int = 0
-    individual_rows: list[dict[str, Any]] = field(default_factory=list, repr=False)
-
-
 def aggregate_by_config(rows: list[dict[str, Any]]) -> list[AggregatedConfig]:
-    """Aggregate individual seed-runs into per-configuration summaries.
-
-    Groups rows by ``config_id`` if present, otherwise by ``(W, latent_dim)``.
-    Computes mean ± std for val_pr_auc, val_roc_auc, best_epoch, and
-    train_time_sec.
-
-    Parameters
-    ----------
-    rows : list[dict]
-        Individual result rows loaded from CSV (one per seed-run).
-
-    Returns
-    -------
-    list[AggregatedConfig]
-        One entry per configuration, sorted by ``config_id``.
-    """
-    # Group rows: use config_id if available, else fall back to (W, latent_dim)
-    groups: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
-    has_config_id = any("config_id" in r for r in rows)
-
-    if not has_config_id:
-        logger.warning(
-            "No config_id column found in CSV — aggregating by (W, latent_dim). "
-            "This indicates a legacy CSV format."
-        )
-
-    for row in rows:
-        if has_config_id and "config_id" in row:
-            key: tuple = (row["config_id"],)
-        else:
-            key = (row["W"], row["latent_dim"])
-        groups[key].append(row)
+    """Group rows by (W, latent_dim) and compute mean +/- std."""
+    groups: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for r in rows:
+        key = (r["W"], r["latent_dim"])
+        groups.setdefault(key, []).append(r)
 
     aggregated: list[AggregatedConfig] = []
-    for key, group_rows in groups.items():
-        pr_aucs = [r["val_pr_auc"] for r in group_rows]
-        roc_aucs = [r["val_roc_auc"] for r in group_rows]
-        best_epochs = [r["best_epoch"] for r in group_rows]
-        train_times = [r["train_time_sec"] for r in group_rows]
-        seeds = [r["seed"] for r in group_rows if r.get("seed")]
+    for config_id, ((w, latent), group) in enumerate(groups.items(), start=1):
+        pr_aucs = [g["best_val_pr_auc"] for g in group]
+        roc_aucs = [g.get("val_roc_auc", 0.0) for g in group]
+        epochs = [g["best_epoch"] for g in group]
+        times = [g["train_time_sec"] for g in group]
+        seeds = [g["seed"] for g in group]
+        n = len(group)
 
-        config_id = key[0] if has_config_id else len(aggregated) + 1
-
-        agg = AggregatedConfig(
-            config_id=config_id,
-            W=group_rows[0]["W"],
-            latent_dim=group_rows[0]["latent_dim"],
-            mean_val_pr_auc=round(float(np.mean(pr_aucs)), 6),
-            std_val_pr_auc=round(float(np.std(pr_aucs, ddof=1)) if len(pr_aucs) > 1 else 0.0, 6),
-            mean_val_roc_auc=round(float(np.mean(roc_aucs)), 6),
-            std_val_roc_auc=round(float(np.std(roc_aucs, ddof=1)) if len(roc_aucs) > 1 else 0.0, 6),
-            mean_best_epoch=round(float(np.mean(best_epochs)), 2),
-            std_best_epoch=round(float(np.std(best_epochs, ddof=1)) if len(best_epochs) > 1 else 0.0, 2),
-            mean_train_time_sec=round(float(np.mean(train_times)), 2),
-            seeds=seeds,
-            n_seeds=len(group_rows),
-            individual_rows=group_rows,
+        ddof = 1 if n > 1 else 0
+        aggregated.append(
+            AggregatedConfig(
+                config_id=config_id,
+                W=w,
+                latent_dim=latent,
+                mean_val_pr_auc=float(np.mean(pr_aucs)),
+                std_val_pr_auc=float(np.std(pr_aucs, ddof=ddof)),
+                mean_val_roc_auc=float(np.mean(roc_aucs)),
+                std_val_roc_auc=float(np.std(roc_aucs, ddof=ddof)),
+                mean_best_epoch=float(np.mean(epochs)),
+                std_best_epoch=float(np.std(epochs, ddof=ddof)),
+                mean_train_time_sec=float(np.mean(times)),
+                n_seeds=n,
+                seeds=seeds,
+            )
         )
-        aggregated.append(agg)
-
-    # Sort by config_id for deterministic ordering
-    aggregated.sort(key=lambda a: a.config_id)
     return aggregated
 
 
-def select_best_config(aggregated: list[AggregatedConfig]) -> AggregatedConfig:
-    """Select HP_AE_best per §4.8.6 (robust selection with 3 fixed seeds).
-
-    Selection criteria (in order):
-        1. mean val_pr_auc (max) — primary metric, threshold-free
-        2. std val_pr_auc (min) — tie-break: prefers stable configs
-        3. mean val_roc_auc (max) — secondary metric
-        4. mean best_epoch (min) — prefers faster convergence
-
-    Returns the best AggregatedConfig.
-    """
-    best = max(aggregated, key=lambda a: (
-        a.mean_val_pr_auc,        # primary: mean PR-AUC (threshold-free)
-        -a.std_val_pr_auc,        # tie-break 1: lower std (more stable)
-        a.mean_val_roc_auc,       # tie-break 2: mean ROC-AUC
-        -a.mean_best_epoch,       # tie-break 3: fewer epochs (negated for max)
-    ))
-    return best
+def select_best_config_ae(aggregated: list[AggregatedConfig]) -> AggregatedConfig:
+    """Select best AE config: max mean PR-AUC, min std PR-AUC, max mean ROC-AUC, min epoch."""
+    return max(
+        aggregated,
+        key=lambda c: (
+            c.mean_val_pr_auc,
+            -c.std_val_pr_auc,
+            c.mean_val_roc_auc,
+            -c.mean_best_epoch,
+        ),
+    )
 
 
-def generate_sensitivity_plots(
+def aggregate_by_config_aae(rows: list[dict[str, Any]]) -> list[AggregatedConfigAAE]:
+    """Group rows by AAE hyperparameters and compute mean +/- std across seeds."""
+    groups: dict[Any, list[dict[str, Any]]] = {}
+    for r in rows:
+        if "config_id" in r and r["config_id"] != "":
+            key = r["config_id"]
+        else:
+            key = (
+                r["reconstruction_weight"],
+                r["adversarial_weight"],
+                str(r["discriminator_hidden_layers"]),
+            )
+        groups.setdefault(key, []).append(r)
+
+    aggregated: list[AggregatedConfigAAE] = []
+    for config_id, (key, group) in enumerate(groups.items(), start=1):
+        pr_aucs = [g["best_val_pr_auc"] for g in group if g.get("best_val_pr_auc", -1.0) >= 0]
+        roc_aucs = [g.get("val_roc_auc", 0.0) for g in group if g.get("val_roc_auc", 0.0) >= 0]
+        epochs = [g["best_epoch"] for g in group]
+        times = [g["train_time_sec"] for g in group]
+        seeds = [g["seed"] for g in group]
+        n = len(pr_aucs)
+        if n == 0:
+            continue
+
+        ddof = 1 if n > 1 else 0
+        first = group[0]
+        disc_layers = first["discriminator_hidden_layers"]
+        if isinstance(disc_layers, str):
+            disc_layers = eval(disc_layers)
+
+        aggregated.append(
+            AggregatedConfigAAE(
+                config_id=int(first.get("config_id", config_id)),
+                reconstruction_weight=float(first["reconstruction_weight"]),
+                adversarial_weight=float(first["adversarial_weight"]),
+                discriminator_hidden_layers=disc_layers,
+                mean_val_pr_auc=float(np.mean(pr_aucs)),
+                std_val_pr_auc=float(np.std(pr_aucs, ddof=ddof)),
+                mean_val_roc_auc=float(np.mean(roc_aucs)) if roc_aucs else 0.0,
+                std_val_roc_auc=float(np.std(roc_aucs, ddof=ddof)) if roc_aucs else 0.0,
+                mean_best_epoch=float(np.mean(epochs)),
+                std_best_epoch=float(np.std(epochs, ddof=ddof)),
+                mean_train_time_sec=float(np.mean(times)),
+                n_seeds=n,
+                seeds=seeds,
+            )
+        )
+    return aggregated
+
+
+def select_best_config_aae(
+    aggregated: list[AggregatedConfigAAE] | list[dict[str, Any]],
+) -> AggregatedConfigAAE | dict[str, Any]:
+    """Select best AAE config: max mean PR-AUC, min std PR-AUC, max mean ROC-AUC, min epoch."""
+    if not aggregated:
+        raise ValueError("No configurations to select from.")
+    if isinstance(aggregated[0], AggregatedConfigAAE):
+        return max(
+            aggregated,
+            key=lambda c: (
+                c.mean_val_pr_auc,
+                -c.std_val_pr_auc,
+                c.mean_val_roc_auc,
+                -c.mean_best_epoch,
+            ),
+        )
+    return max(
+        aggregated,
+        key=lambda r: (
+            r["best_val_pr_auc"],
+            r.get("best_val_f1", 0.0),
+            -r["best_epoch"],
+        ),
+    )
+
+
+def generate_sensitivity_plots_ae(
     aggregated: list[AggregatedConfig],
     output_dir: Path,
     best: AggregatedConfig | None = None,
 ) -> list[Path]:
-    """Generate sensitivity plots from aggregated per-config metrics (§4.8.8).
-
-    Groups aggregated configs by the hparam value (e.g. all configs sharing the
-    same W), then computes mean ± std of ``mean_val_pr_auc`` across those configs.
-
-    Parameters
-    ----------
-    aggregated : list[AggregatedConfig]
-        Per-configuration aggregated results.
-    output_dir : Path
-        Directory for output PNG files.
-    best : AggregatedConfig or None
-        The best config (from :func:`select_best_config`) to mark on plots.
-
-    Returns
-    -------
-    list[Path]
-        Paths to the generated plot files.
-    """
+    """Generate sensitivity plots for AE."""
     output_dir.mkdir(parents=True, exist_ok=True)
     generated: list[Path] = []
 
-    for hparam_col, suffix, title, xlabel in SENSITIVITY_SPECS:
-        fig, ax = plt.subplots(figsize=(10, 6))
+    specs = [
+        ("W", "ae_W", "Sensitivity to Window Size (W)", "Window Size W (timesteps)"),
+        ("latent_dim", "ae_latent_dim", "Sensitivity to Latent Dimension", "Latent Dimension"),
+    ]
 
-        # Group aggregated configs by hparam value
-        # (e.g. for W: group all configs with W=16, W=32, etc.)
-        groups: dict[Any, list[float]] = defaultdict(list)
+    for hparam_col, suffix, title, xlabel in specs:
+        groups: dict[Any, list[float]] = {}
         for agg in aggregated:
-            hparam_val = getattr(agg, hparam_col)
-            groups[hparam_val].append(agg.mean_val_pr_auc)
+            val = getattr(agg, hparam_col)
+            groups.setdefault(val, []).append(agg.mean_val_pr_auc)
 
-        if not groups:
-            logger.warning("No data for %s, skipping plot", hparam_col)
-            continue
-
-        sorted_keys = sorted(groups.keys(), key=lambda v: (isinstance(v, str), v))
-        means = [float(np.mean(groups[k])) for k in sorted_keys]
+        sorted_keys = sorted(groups.keys())
+        means = np.array([float(np.mean(groups[k])) for k in sorted_keys], dtype=float)
         stds = np.array(
             [float(np.std(groups[k], ddof=1)) if len(groups[k]) > 1 else 0.0
              for k in sorted_keys],
             dtype=float,
         )
 
+        fig, ax = plt.subplots(figsize=(8, 5))
         x_positions = list(range(len(sorted_keys)))
         ax.errorbar(
             x_positions, means, yerr=stds,
@@ -335,11 +340,10 @@ def generate_sensitivity_plots(
         ax.set_xticks(x_positions)
         ax.set_xticklabels([str(k) for k in sorted_keys], fontsize=11)
         ax.set_xlabel(xlabel, fontsize=12)
-        ax.set_ylabel("Mean PR-AUC (validation, mean over seeds)", fontsize=12)
+        ax.set_ylabel("Mean PR-AUC (validation)", fontsize=12)
         ax.set_title(title, fontsize=14, fontweight="bold")
         ax.grid(True, alpha=0.3)
 
-        # Mark best config
         if best is not None:
             best_key = getattr(best, hparam_col)
             if best_key in sorted_keys:
@@ -358,55 +362,103 @@ def generate_sensitivity_plots(
     return generated
 
 
-def write_validated_params(
+def generate_sensitivity_plots_aae(
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+) -> list[Path]:
+    """Generate sensitivity plots for AAE."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    generated: list[Path] = []
+
+    specs = [
+        ("reconstruction_weight", "aae_reconstruction_weight",
+         "Sensitivity to Reconstruction Weight", "Reconstruction Weight"),
+        ("adversarial_weight", "aae_adversarial_weight",
+         "Sensitivity to Adversarial Weight", "Adversarial Weight"),
+        ("discriminator_hidden_layers", "aae_discriminator_hidden_layers",
+         "Sensitivity to Discriminator Hidden Layers", "Hidden Layers"),
+    ]
+
+    for hparam_col, suffix, title, xlabel in specs:
+        groups: dict[Any, list[float]] = {}
+        for r in rows:
+            val = r[hparam_col]
+            groups.setdefault(val, []).append(r["best_val_pr_auc"])
+
+        try:
+            sorted_keys = sorted(groups.keys(), key=float)
+        except (ValueError, TypeError):
+            sorted_keys = sorted(groups.keys(), key=str)
+
+        means = [np.mean(groups[k]) for k in sorted_keys]
+        stds = [np.std(groups[k]) for k in sorted_keys]
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.bar(
+            [str(k) for k in sorted_keys],
+            means,
+            yerr=stds,
+            capsize=5,
+            color="#0ea5e9",
+            edgecolor="#0284c7",
+            alpha=0.85,
+        )
+        ax.set_xlabel(xlabel, fontsize=12)
+        ax.set_ylabel("Mean PR-AUC (validation)", fontsize=12)
+        ax.set_title(title, fontsize=14, fontweight="bold")
+        ax.grid(axis="y", alpha=0.3)
+
+        fig.tight_layout()
+        save_path = output_dir / f"sensitivity_{suffix}.png"
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info("Generated %s", save_path)
+        generated.append(save_path)
+
+    return generated
+
+
+def write_validated_params_ae(
     best: AggregatedConfig,
     base_config: dict,
     output_path: Path,
 ) -> None:
-    """Write params_validated_ae.yaml with the best hyperparameters.
-
-    Merges the best config into the base params.yaml structure, overriding
-    only the validated HPs: W (window_size), latent_dim.
-
-    The threshold is NO LONGER written here — it is calibrated in Stage 3
-    (train_ae.py) on the final trained model's validation errors.
-
-    Parameters
-    ----------
-    best : AggregatedConfig
-        Best aggregated config from validation search.
-    base_config : dict
-        Base config (from load_config) to start from.
-    output_path : Path
-        Output YAML file path.
-    """
+    """Write params_validated_ae.yaml with the best hyperparameters."""
     validated = copy.deepcopy(base_config)
-
-    # Override validated hyperparameters (Stage 1: model selection)
-    w_val = best.W
-    # Single source of truth: data.window_size
-    validated["data"]["window_size"] = w_val
+    validated["data"]["window_size"] = best.W
     validated["model"]["latent_dim"] = best.latent_dim
-
-    # Threshold is calibrated per-seed in Stage 3 (train_ae.py),
-    # NOT in Stage 2 (select_threshold.py). No placeholder here.
-
-    # Keep training settings from base config
-    # (epochs, batch_size, learning_rate, etc. stay as defaults for final training)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         yaml.dump(validated, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
-    logger.info("Wrote validated params to %s", output_path)
-    logger.info(
-        "Best config: W=%d, latent_dim=%d, "
-        "val_roc_auc=%.4f +/- %.4f, val_pr_auc=%.4f +/- %.4f (n_seeds=%d)",
-        best.W, best.latent_dim,
-        best.mean_val_roc_auc, best.std_val_roc_auc,
-        best.mean_val_pr_auc, best.std_val_pr_auc,
-        best.n_seeds,
-    )
+    logger.info("Wrote validated AE params to %s", output_path)
+
+
+def write_validated_params_aae(
+    best: AggregatedConfigAAE | dict[str, Any],
+    base_config: dict,
+    output_path: Path,
+) -> None:
+    """Write params_validated_aae.yaml with the best AAE hyperparameters."""
+    validated = copy.deepcopy(base_config)
+    if isinstance(best, AggregatedConfigAAE):
+        validated["training"]["reconstruction_weight"] = float(best.reconstruction_weight)
+        validated["training"]["adversarial_weight"] = float(best.adversarial_weight)
+        validated["model"]["discriminator"]["hidden_layers"] = list(best.discriminator_hidden_layers)
+    else:
+        validated["training"]["reconstruction_weight"] = float(best["reconstruction_weight"])
+        validated["training"]["adversarial_weight"] = float(best["adversarial_weight"])
+        disc_layers = best["discriminator_hidden_layers"]
+        if isinstance(disc_layers, str):
+            disc_layers = eval(disc_layers)
+        validated["model"]["discriminator"]["hidden_layers"] = list(disc_layers)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        yaml.dump(validated, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+    logger.info("Wrote validated AAE params to %s", output_path)
 
 
 def run_analysis(
@@ -414,106 +466,110 @@ def run_analysis(
     output_dir: Path | None = None,
     params_path: Path | None = None,
     generate_plots: bool = True,
+    is_aae: bool = False,
 ) -> dict[str, Any]:
-    """Run the full analysis pipeline.
-
-    Loads individual seed-run rows from CSV, aggregates per configuration
-    (mean ± std over 3 fixed seeds), selects the best config, and writes
-    validated params + sensitivity plots.
-
-    Parameters
-    ----------
-    csv_path : Path or None
-        Path to validation_results_ae.csv. Defaults to reports/tables/.
-    output_dir : Path or None
-        Directory for sensitivity plots. Defaults to reports/figures/.
-    params_path : Path or None
-        Output path for params_validated_ae.yaml. Defaults to config/.
-    generate_plots : bool
-        Whether to generate sensitivity plots.
-
-    Returns
-    -------
-    dict
-        Summary with ``best_config``, ``aggregated``, ``n_runs``, ``n_configs``,
-        ``plot_paths``, ``params_path``.
-    """
-    config = load_config()
+    """Run the analysis pipeline."""
+    if is_aae:
+        val_ae_path = Path("config/params_validated_ae.yaml")
+        config = load_config(params_path=val_ae_path if val_ae_path.exists() else None)
+    else:
+        config = load_config()
 
     if csv_path is None:
-        csv_path = get_default_results_path(config)
+        csv_path = get_default_results_path(config, is_aae=is_aae)
     if output_dir is None:
         output_dir = get_default_output_dir(config)
     if params_path is None:
-        params_path = get_default_params_path()
+        params_path = get_default_params_path(is_aae=is_aae)
 
     if not csv_path.exists():
         logger.error("Results CSV not found: %s", csv_path)
-        logger.error("Run: python -m src.validation.run_search_ae --n-iter 20 --seed 42 "
-                 "(or --max-val-epochs 50 for exhaustive)")
         raise FileNotFoundError(f"Results CSV not found: {csv_path}")
 
-    # --- Load individual seed-run rows ---
-    rows = load_results_csv(csv_path)
+    rows = load_results_csv(csv_path, is_aae=is_aae)
     if not rows:
         raise ValueError(f"No valid rows in {csv_path}")
 
-    # --- Aggregate per configuration (mean ± std over 3 seeds) ---
-    aggregated = aggregate_by_config(rows)
-
-    # --- Select best config from aggregated metrics ---
-    best = select_best_config(aggregated)
-
-    logger.info("=" * 70)
-    logger.info("VALIDATION RESULTS SUMMARY: %d runs, %d configs (seeds=%s)",
-                len(rows), len(aggregated),
-                aggregated[0].seeds if aggregated else "[]")
-    logger.info("=" * 70)
-    for agg in aggregated:
-        flag = " <-- BEST" if agg == best else ""
-        logger.info(
-            "  Config %2d | W=%-2d latent=%-2d | "
-            "pr_auc=%.4f +/- %.4f | roc_auc=%.4f +/- %.4f | "
-            "epoch=%.1f | n_seeds=%d%s",
-            agg.config_id, agg.W, agg.latent_dim,
-            agg.mean_val_pr_auc, agg.std_val_pr_auc,
-            agg.mean_val_roc_auc, agg.std_val_roc_auc,
-            agg.mean_best_epoch, agg.n_seeds, flag,
-        )
-    logger.info("=" * 70)
-    logger.info("HP_AE_best: W=%d, latent_dim=%d", best.W, best.latent_dim)
-    logger.info("  val_pr_auc  = %.4f +/- %.4f", best.mean_val_pr_auc, best.std_val_pr_auc)
-    logger.info("  val_roc_auc = %.4f +/- %.4f", best.mean_val_roc_auc, best.std_val_roc_auc)
-    logger.info("  best_epoch  = %.1f +/- %.1f", best.mean_best_epoch, best.std_best_epoch)
-    logger.info("  seeds       = %s", best.seeds)
-    logger.info("=" * 70)
-
-    # --- Generate plots ---
     plot_paths: list[Path] = []
-    if generate_plots:
-        plot_paths = generate_sensitivity_plots(aggregated, output_dir, best=best)
 
-    # --- Write validated params ---
-    write_validated_params(best, config, params_path)
+    if is_aae:
+        aggregated_aae = aggregate_by_config_aae(rows)
+        best_aae = select_best_config_aae(aggregated_aae)
 
-    return {
-        "best_config": best,
-        "aggregated": aggregated,
-        "n_runs": len(rows),
-        "n_configs": len(aggregated),
-        "csv_path": str(csv_path),
-        "plot_paths": [str(p) for p in plot_paths],
-        "params_path": str(params_path),
-    }
+        logger.info("=" * 70)
+        logger.info("AAE VALIDATION RESULTS SUMMARY: %d runs, %d configs", len(rows), len(aggregated_aae))
+        logger.info("=" * 70)
+        for agg in aggregated_aae:
+            flag = " <-- BEST" if agg == best_aae else ""
+            logger.info(
+                "  Config %2d | recon_w=%.2f adv_w=%.3f disc=%-12s | pr_auc=%.4f +/- %.4f | epoch=%.1f%s",
+                agg.config_id, agg.reconstruction_weight, agg.adversarial_weight,
+                str(agg.discriminator_hidden_layers), agg.mean_val_pr_auc, agg.std_val_pr_auc,
+                agg.mean_best_epoch, flag,
+            )
+        logger.info("=" * 70)
+        logger.info(
+            "HP_AAE_best: recon_w=%.2f, adv_w=%.3f, disc=%s | pr_auc=%.4f +/- %.4f",
+            best_aae.reconstruction_weight, best_aae.adversarial_weight,
+            best_aae.discriminator_hidden_layers, best_aae.mean_val_pr_auc,
+            best_aae.std_val_pr_auc,
+        )
+
+        if generate_plots:
+            plot_paths = generate_sensitivity_plots_aae(rows, output_dir)
+        write_validated_params_aae(best_aae, config, params_path)
+
+        return {
+            "best_config": best_aae,
+            "aggregated": aggregated_aae,
+            "n_runs": len(rows),
+            "n_configs": len(aggregated_aae),
+            "csv_path": str(csv_path),
+            "plot_paths": [str(p) for p in plot_paths],
+            "params_path": str(params_path),
+        }
+    else:
+        aggregated = aggregate_by_config(rows)
+        best = select_best_config_ae(aggregated)
+
+        logger.info("=" * 70)
+        logger.info("AE VALIDATION RESULTS SUMMARY: %d runs, %d configs", len(rows), len(aggregated))
+        logger.info("=" * 70)
+        for agg in aggregated:
+            flag = " <-- BEST" if agg == best else ""
+            logger.info(
+                "  Config %2d | W=%-2d latent=%-2d | pr_auc=%.4f +/- %.4f | epoch=%.1f%s",
+                agg.config_id, agg.W, agg.latent_dim,
+                agg.mean_val_pr_auc, agg.std_val_pr_auc, agg.mean_best_epoch, flag,
+            )
+        logger.info("=" * 70)
+        logger.info(
+            "HP_AE_best: W=%d, latent_dim=%d | pr_auc=%.4f +/- %.4f",
+            best.W, best.latent_dim, best.mean_val_pr_auc, best.std_val_pr_auc,
+        )
+
+        if generate_plots:
+            plot_paths = generate_sensitivity_plots_ae(aggregated, output_dir, best=best)
+        write_validated_params_ae(best, config, params_path)
+
+        return {
+            "best_config": best,
+            "aggregated": aggregated,
+            "n_runs": len(rows),
+            "n_configs": len(aggregated),
+            "csv_path": str(csv_path),
+            "plot_paths": [str(p) for p in plot_paths],
+            "params_path": str(params_path),
+        }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze AE validation results and select best config"
+        description="Analyze validation results and select best config (AE or AAE)"
     )
     parser.add_argument(
         "--input", type=Path, default=None,
-        help="Path to validation_results_ae.csv (default: reports/tables/validation_results_ae.csv)",
+        help="Path to validation results CSV",
     )
     parser.add_argument(
         "--output-dir", type=Path, default=None,
@@ -521,11 +577,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--params-out", type=Path, default=None,
-        help="Output path for params_validated_ae.yaml (default: config/params_validated_ae.yaml)",
+        help="Output path for params_validated_{ae|aae}.yaml",
     )
     parser.add_argument(
         "--no-plots", action="store_true",
         help="Skip generating sensitivity plots",
+    )
+    parser.add_argument(
+        "--aae", action="store_true",
+        help="Analyze AAE results (default: AE)",
     )
     return parser.parse_args()
 
@@ -544,6 +604,7 @@ def main() -> None:
         output_dir=args.output_dir,
         params_path=args.params_out,
         generate_plots=not args.no_plots,
+        is_aae=args.aae,
     )
 
 

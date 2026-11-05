@@ -13,15 +13,63 @@ save_checkpoint — save model checkpoint with metadata
 """
 from __future__ import annotations
 
+import copy
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
+
+
+class EarlyStopping:
+    """Early stopping handler to monitor validation loss during training."""
+
+    def __init__(
+        self,
+        patience: int = 10,
+        min_delta: float = 1e-4,
+        mode: Literal["min", "max"] = "min",
+    ) -> None:
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.counter = 0
+        self.best_score: float | None = None
+        self.best_state: dict[str, Any] | None = None
+        self.early_stop = False
+        self.best_epoch = 0
+
+    def __call__(self, val_loss: float, model: nn.Module, epoch: int = 0) -> bool:
+        score = -val_loss if self.mode == "min" else val_loss
+
+        if self.best_score is None:
+            self.best_score = score
+            self.best_state = copy.deepcopy(model.state_dict())
+            self.best_epoch = epoch
+            return False
+
+        if score < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+                return True
+        else:
+            self.best_score = score
+            self.best_state = copy.deepcopy(model.state_dict())
+            self.best_epoch = epoch
+            self.counter = 0
+
+        return False
+
+    def restore_best_weights(self, model: nn.Module) -> None:
+        """Restore the best observed model weights."""
+        if self.best_state is not None:
+            model.load_state_dict(self.best_state)
+
 
 
 def train_epoch(
@@ -226,6 +274,9 @@ def fit_autoencoder(
 
     # Restore best weights
     model.load_state_dict(best_state)
+
+    if checkpoint_path is not None:
+        save_checkpoint(model, history, checkpoint_path)
 
     history["best_epoch"] = best_epoch
     return history

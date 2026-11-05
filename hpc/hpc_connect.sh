@@ -146,19 +146,27 @@ cmd_download() {
 
 cmd_submit() {
     local script="$1"
-    if [[ ! -f "${script}" ]]; then
-        echo "ERROR: SLURM script not found: ${script}"
-        exit 1
-    fi
-    echo "Uploading and submitting SLURM job: ${script}"
-    local basename_script
+    local basename_script abs_script
     basename_script=$(basename "${script}")
+    if [[ -f "${script}" ]]; then
+        abs_script="$(cd "$(dirname "${script}")" 2>/dev/null && pwd)/$(basename "${script}")"
+    elif [[ -f "${SCRIPT_DIR}/${script}" ]]; then
+        abs_script="${SCRIPT_DIR}/${script}"
+    elif [[ -f "${PROJECT_ROOT}/hpc/${script}" ]]; then
+        abs_script="${PROJECT_ROOT}/hpc/${script}"
+    elif [[ -f "${PROJECT_ROOT}/${script}" ]]; then
+        abs_script="${PROJECT_ROOT}/${script}"
+    else
+        echo "ERROR: SLURM script '${script}' not found in current directory, ${SCRIPT_DIR}, or ${PROJECT_ROOT}." >&2
+        return 1
+    fi
+    echo "Uploading and submitting SLURM job: ${abs_script}"
     # SLURM does NOT create the --output log directory itself; create ~/jobs/logs
     # on the login node (where sbatch runs) BEFORE submitting, otherwise the job
     # fails silently with no log files written.
     ssh_run "$(ssh_target)" "mkdir -p ~/jobs/logs"
-    scp "${script}" "$(ssh_target):~/jobs/${basename_script}"
-    ssh_run "$(ssh_target)" "cd ~/jobs && sbatch ${basename_script}"
+    scp "${abs_script}" "$(ssh_target):~/jobs/${basename_script}"
+    ssh_run "$(ssh_target)" "sed -i 's/\r$//' ~/jobs/${basename_script} && cd ~/jobs && sbatch ${basename_script}"
 }
 
 cmd_check() {
@@ -355,6 +363,22 @@ cmd_batch() {
     done
     [[ -n "${script:-}" ]] || { echo "ERROR: usage: ./hpc_connect.sh batch [--dry-run] [--clean] <slurm_script>"; exit 1; }
 
+    # Resolve absolute path to the SLURM script BEFORE any directory change
+    local basename_script abs_script
+    basename_script=$(basename "${script}")
+    if [[ -f "${script}" ]]; then
+        abs_script="$(cd "$(dirname "${script}")" 2>/dev/null && pwd)/$(basename "${script}")"
+    elif [[ -f "${SCRIPT_DIR}/${script}" ]]; then
+        abs_script="${SCRIPT_DIR}/${script}"
+    elif [[ -f "${PROJECT_ROOT}/hpc/${script}" ]]; then
+        abs_script="${PROJECT_ROOT}/hpc/${script}"
+    elif [[ -f "${PROJECT_ROOT}/${script}" ]]; then
+        abs_script="${PROJECT_ROOT}/${script}"
+    else
+        echo "ERROR: SLURM script '${script}' not found in current directory, ${SCRIPT_DIR}, or ${PROJECT_ROOT}." >&2
+        return 1
+    fi
+
     local deploy_args=()
     [[ "$dry" == "1" ]] && deploy_args+=("--dry-run")
     [[ "$clean" == "1" ]] && deploy_args+=("--clean")
@@ -369,13 +393,10 @@ cmd_batch() {
         cd "${PROJECT_ROOT}" || return 1
     fi
     # ── Upload SLURM script ─────────────────────────────────────────────────
-    local basename_script abs_script
-    basename_script=$(basename "${script}")
-    abs_script="$(cd "$(dirname "${script}")" 2>/dev/null && pwd)/$(basename "${script}")"
-    [[ -f "${abs_script}" ]] || abs_script="${script}"
     ssh_run "$(ssh_target)" "mkdir -p ~/jobs/logs"
     scp "${abs_script}" "$(ssh_target):~/jobs/${basename_script}"
-    echo "Uploaded ${basename_script} → ~/jobs/"
+    ssh_run "$(ssh_target)" "sed -i 's/\r$//' ~/jobs/${basename_script}"
+    echo "Uploaded and normalized (LF) ${basename_script} → ~/jobs/"
 
     # ── Submit and capture job ID ───────────────────────────────────────────
     local jid
@@ -428,12 +449,10 @@ cmd_batch() {
     echo "  tail -f ~/jobs/logs/am01_*_${jid}.log"
     echo ""
     # Run log streaming on HPC via a single ssh_run invocation.
-    # Use a temp script to avoid fragile quoting of variables inside a nested string.
     # The stream script polls every 60s for the log file to appear (the cluster
     # may still be starting the job, so the log does not exist yet) and retries
     # indefinitely — it does not stop after the first 60s window.
-    local _stream_script="/tmp/am01_stream_${jid}.sh"
-    cat > "${_stream_script}.base" <<'EOFSRIPT'
+    ssh_run "$(ssh_target)" "cat > ~/am01_stream_${jid}.sh" <<'EOFSRIPT'
 #!/bin/bash
 set +e
 JID="$1"
@@ -458,12 +477,9 @@ echo ''
 echo "=== Job ${JID} completed ==="
 tail -8 "$log_file" 2>/dev/null || true
 EOFSRIPT
-    # JID is passed as $1 to the stream script (no sed substitution needed)
-    cp "${_stream_script}.base" "${_stream_script}"
-    chmod +x "${_stream_script}" 2>/dev/null || true
-    # Upload and execute on HPC (run in foreground so Ctrl-C detaches cleanly)
-    scp "${_stream_script}" "$(ssh_target):~/am01_stream_${jid}.sh" 2>/dev/null || true
-    ssh_run "$(ssh_target)" "bash ~/am01_stream_${jid}.sh ${jid}"
+    # Execute on HPC (run in foreground so Ctrl-C detaches cleanly)
+    ssh_run "$(ssh_target)" "chmod +x ~/am01_stream_${jid}.sh && bash ~/am01_stream_${jid}.sh ${jid}"
+    ssh_run "$(ssh_target)" "rm -f ~/am01_stream_${jid}.sh" 2>/dev/null || true
 
     # ── Auto-download results ───────────────────────────────────────────────
     echo ""
@@ -473,15 +489,6 @@ EOFSRIPT
              "${PROJECT_ROOT}/logs" \
              "${PROJECT_ROOT}/config"
 
-    # Always clear training-only artefacts first so that stale local copies do
-    # not survive a validation-only run (where these files are NOT produced).
-    # If the SLURM job DID produce them, they will be re-downloaded below.
-    rm -f "${PROJECT_ROOT}/reports/tables/ae_final_metrics.csv" \
-          "${PROJECT_ROOT}/reports/tables/aae_final_metrics.csv" \
-          "${PROJECT_ROOT}/reports/tables/ae_test_metrics.csv" \
-          "${PROJECT_ROOT}/reports/checkpoints/ae_baseline.pth" \
-          "${PROJECT_ROOT}/reports/checkpoints/ae_baseline_seed*.pth" \
-          "${PROJECT_ROOT}/reports/checkpoints/aae_final.pth" 2>/dev/null || true
 
     if command -v rsync >/dev/null 2>&1; then
         rsync -av --progress --delete \
@@ -489,19 +496,25 @@ EOFSRIPT
             "${PROJECT_ROOT}/data/processed/" 2>/dev/null || true
 
         # Download reports/ (CSV + plots) — populated by AE search / training jobs
-        rsync -av --progress --delete \
+        rsync -av --progress \
             "$(ssh_target):~/am01_project/reports/tables/" \
             "${PROJECT_ROOT}/reports/tables/" 2>/dev/null || true
-        rsync -av --progress --delete \
+        rsync -av --progress \
             "$(ssh_target):~/am01_project/reports/figures/" \
             "${PROJECT_ROOT}/reports/figures/" 2>/dev/null || true
-        rsync -av --progress --delete \
+        rsync -av --progress \
             "$(ssh_target):~/am01_project/reports/checkpoints/" \
             "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null || true
 
         # Download validated params (produced by analyze_results on the remote)
         scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
-            "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null || true
+            "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null \
+            && echo "Validated AE params → ${PROJECT_ROOT}/config/params_validated_ae.yaml" \
+            || true
+        scp "$(ssh_target):~/am01_project/config/params_validated_aae.yaml" \
+            "${PROJECT_ROOT}/config/params_validated_aae.yaml" 2>/dev/null \
+            && echo "Validated AAE params → ${PROJECT_ROOT}/config/params_validated_aae.yaml" \
+            || true
     else
         # Fallback: scp individual files (no rsync → no --delete, so we must
         # proactively remove stale files above and overwrite unconditionally)
@@ -522,11 +535,13 @@ EOFSRIPT
                 "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null || true
         done
         # Figures
-        scp -r "$(ssh_target):~/am01_project/reports/figures/" \
+        scp -r "$(ssh_target):~/am01_project/reports/figures/*" \
             "${PROJECT_ROOT}/reports/figures/" 2>/dev/null || true
         # Validated params
         scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
-            "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null || true
+            "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/config/params_validated_ae.yaml" || true
+        scp "$(ssh_target):~/am01_project/config/params_validated_aae.yaml" \
+            "${PROJECT_ROOT}/config/params_validated_aae.yaml" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/config/params_validated_aae.yaml" || true
     fi
 
     # Download latest log (fetched to ~/am01_project/logs/ by SLURM post-run rsync)

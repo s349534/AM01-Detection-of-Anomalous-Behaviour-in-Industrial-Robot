@@ -2,15 +2,12 @@
 
 This script orchestrates:
 1. Data loading and preprocessing
-2. Model training
+2. Model training (AE or AAE)
 3. Evaluation and comparison
 4. Results visualization
 
 Usage:
-    uv run python src/main.py [--config CONFIG] [--phase {preprocess,train,evaluate,all}]
-
-Note: model/data modules are currently scaffolding (placeholders) for Fases 3–5.
-Fase 2 (preprocessing) is fully implemented and wired up — use ``--phase preprocess``.
+    uv run python src/main.py [--config CONFIG] [--phase {preprocess,train,train_aae,evaluate,all}]
 """
 from __future__ import annotations
 
@@ -42,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--phase",
-        choices=["preprocess", "train", "evaluate", "all"],
+        choices=["preprocess", "train", "train_aae", "evaluate", "all"],
         default="all",
         help="Which pipeline phase to run (default: all)",
     )
@@ -69,7 +66,7 @@ def import_modules() -> None:
     print("--- Importing project modules ---")
     from src.data import dataset, preprocessing  # noqa: F401
     try:
-        from src.models import autoencoder  # noqa: F401
+        from src.models import autoencoder, adversarial_ae  # noqa: F401
         print("models import OK.")
     except ImportError as e:
         print(f"models import skipped (scaffolding): {e}")
@@ -77,7 +74,7 @@ def import_modules() -> None:
 
 
 def run_phase_preprocess(config: dict) -> None:
-    """Run Fase 2 — preprocessing pipeline (fully implemented)."""
+    """Run Fase 2 — preprocessing pipeline."""
     from src.data.preprocessing import run_preprocessing
 
     print("\n=== Fase 2: Preprocessing ===")
@@ -91,6 +88,17 @@ def run_phase_train(config: dict) -> None:
     print("\n=== Fase 3: Train Baseline SequenceAutoencoder ===")
     run_final_training(
         config_path="config/params_validated_ae.yaml",
+        seeds=[42, 123, 7],
+    )
+
+
+def run_phase_train_aae(config: dict) -> None:
+    """Run Fase 4 — Train Adversarial Autoencoder."""
+    from src.models.train_aae import run_final_training_aae
+
+    print("\n=== Fase 4: Train Adversarial Autoencoder ===")
+    run_final_training_aae(
+        config_path="config/params_validated_aae.yaml",
         seeds=[42, 123, 7],
     )
 
@@ -154,6 +162,7 @@ def main() -> None:
     phases = {
         "preprocess": run_phase_preprocess,
         "train": run_phase_train,
+        "train_aae": run_phase_train_aae,
         "evaluate": run_phase_evaluate,
     }
 
