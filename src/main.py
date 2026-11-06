@@ -87,7 +87,7 @@ def run_phase_train(config: dict) -> None:
 
     print("\n=== Fase 3: Train Baseline SequenceAutoencoder ===")
     run_final_training(
-        config_path="config/params_validated_ae.yaml",
+        config_path="config/params_validated.yaml",
         seeds=[42, 123, 7],
     )
 
@@ -98,7 +98,7 @@ def run_phase_train_aae(config: dict) -> None:
 
     print("\n=== Fase 4: Train Adversarial Autoencoder ===")
     run_final_training_aae(
-        config_path="config/params_validated_aae.yaml",
+        config_path="config/params_validated.yaml",
         seeds=[42, 123, 7],
     )
 

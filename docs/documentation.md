@@ -295,7 +295,7 @@ La griglia di validazione ha esplorato lo spazio iperparametrico specifico della
 
 Ogni configurazione è stata addestrata e valutata su **3 seed casuali** (`[7, 42, 123]`) per un totale di 45 run indipendenti. L'aggregazione dei risultati (tramite `src/validation/analyze_results.py --aae`) ha selezionato la configurazione ottimale in base alla media massima di `val_pr_auc` sui 3 seed:
 - **Configurazione vincente (Config 14):** `reconstruction_weight = 1.40`, `adversarial_weight = 0.010`, `discriminator = (16, 8)`, con `val_pr_auc` medio di **0.7818 ± 0.0270** e `val_roc_auc` medio di **0.7780 ± 0.0264**.
-- I parametri validati sono stati serializzati in `config/params_validated_aae.yaml` per il training finale multi-seed.
+- I parametri validati sono stati serializzati in `config/params_validated.yaml` (sezione `aae:`) per il training finale multi-seed.
 
 ---
 

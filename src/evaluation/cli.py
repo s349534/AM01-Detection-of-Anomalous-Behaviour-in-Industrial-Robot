@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data/processed"), help="Processed data directory")
     parser.add_argument(
-        "--config", type=Path, default=Path("config/params_validated_ae.yaml"), help="Config file (default: params_validated_ae.yaml)")
+        "--config", type=Path, default=Path("config/params_validated.yaml"), help="Config file (default: params_validated.yaml)")
     parser.add_argument("--threshold", type=float, default=None, help="Fixed threshold (default: calibrate on validation)")
     parser.add_argument("--metric", type=str, default="mae", choices=["mae", "mse"], help="Reconstruction metric")
     parser.add_argument("--device", type=str, default=None, help="Device (cuda/cpu)")
@@ -50,7 +50,7 @@ def main() -> None:
         stream=sys.stdout,
     )
 
-    config = load_config(args.config, None)  # params_validated_ae.yaml already contains everything
+    config = load_config(args.config, None)  # params_validated.yaml contains both AE and AAE sections
 
     # Evaluate checkpoints
     result = evaluate_checkpoints(

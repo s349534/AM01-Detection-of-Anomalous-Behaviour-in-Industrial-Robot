@@ -86,21 +86,21 @@ def get_search_space_aae() -> dict[str, Any]:
 
     1. ``training.reconstruction_weight`` — MSE loss multiplier
     2. ``training.adversarial_weight``    — BCE loss multiplier
-    3. ``model.discriminator.hidden_layers`` — discriminator capacity (2 archs)
 
-    Grid = 5 × 6 × 2 = 60 combos; 20-30 sampled per validation run.
+    Discriminator hidden layers are FIXED to [16, 8] (validated best from prior runs)
+    and not included in the search space.
+
+    Grid = 5 × 6 = 30 combos; all run exhaustively per validation run.
 
     Notes
     -----
-    - Discriminator architecture has 2 options (not 3) to mirror the AE
-      ``encoder.conv_channels`` search space (2 options: ``[64,32]`` /
-      ``[128,64]``).  The "large" config ``[64,32]`` is excluded because for
-      ``latent_dim=16`` it is ~4× latent size — overkill for a binary prior
-      matching task.  The default ``[32,16]`` is the current ``params.yaml``
-      value.
+    - Adversarial weight range explores below current best (0.01) to test if
+      performance continues improving, and includes higher values (0.1, 0.2) to
+      confirm the cliff observed at >=0.05. Log-scale spacing for lower values.
+    - Reconstruction weight range is denser in the optimal zone (0.7-1.4) identified
+      from prior validation results.
     """
     return {
-        "training.reconstruction_weight": [0.5, 0.7, 1.0, 1.4, 2.0],
-        "training.adversarial_weight": [0.01, 0.05, 0.1, 0.15, 0.3, 0.5],
-        "model.discriminator.hidden_layers": [[16, 8], [32, 16]],
+        "training.reconstruction_weight": [0.5, 0.7, 0.9, 1.1, 1.4],
+        "training.adversarial_weight": [0.001, 0.005, 0.01, 0.02, 0.1, 0.2],
     }

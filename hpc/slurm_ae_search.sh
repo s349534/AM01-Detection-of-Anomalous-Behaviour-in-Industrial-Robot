@@ -137,21 +137,21 @@ fi
 
 uv run python -m src.validation.run_search_ae "${SEARCH_ARGS[@]}"
 
-# ── Phase 3.1b: Analyze results → params_validated_ae.yaml + plots (§4.8.8) ─
+# ── Phase 3.1b: Analyze results → params_validated.yaml + plots (§4.8.8) ─
 echo "=== Phase 3.1b: Analyzing results ==="
 uv run python -m src.validation.analyze_results
 
 # ── Verify outputs ──────────────────────────────────────────────────────────
 echo "=== Outputs ==="
-ls -lh reports/tables/validation_results_ae.csv reports/figures/sensitivity_*.png config/params_validated_ae.yaml 2>/dev/null || true
-
-# ── Debug: verify figures exist before sync ────────────────────────────────────
-echo "=== Debug: figures on scratch ==="
-ls -la "${RESULTS_DIR}/reports/figures/" 2>/dev/null || echo "No figures dir on scratch"
+ls -lh reports/tables/validation_results_ae.csv reports/figures/sensitivity_*.png config/params_validated.yaml 2>/dev/null || true
 
 # ── Fetch results back to $HOME (so hpc_connect.sh batch can download) ──────
 RESULTS_DIR="${SCRATCH_DIR}/${SCRATCH_PROJECT}"
 HOME_PROJECT="${HOME}/am01_project"
+
+# Debug: verify figures exist before sync ────────────────────────────────────
+echo "=== Debug: figures on scratch ==="
+ls -la "${RESULTS_DIR}/reports/figures/" 2>/dev/null || echo "No figures dir on scratch"
 
 mkdir -p "${HOME_PROJECT}/reports/tables" "${HOME_PROJECT}/reports/figures" "${HOME_PROJECT}/config"
 mkdir -p "${HOME_PROJECT}/logs"
@@ -169,7 +169,7 @@ rsync -a --delete --info=progress2 \
 rsync -a --delete --info=progress2 \
     "${RESULTS_DIR}/reports/figures/" "${HOME_PROJECT}/reports/figures/"
 
-# params_validated_ae.yaml (produced by analyze_results)
+# params_validated.yaml (produced by analyze_results)
 rsync -a --info=progress2 \
     "${RESULTS_DIR}/config/" "${HOME_PROJECT}/config/"
 

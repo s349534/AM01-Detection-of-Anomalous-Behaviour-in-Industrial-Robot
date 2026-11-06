@@ -438,6 +438,12 @@ def save_processed_data(
     np.save(cols_path, selected_col_names)
     logger.info("Saved %s: %d columns", cols_path, selected_col_names.shape[0])
 
+    # --- Save partition plans (window start indices per partition) ---
+    for name, starts in plan.items():
+        plan_path = output_dir / f"plan_{name}.npy"
+        np.save(plan_path, starts)
+        logger.info("Saved %s: %d windows", plan_path, len(starts))
+
     # --- Build train mask ONCE (reused for manifest + stats) ---
     train_mask = _build_mask(plan.get("train", np.array([], dtype=np.int64)), window_size, normal.shape[0])
 

@@ -1,7 +1,7 @@
 """CLI for final AAE training with validated hyperparameters (§4.2).
 
 After Fase 4.1 validation selects HP_AAE_best and writes
-``config/params_validated_aae.yaml``, this script performs the final training:
+``config/params_validated.yaml``, this script performs the final training:
 
     - 3 runs with different seeds (nested validation, §4.8.1)
     - Calibrates decision threshold on validation set
@@ -10,8 +10,8 @@ After Fase 4.1 validation selects HP_AAE_best and writes
     - Writes reports/tables/aae_final_metrics.csv with mean +/- std
 
 Usage:
-    python -m src.models.train_aae --config config/params_validated_aae.yaml
-    python -m src.models.train_aae --config config/params_validated_aae.yaml --seeds 42 123 7
+    python -m src.models.train_aae --config config/params_validated.yaml
+    python -m src.models.train_aae --config config/params_validated.yaml --seeds 42 123 7
 """
 from __future__ import annotations
 
@@ -91,14 +91,15 @@ def train_single_seed(
     weight_decay = float(get_param(config, "training.weight_decay", 0.0))
     patience = int(get_param(config, "training.early_stopping.patience", 15))
     min_delta = float(get_param(config, "training.early_stopping.min_delta", 1e-4))
+    # AAE-specific params from unified config under aae.training
     reconstruction_weight = float(
-        get_param(config, "training.reconstruction_weight", 1.0)
+        get_param(config, "aae.training.reconstruction_weight", 1.0)
     )
     adversarial_weight = float(
-        get_param(config, "training.adversarial_weight", 0.1)
+        get_param(config, "aae.training.adversarial_weight", 0.1)
     )
     disc_updates_per_gen = int(
-        get_param(config, "training.discriminator_updates_per_gen", 1)
+        get_param(config, "aae.training.discriminator_updates_per_gen", 1)
     )
     loss_name = str(get_param(config, "training.loss", "mae"))
     metric = str(get_param(config, "training.reconstruction_metric", "mae"))
@@ -251,7 +252,7 @@ def _mean_std_row(results: list[dict[str, Any]]) -> dict[str, str]:
 
 
 def run_final_training(
-    config_path: str | Path = "config/params_validated_aae.yaml",
+    config_path: str | Path = "config/params_validated.yaml",
     seeds: list[int] | None = None,
     device: str | torch.device | None = None,
 ) -> None:
@@ -261,9 +262,7 @@ def run_final_training(
 
     cfg_file = Path(config_path)
     if not cfg_file.exists():
-        cfg_file = Path("config/params_validated_aae.yaml")
-        if not cfg_file.exists():
-            cfg_file = Path("config/params.yaml")
+        cfg_file = Path("config/params.yaml")
 
     config = load_config(config_path=Path("config/config.yaml"), params_path=cfg_file)
 
@@ -323,7 +322,7 @@ run_final_training_aae = run_final_training
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train final AAE models across multiple seeds")
-    parser.add_argument("--config", type=Path, default=Path("config/params_validated_aae.yaml"), help="Config path")
+    parser.add_argument("--config", type=Path, default=Path("config/params_validated.yaml"), help="Config path")
     parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS, help="Random seeds")
     parser.add_argument("--device", type=str, default=None, help="Device (cpu/cuda)")
     return parser.parse_args()

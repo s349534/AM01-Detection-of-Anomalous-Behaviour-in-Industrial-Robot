@@ -19,46 +19,6 @@ paths:
 logging:
   level: INFO
   format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-model:
-  name: adversarial_autoencoder
-  input_dim: 86
-  encoding_dim: 32
-  latent_dim: 16
-  encoder:
-    conv_channels:
-    - 64
-    - 32
-    - 16
-    conv_kernels:
-    - 5
-    - 3
-    - 3
-    pool_size: 2
-    activation: relu
-  discriminator:
-    hidden_layers:
-    - 16
-    - 8
-    activation: leaky_relu
-training:
-  batch_size: 256
-  epochs: 300
-  validation_epochs: 150
-  learning_rate: 0.001
-  weight_decay: 0.0001
-  beta1: 0.5
-  beta2: 0.999
-  num_workers: 4
-  adversarial_weight: 0.01
-  reconstruction_weight: 1.4
-  loss: mae
-  reconstruction_metric: mae
-  early_stopping:
-    patience: 15
-    min_delta: 0.001
-  train_split: 0.7
-  val_split: 0.15
-  slow_val_split: 0.5
 data:
   normal_data_path: data/raw/KukaNormal.npy
   slow_data_path: data/raw/KukaSlow.npy
@@ -85,3 +45,44 @@ data:
       test_normal: 0.5
       val_anomaly: 0.5
       test_anomaly: 0.5
+model:
+  input_dim: 86
+  latent_dim: 32
+  encoder:
+    conv_channels:
+    - 64
+    - 32
+    - 16
+    conv_kernels:
+    - 5
+    - 3
+    - 3
+    pool_size: 2
+    activation: relu
+training:
+  batch_size: 256
+  epochs: 300
+  validation_epochs: 150
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  beta1: 0.5
+  beta2: 0.999
+  num_workers: 4
+  loss: mae
+  reconstruction_metric: mae
+  early_stopping:
+    patience: 15
+    min_delta: 0.001
+  train_split: 0.7
+  val_split: 0.15
+  slow_val_split: 0.5
+aae:
+  training:
+    reconstruction_weight: 1.4
+    adversarial_weight: 0.001
+    discriminator_updates_per_gen: 1
+  discriminator:
+    hidden_layers:
+    - 16
+    - 8
+    activation: leaky_relu

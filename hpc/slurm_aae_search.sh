@@ -2,21 +2,23 @@
 #
 # slurm_aae_search.sh — SLURM batch job for AAE hyperparameter validation search (§4.8.5/§4.8.6)
 #
-# Runs the full random search over the Adversarial Autoencoder, then analyzes results.
+# Runs the full exhaustive search (all 30 combinations) or random subset over the Adversarial Autoencoder, then analyzes results.
 # All artefacts (CSV + YAML + plots + log) are written to reports/ and synced back
 # to $HOME/am01_project/ so hpc_connect.sh batch can fetch them to your machine.
 #
 # Customize --n-iter and --max-val-epochs below, or pass via env:
-#   N_ITER=30 MAX_VAL_EPOCHS=50 ./hpc_connect.sh batch hpc/slurm_aae_search.sh
+#   MAX_VAL_EPOCHS=50 ./hpc_connect.sh batch hpc/slurm_aae_search.sh            # exhaustive (default)
+#   N_ITER=15 MAX_VAL_EPOCHS=50 ./hpc_connect.sh batch hpc/slurm_aae_search.sh # random subset
 # ==============================================================================
 
 # ── SLURM Directives ────────────────────────────────────────────────────────
 #SBATCH --job-name=am01_aae_search
 #SBATCH --partition=gpu_a40
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=8
+#SBATCH --ntasks-per-node=1          # 1 task = 1 processo Python (NO MPI)
+#SBATCH --cpus-per-task=6            # 6 core per quel task (1 main + 4 worker + 1 margine)
 #SBATCH --gres=gpu:1
-#SBATCH --time=04:00:00
+#SBATCH --time=04:30:00              # 4.5h: 30 configs × 3 seeds = 90 runs con num_workers=4
 #SBATCH --mem=64GB
 #SBATCH --output=logs/%x_%j.log
 #SBATCH --error=logs/%x_%j.log
@@ -29,14 +31,21 @@ module load cuda 2>/dev/null || true
 
 export OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
+export UV_NO_SYNC=1
 export SCRATCH_PROJECT="am01"
 export PATH="/share/apps/miniconda3/bin:$HOME/.local/bin:$PATH"
 
 echo "Allocated GPU (SLURM GRES): CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 
-# Resolve N_ITER / MAX_VAL_EPOCHS from env (with defaults: 15 configs x 3 seeds = 45 runs)
-N_ITER="${N_ITER:-15}"
+# Resolve N_ITER / MAX_VAL_EPOCHS from env (with defaults)
+# N_ITER: if not set, runs exhaustive search (all 30 combinations)
+N_ITER="${N_ITER:-}"
 MAX_VAL_EPOCHS="${MAX_VAL_EPOCHS:-50}"
+
+echo "=== SLURM job started: $(date) ==="
+echo "Job ID: ${SLURM_JOB_ID:-unknown}"
+echo "N_ITER: ${N_ITER:-exhaustive}"
+echo "MAX_VAL_EPOCHS: ${MAX_VAL_EPOCHS}"
 
 # ── Working directory on scratch ────────────────────────────────────────────
 SCRATCH_DIR="${SCRATCH:-${HOME}/scratch}"
@@ -53,11 +62,15 @@ if [[ -d "${HOME}/am01_project" ]]; then
         --exclude='.ipynb_checkpoints/' \
         --exclude='data/raw/' \
         --exclude='*.pth' --exclude='*.pt' --exclude='*.ckpt' \
+        --exclude='*.npz' \
         --exclude='outputs/' --exclude='reports/figures/' \
+        --exclude='reports/tables/aae_final_metrics.csv' \
         "${HOME}/am01_project/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/"
     echo "Synced project to scratch."
 
-    # Content-based re-sync of the sources (--checksum)
+    # Content-based re-sync of the sources (--checksum): the quick check
+    # (size+mtime) above can skip files whose timestamp did not change,
+    # leaving a STALE copy of the code on scratch.
     rsync -a --checksum \
         --include='*/' --include='*.py' --include='*.yaml' --include='*.sh' --exclude='*' \
         "${HOME}/am01_project/src/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/src/"
@@ -68,6 +81,8 @@ if [[ -d "${HOME}/am01_project" ]]; then
 fi
 
 # ── Activate uv environment ─────────────────────────────────────────────────
+# Clear any stale VIRTUAL_ENV inherited from a remote .bashrc (setup_env.sh
+# auto-activates ~/am01_project/.venv, which is wrong on scratch)
 unset VIRTUAL_ENV 2>/dev/null || true
 
 if command -v uv &>/dev/null; then
@@ -83,28 +98,51 @@ if torch.cuda.is_available():
 "
 fi
 
-# ── Ensure preprocessed data exists ──────────────────────────────────────────
-if [[ ! -f "data/processed/normal_scaled.npy" ]]; then
-    echo "data/processed/normal_scaled.npy not found — running preprocessing on compute node..."
-    uv run python -m src.data.preprocessing --config config/params.yaml
+
+# ── Phase 4.1: Validation search (§4.8.6) ───────────────────────────────────
+# Preprocessing is ALWAYS executed: data/processed/ may be stale from a previous
+# run (different hyperparameters, window size, or scaler), so re-generating it
+# guarantees the search step consumes a consistent, up-to-date dataset.
+# Verify raw data exists before attempting preprocessing
+if [[ ! -f "data/raw/KukaNormal.npy" || ! -f "data/raw/KukaSlow.npy" || ! -f "data/raw/KukaColumnNames.npy" ]]; then
+    echo "ERROR: Raw data files missing in data/raw!"
+    echo "  Required: KukaNormal.npy, KukaSlow.npy, KukaColumnNames.npy"
+    echo "  Run ./hpc_connect.sh deploy first to upload them, or upload manually:"
+    echo "  scp data/raw/*.npy polito-hpc:~/am01_project/data/raw/"
+    exit 1
+fi
+# Log raw data shapes for debugging
+echo "=== Raw data verification ==="
+uv run python -c 'import numpy as np
+normal = np.load("data/raw/KukaNormal.npy", mmap_mode="r")
+slow = np.load("data/raw/KukaSlow.npy", mmap_mode="r")
+cols = np.load("data/raw/KukaColumnNames.npy", allow_pickle=True)
+print(f"KukaNormal: {normal.shape}")
+print(f"KukaSlow: {slow.shape}")
+print(f"ColumnNames: {cols.shape}")
+'
+uv run python -m src.data.preprocessing --config config/params_validated.yaml
+
+# Build command args for run_search_aae
+# --seed is for ParameterSampler sampling only; training seeds are fixed: [7, 42, 123]
+# (--val-seeds) per config (§4.8.6)
+SEARCH_ARGS=("--seed" "42" "--max-val-epochs" "${MAX_VAL_EPOCHS}" "--no-resume")
+if [[ -n "${N_ITER}" ]]; then
+    SEARCH_ARGS+=("--n-iter" "${N_ITER}")
+    echo "=== Phase 4.1: AAE validation search (random ${N_ITER} configs × 3 seeds, max ${MAX_VAL_EPOCHS} epochs) ==="
+else
+    echo "=== Phase 4.1: AAE validation search (EXHAUSTIVE - all 30 configs × 3 seeds = 90 runs, max ${MAX_VAL_EPOCHS} epochs) ==="
 fi
 
-# ── Phase 4.1: AAE Validation search (§4.8.6) ───────────────────────────────
-echo "=== Phase 4.1: AAE validation search (${N_ITER} iterations, max ${MAX_VAL_EPOCHS} epochs) ==="
-uv run python -m src.validation.run_search_aae \
-    --params config/params_validated_ae.yaml \
-    --n-iter "${N_ITER}" \
-    --seed 42 \
-    --max-val-epochs "${MAX_VAL_EPOCHS}" \
-    --no-resume
+uv run python -m src.validation.run_search_aae "${SEARCH_ARGS[@]}"
 
-# ── Phase 4.1b: Analyze results → params_validated_aae.yaml + plots (§4.8.8) ─
+# ── Phase 4.1b: Analyze results → params_validated.yaml + plots (§4.8.8) ─
 echo "=== Phase 4.1b: Analyzing AAE results ==="
 uv run python -m src.validation.analyze_results --aae
 
 # ── Verify outputs ──────────────────────────────────────────────────────────
 echo "=== Outputs ==="
-ls -lh reports/tables/validation_results_aae.csv reports/figures/sensitivity_aae_*.png config/params_validated_aae.yaml 2>/dev/null || true
+ls -lh reports/tables/validation_results_aae.csv reports/figures/sensitivity_aae_*.png config/params_validated.yaml 2>/dev/null || true
 
 # ── Fetch results back to $HOME (so hpc_connect.sh batch can download) ──────
 RESULTS_DIR="${SCRATCH_DIR}/${SCRATCH_PROJECT}"
@@ -113,20 +151,34 @@ HOME_PROJECT="${HOME}/am01_project"
 mkdir -p "${HOME_PROJECT}/reports/tables" "${HOME_PROJECT}/reports/figures" "${HOME_PROJECT}/config"
 mkdir -p "${HOME_PROJECT}/logs"
 
-# CSV + YAML + plots
-rsync -a --include='validation_results_aae.csv' --include='aae_final_metrics.csv' \
-          --include='params_validated_aae.yaml' \
-          --include='sensitivity_aae_*.png' --include='*.png' \
-          --include='*' --exclude='*' \
-    "${RESULTS_DIR}/reports/" "${HOME_PROJECT}/reports/" 2>/dev/null || true
+# Remove stale training residue from previous runs.
+# Validation phase does NOT produce aae_final_metrics.csv — clear it from BOTH
+# scratch (so it doesn't sync back to home) and home (the source of truth for
+# the local download).
+rm -f "${RESULTS_DIR}/reports/tables/aae_final_metrics.csv" \
+      "${HOME_PROJECT}/reports/tables/aae_final_metrics.csv" 2>/dev/null || true
 
-rsync -a --include='params_validated_aae.yaml' \
-          --include='*.yaml' --include='*' --exclude='*' \
-    "${RESULTS_DIR}/config/" "${HOME_PROJECT}/config/" 2>/dev/null || true
+# CSV + YAML + plots --delete: remove stale files not present in this run's output.
+rsync -a --delete --info=progress2 \
+    "${RESULTS_DIR}/reports/tables/" "${HOME_PROJECT}/reports/tables/"
+rsync -a --delete --info=progress2 \
+    "${RESULTS_DIR}/reports/figures/" "${HOME_PROJECT}/reports/figures/"
 
-# Log
-cp "${HOME}/jobs/logs/am01_aae_search_${SLURM_JOB_ID}.log" "${HOME_PROJECT}/logs/" 2>/dev/null || \
-    cp "${RESULTS_DIR}/logs"/am01_aae_search_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+# params_validated.yaml (produced by analyze_results)
+rsync -a --info=progress2 \
+    "${RESULTS_DIR}/config/" "${HOME_PROJECT}/config/"
+
+# data/processed/ — sync from scratch to home so cmd_batch can download
+# --delete removes stale artifacts (e.g., old plan_*.npy no longer generated)
+rsync -a --delete --info=progress2 --include='*.npy' --include='*.pkl' --include='*.json' --exclude='*' \
+    "${RESULTS_DIR}/data/processed/" "${HOME_PROJECT}/data/processed/"
+
+# Log — SLURM writes to ~/jobs/logs/ (relative to sbatch submission dir), not to scratch
+cp ~/jobs/logs/am01_aae_search_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+
+# Debug: verify figures synced to home
+echo "=== Debug: figures on home ==="
+ls -la "${HOME_PROJECT}/reports/figures/" 2>/dev/null || echo "No figures dir on home"
 
 echo "=== Results fetched to ${HOME_PROJECT}/reports/ and ${HOME_PROJECT}/config/ ==="
 echo "Job completed."

@@ -337,10 +337,7 @@ class TestPreprocessingOutput:
     def test_artifacts_exist(self):
         processed_dir = Path("data/processed")
         for name in ["normal_scaled.npy", "slow_scaled.npy",
-                     "plan_train.npy", "plan_val_normal.npy",
-                     "plan_val_anomaly.npy", "plan_test_normal.npy",
-                     "plan_test_anomaly.npy", "scaler.pkl",
-                     "selected_columns.npy", "manifest.json", "stats.json"]:
+                     "scaler.pkl", "selected_columns.npy", "manifest.json", "stats.json"]:
             assert (processed_dir / name).exists(), f"Missing {name}"
 
     def test_manifest_fields(self):

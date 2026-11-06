@@ -1,7 +1,7 @@
 """CLI for final AE training with validated hyperparameters (§3.2).
 
 After Fase 3.1 validation selects HP_AE_best and writes
-``config/params_validated_ae.yaml``, this script performs the final training:
+``config/params_validated.yaml``, this script performs the final training:
 
     - 3 runs with different seeds (nested validation, §4.8.1)
     - Selects best model by **test** PR-AUC (tie-break: ROC-AUC)
@@ -10,8 +10,8 @@ After Fase 3.1 validation selects HP_AE_best and writes
     - Writes reports/tables/ae_final_metrics.csv with per-seed metrics + MEAN+/-STD
 
 Usage:
-    python -m src.models.train_ae --config config/params_validated_ae.yaml
-    python -m src.models.train_ae --config config/params_validated_ae.yaml --seeds 42 123 7
+    python -m src.models.train_ae --config config/params_validated.yaml
+    python -m src.models.train_ae --config config/params_validated.yaml --seeds 42 123 7
 """
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ def train_single_seed(
     Parameters
     ----------
     config : dict
-        Validated config (from params_validated_ae.yaml).
+        Validated config (from params_validated.yaml).
     seed : int
         Random seed for this run.
     checkpoint_path : str | Path | None
@@ -254,7 +254,7 @@ def run_final_training(
     Parameters
     ----------
     config_path : str | Path
-        Path to ``params_validated_ae.yaml``.
+        Path to ``params_validated.yaml``.
     seeds : list[int] or None
         Seeds for nested runs. Defaults to ``[42, 123, 7]``.
     device : str | torch.device | None
@@ -424,8 +424,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config", type=Path,
-        default=Path("config/params_validated_ae.yaml"),
-        help="Path to params_validated_ae.yaml (default: config/params_validated_ae.yaml)",
+        default=Path("config/params_validated.yaml"),
+        help="Path to params_validated.yaml (default: config/params_validated.yaml)",
     )
     parser.add_argument(
         "--seeds", type=int, nargs="+", default=None,

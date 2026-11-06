@@ -37,7 +37,6 @@ env/
 
 # Model results
 diagnostics/
-*.pth
 *.pt
 *.ckpt
 

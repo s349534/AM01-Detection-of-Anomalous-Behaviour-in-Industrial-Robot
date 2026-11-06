@@ -72,33 +72,51 @@ fi
 # ── Ensure preprocessed data exists ──────────────────────────────────────────
 if [[ ! -f "data/processed/normal_scaled.npy" ]]; then
     echo "data/processed/normal_scaled.npy not found — running preprocessing on compute node..."
-    uv run python -m src.data.preprocessing --config config/params.yaml
+    uv run python -m src.data.preprocessing --config config/params_validated.yaml
 fi
 
 # ── Phase 4.2: Final AAE training with validated HPs (3 seeds) ──────────────
 echo "=== Phase 4.2: Final AAE training (3 seeds) ==="
 SEEDS="${SEEDS:-42 123 7}"
 uv run python -m src.models.train_aae \
-    --config config/params_validated_aae.yaml \
+    --config config/params_validated.yaml \
     --seeds ${SEEDS}
 
 # ── Verify outputs ──────────────────────────────────────────────────────────
 echo "=== Outputs ==="
-ls -lh reports/checkpoints/aae_final.pth reports/tables/aae_final_metrics.csv 2>/dev/null || true
+ls -lh reports/checkpoints/aae_final.pth reports/tables/aae_final_metrics.csv reports/figures/aae_confusion_matrix.png 2>/dev/null || true
 
 # ── Fetch results back to $HOME ─────────────────────────────────────────────
 RESULTS_DIR="${SCRATCH_DIR}/${SCRATCH_PROJECT}"
 HOME_PROJECT="${HOME}/am01_project"
 
-mkdir -p "${HOME_PROJECT}/reports/checkpoints" "${HOME_PROJECT}/reports/tables" "${HOME_PROJECT}/logs"
+# Debug: verify figures exist before sync ────────────────────────────────────
+echo "=== Debug: figures on scratch ==="
+ls -la "${RESULTS_DIR}/reports/figures/" 2>/dev/null || echo "No figures dir on scratch"
 
-rsync -a --progress \
-    "${RESULTS_DIR}/reports/checkpoints/" "${HOME_PROJECT}/reports/checkpoints/" 2>/dev/null || true
-rsync -a --progress \
-    "${RESULTS_DIR}/reports/tables/" "${HOME_PROJECT}/reports/tables/" 2>/dev/null || true
+mkdir -p "${HOME_PROJECT}/reports/checkpoints" "${HOME_PROJECT}/reports/tables" \
+         "${HOME_PROJECT}/reports/figures" "${HOME_PROJECT}/logs"
 
-cp "${HOME}/jobs/logs/am01_aae_train_${SLURM_JOB_ID}.log" "${HOME_PROJECT}/logs/" 2>/dev/null || \
-    cp "${RESULTS_DIR}/logs"/am01_aae_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+# No --ignore-existing: new results must overwrite stale ones
+# --delete ensures stale artifacts are removed
+# Use --info=progress2 for visibility, no head truncation
+rsync -a --delete --info=progress2 \
+    "${RESULTS_DIR}/reports/checkpoints/" "${HOME_PROJECT}/reports/checkpoints/"
+rsync -a --delete --info=progress2 \
+    "${RESULTS_DIR}/reports/tables/" "${HOME_PROJECT}/reports/tables/"
+rsync -a --delete --info=progress2 \
+    "${RESULTS_DIR}/reports/figures/" "${HOME_PROJECT}/reports/figures/"
+
+# Sync processed data
+rsync -a --delete --info=progress2 --include='*.npy' --include='*.pkl' --include='*.json' --exclude='*' \
+    "${RESULTS_DIR}/data/processed/" "${HOME_PROJECT}/data/processed/"
+
+# Log — SLURM writes to ~/jobs/logs/ (relative to sbatch submission dir), not to scratch
+cp ~/jobs/logs/am01_aae_train_*.log "${HOME_PROJECT}/logs/" 2>/dev/null || true
+
+# Debug: verify figures synced to home
+echo "=== Debug: figures on home ==="
+ls -la "${HOME_PROJECT}/reports/figures/" 2>/dev/null || echo "No figures dir on home"
 
 echo "=== Results fetched to ${HOME_PROJECT}/reports/ ==="
 echo "Job completed."

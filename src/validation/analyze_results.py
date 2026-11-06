@@ -78,8 +78,7 @@ def get_default_output_dir(config: dict) -> Path:
 
 
 def get_default_params_path(is_aae: bool = False) -> Path:
-    fname = "params_validated_aae.yaml" if is_aae else "params_validated_ae.yaml"
-    return Path("config") / fname
+    return Path("config") / "params_validated.yaml"
 
 
 def load_results_csv(csv_path: Path, is_aae: bool = False) -> list[dict[str, Any]]:
@@ -423,10 +422,14 @@ def write_validated_params_ae(
     base_config: dict,
     output_path: Path,
 ) -> None:
-    """Write params_validated_ae.yaml with the best hyperparameters."""
+    """Write params_validated.yaml with the best AE hyperparameters (base section only)."""
     validated = copy.deepcopy(base_config)
     validated["data"]["window_size"] = best.W
     validated["model"]["latent_dim"] = best.latent_dim
+
+    # Preserve aae section if it exists in base_config
+    if "aae" in base_config:
+        validated["aae"] = copy.deepcopy(base_config["aae"])
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
@@ -440,19 +443,32 @@ def write_validated_params_aae(
     base_config: dict,
     output_path: Path,
 ) -> None:
-    """Write params_validated_aae.yaml with the best AAE hyperparameters."""
+    """Write params_validated.yaml with the best AAE hyperparameters (base + aae sections).
+    
+    Note: W and latent_dim are inherited from AE (not re-validated in AAE search),
+    so we keep the base_config values for those.
+    """
     validated = copy.deepcopy(base_config)
+    
+    # Update aae section
+    if "aae" not in validated:
+        validated["aae"] = {}
+    if "training" not in validated["aae"]:
+        validated["aae"]["training"] = {}
+    if "discriminator" not in validated["aae"]:
+        validated["aae"]["discriminator"] = {}
+    
     if isinstance(best, AggregatedConfigAAE):
-        validated["training"]["reconstruction_weight"] = float(best.reconstruction_weight)
-        validated["training"]["adversarial_weight"] = float(best.adversarial_weight)
-        validated["model"]["discriminator"]["hidden_layers"] = list(best.discriminator_hidden_layers)
+        validated["aae"]["training"]["reconstruction_weight"] = float(best.reconstruction_weight)
+        validated["aae"]["training"]["adversarial_weight"] = float(best.adversarial_weight)
+        validated["aae"]["discriminator"]["hidden_layers"] = list(best.discriminator_hidden_layers)
     else:
-        validated["training"]["reconstruction_weight"] = float(best["reconstruction_weight"])
-        validated["training"]["adversarial_weight"] = float(best["adversarial_weight"])
+        validated["aae"]["training"]["reconstruction_weight"] = float(best["reconstruction_weight"])
+        validated["aae"]["training"]["adversarial_weight"] = float(best["adversarial_weight"])
         disc_layers = best["discriminator_hidden_layers"]
         if isinstance(disc_layers, str):
             disc_layers = eval(disc_layers)
-        validated["model"]["discriminator"]["hidden_layers"] = list(disc_layers)
+        validated["aae"]["discriminator"]["hidden_layers"] = list(disc_layers)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
@@ -469,11 +485,9 @@ def run_analysis(
     is_aae: bool = False,
 ) -> dict[str, Any]:
     """Run the analysis pipeline."""
-    if is_aae:
-        val_ae_path = Path("config/params_validated_ae.yaml")
-        config = load_config(params_path=val_ae_path if val_ae_path.exists() else None)
-    else:
-        config = load_config()
+    # Load unified validated config (contains both base and aae sections)
+    unified_path = Path("config/params_validated.yaml")
+    config = load_config(params_path=unified_path if unified_path.exists() else None)
 
     if csv_path is None:
         csv_path = get_default_results_path(config, is_aae=is_aae)

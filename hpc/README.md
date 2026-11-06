@@ -218,7 +218,7 @@ Se invece preferisci il controllo manuale:
 | `hpc_connect.sh` | Dispatcher SSH/SLURM (upload, deploy, submit, batch, interactive, exec). Include `data/raw/` nel deploy rsync. |
 | `setup_env.sh` | Installa `uv`, crea il venv con `uv sync --frozen` (Python 3.13), registra kernel Jupyter `am01-hpc` (run in automatico da `deploy`) |
 | `slurm_job_template.sh` | Template generico SLURM: rsync → scratch, `uv sync`, torch/CUDA check, preprocessing trigger, lancia `src/main.py` |
-| `slurm_ae_search.sh` | **Fase 3.1**: validation search (`run_search_ae.py --no-resume`) → `validation_results_ae.csv` + `params_validated_ae.yaml` + 3 plots. **Default: exhaustive (all 50 combos)**; use `N_ITER` for random subset. Preprocessing automatico su compute node. |
+| `slurm_ae_search.sh` | **Fase 3.1**: validation search (`run_search_ae.py --no-resume`) → `validation_results_ae.csv` + `params_validated.yaml` + 3 plots. **Default: exhaustive (all 50 combos)**; use `N_ITER` for random subset. Preprocessing automatico su compute node. |
 | `slurm_ae_train.sh` | **Fase 3.2**: training finale 3 seed (`train_ae.py`) → `ae_baseline.pth` + `ae_final_metrics.csv`. Preprocessing saltato se `data/processed/` esiste. |
 
 ## 7. Workflow completo — da zero a risultati
@@ -244,7 +244,7 @@ MAX_VAL_EPOCHS=50 ./hpc_connect.sh batch hpc/slurm_ae_search.sh
 # 4. Al termine, verifica localmente:
 ls reports/tables/validation_results_ae.csv
 ls reports/figures/sensitivity_ae_*.png
-ls config/params_validated_ae.yaml
+ls config/params_validated.yaml
 ls logs/am01_ae_search_*.log
 
 # 5. Training finale (Fase 3.2): 3 seed

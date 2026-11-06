@@ -26,13 +26,11 @@ from src.data.dataset import build_dataloaders
 from src.models.inference import compute_errors_on_loader
 from src.models.adversarial_ae import AdversarialAutoencoder, fit_aae
 from src.utils.config import get_param
+from src.utils.device import check_cuda_available
 from src.evaluation.metrics import calculate_auc
 from src.utils.seed import set_seed
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_VAL_EPOCHS = 50
-
 
 def train_and_evaluate_aae(
     config: dict[str, Any],
@@ -54,7 +52,8 @@ def train_and_evaluate_aae(
     seed : int
         Random seed for reproducibility.
     max_val_epochs : int or None
-        Max epochs for this validation run. Defaults to DEFAULT_VAL_EPOCHS (50).
+        Max epochs for this validation run. Overrides config ``training.validation_epochs``
+        if provided. If not provided, reads from ``config["training"]["validation_epochs"]``.
     device : str | torch.device | None
         Device to train/evaluate on. None -> auto-detect.
     patience : int or None
@@ -73,12 +72,31 @@ def train_and_evaluate_aae(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     dev = torch.device(device)
 
+    # --- Early GPU check: fail fast if CUDA not actually usable ---
+    if dev.type == "cuda":
+        try:
+            check_cuda_available(dev)
+        except RuntimeError as e:
+            logger.error("GPU check failed in run_id=%d: %s", run_id, e)
+            raise
+
     # --- Extract hyperparameters ---
     window_size = int(get_param(config, "data.window_size", 256))
     latent_dim = int(get_param(config, "model.latent_dim", 16))
-    disc_hidden = tuple(get_param(config, "model.discriminator.hidden_layers", [32, 16]))
+    # Read discriminator hidden layers from aae.discriminator (new unified config)
+    # with fallback to model.discriminator (legacy)
+    disc_hidden = tuple(
+        get_param(config, "aae.discriminator.hidden_layers", get_param(config, "model.discriminator.hidden_layers", [32, 16]))
+    )
     batch_size = int(get_param(config, "training.batch_size", 256))
-    epochs = max_val_epochs or int(get_param(config, "training.epochs", DEFAULT_VAL_EPOCHS))
+    # Use validation_epochs from config; CLI max_val_epochs overrides if provided
+    val_epochs_cfg = get_param(config, "training.validation_epochs", None)
+    if val_epochs_cfg is not None:
+        epochs = int(val_epochs_cfg)
+    elif max_val_epochs is not None:
+        epochs = int(max_val_epochs)
+    else:
+        raise ValueError("training.validation_epochs not set in config and --max-val-epochs not provided")
     lr = float(get_param(config, "training.learning_rate", 1e-3))
     weight_decay = float(get_param(config, "training.weight_decay", 0.0))
     patience = patience if patience is not None else int(

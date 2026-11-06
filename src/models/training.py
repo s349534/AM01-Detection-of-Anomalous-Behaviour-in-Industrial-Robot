@@ -256,6 +256,8 @@ def fit_autoencoder(
                 "Epoch %3d/%3d — Train Loss: %.6f — Val Loss: %.6f",
                 epoch, epochs, train_loss, val_loss,
             )
+            import sys
+            sys.stdout.flush()
 
         # Early stopping check
         if val_loss < best_val_loss - min_delta:

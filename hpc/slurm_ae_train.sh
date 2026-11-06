@@ -105,7 +105,7 @@ print(f"KukaNormal: {normal.shape}")
 print(f"KukaSlow: {slow.shape}")
 print(f"ColumnNames: {cols.shape}")
 '
-uv run python -m src.data.preprocessing --config config/params_validated_ae.yaml
+uv run python -m src.data.preprocessing --config config/params_validated.yaml
 
 # Resolve SEEDS default BEFORE first use (fixes "unbound variable" error)
 SEEDS="${SEEDS:-42 123 7}"
@@ -114,7 +114,7 @@ MAX_EPOCHS="${MAX_EPOCHS:-}"
 echo "=== Phase 3.2: Final AE training (seeds=${SEEDS}) ==="
 
 TRAIN_CMD="uv run python -m src.models.train_ae \
-    --config config/params_validated_ae.yaml \
+    --config config/params_validated.yaml \
     --seeds ${SEEDS}"
 if [[ -n "${MAX_EPOCHS}" ]]; then
     TRAIN_CMD="${TRAIN_CMD} --max-epochs ${MAX_EPOCHS}"

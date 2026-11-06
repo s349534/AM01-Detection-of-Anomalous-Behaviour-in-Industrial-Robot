@@ -23,6 +23,8 @@ import sys
 import time
 from pathlib import Path
 
+import torch
+
 from sklearn.model_selection import ParameterGrid, ParameterSampler
 
 from src.utils.config import load_config
@@ -272,6 +274,11 @@ def run_search(
                 }
                 write_result_row_csv(output_csv, fail_row, write_header=write_header)
                 write_header = False
+
+            finally:
+                # Free GPU memory between runs to avoid OOM / busy device errors
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     logger.info("Search complete. Results: %s", output_csv)
     return output_csv

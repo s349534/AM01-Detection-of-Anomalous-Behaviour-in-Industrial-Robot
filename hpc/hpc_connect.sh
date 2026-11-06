@@ -507,13 +507,9 @@ EOFSRIPT
             "${PROJECT_ROOT}/reports/checkpoints/" 2>/dev/null || true
 
         # Download validated params (produced by analyze_results on the remote)
-        scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
-            "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null \
-            && echo "Validated AE params → ${PROJECT_ROOT}/config/params_validated_ae.yaml" \
-            || true
-        scp "$(ssh_target):~/am01_project/config/params_validated_aae.yaml" \
-            "${PROJECT_ROOT}/config/params_validated_aae.yaml" 2>/dev/null \
-            && echo "Validated AAE params → ${PROJECT_ROOT}/config/params_validated_aae.yaml" \
+        scp "$(ssh_target):~/am01_project/config/params_validated.yaml" \
+            "${PROJECT_ROOT}/config/params_validated.yaml" 2>/dev/null \
+            && echo "Validated params → ${PROJECT_ROOT}/config/params_validated.yaml" \
             || true
     else
         # Fallback: scp individual files (no rsync → no --delete, so we must
@@ -538,10 +534,8 @@ EOFSRIPT
         scp -r "$(ssh_target):~/am01_project/reports/figures/*" \
             "${PROJECT_ROOT}/reports/figures/" 2>/dev/null || true
         # Validated params
-        scp "$(ssh_target):~/am01_project/config/params_validated_ae.yaml" \
-            "${PROJECT_ROOT}/config/params_validated_ae.yaml" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/config/params_validated_ae.yaml" || true
-        scp "$(ssh_target):~/am01_project/config/params_validated_aae.yaml" \
-            "${PROJECT_ROOT}/config/params_validated_aae.yaml" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/config/params_validated_aae.yaml" || true
+        scp "$(ssh_target):~/am01_project/config/params_validated.yaml" \
+            "${PROJECT_ROOT}/config/params_validated.yaml" 2>/dev/null && echo "  Downloaded: ${PROJECT_ROOT}/config/params_validated.yaml" || true
     fi
 
     # Download latest log (fetched to ~/am01_project/logs/ by SLURM post-run rsync)
@@ -554,7 +548,7 @@ EOFSRIPT
     fi
 
     echo ""
-    echo "Done.  Data: ${PROJECT_ROOT}/data/processed/   Reports: ${PROJECT_ROOT}/reports/   Config: ${PROJECT_ROOT}/config/params_validated_ae.yaml   Log: ${PROJECT_ROOT}/logs/"
+    echo "Done.  Data: ${PROJECT_ROOT}/data/processed/   Reports: ${PROJECT_ROOT}/reports/   Config: ${PROJECT_ROOT}/config/params_validated.yaml   Log: ${PROJECT_ROOT}/logs/"
 }
 
 cmd_help() {

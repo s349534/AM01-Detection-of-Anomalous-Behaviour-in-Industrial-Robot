@@ -258,10 +258,14 @@ class AdversarialAutoencoder(nn.Module):
         pool_size = int(get_param(config, "model.encoder.pool_size", 2))
         activation = str(get_param(config, "model.encoder.activation", "relu"))
 
+        # Read discriminator params from aae.discriminator (new unified config) 
+        # with fallback to model.discriminator (legacy)
         disc_hidden = tuple(
-            get_param(config, "model.discriminator.hidden_layers", [32, 16])
+            get_param(config, "aae.discriminator.hidden_layers", get_param(config, "model.discriminator.hidden_layers", [32, 16]))
         )
-        disc_act = str(get_param(config, "model.discriminator.activation", "leaky_relu"))
+        disc_act = str(
+            get_param(config, "aae.discriminator.activation", get_param(config, "model.discriminator.activation", "leaky_relu"))
+        )
 
         return cls(
             input_dim=input_dim,
@@ -440,6 +444,14 @@ def fit_aae(
         history["recon_loss"].append(tr_recon)
         history["adv_loss"].append(tr_adv)
         history["val_loss"].append(val_loss)
+
+        if epoch % 5 == 0 or epoch == epochs:
+            logger.info(
+                "Epoch %3d/%3d — Train: %.6f — Recon: %.6f — Adv: %.6f — Val: %.6f",
+                epoch, epochs, tr_total, tr_recon, tr_adv, val_loss,
+            )
+            import sys
+            sys.stdout.flush()
 
         if early_stopping(val_loss, model):
             logger.info("Early stopping triggered at epoch %d", epoch)
