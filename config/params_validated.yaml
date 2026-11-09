@@ -47,7 +47,7 @@ data:
       test_anomaly: 0.5
 model:
   input_dim: 86
-  latent_dim: 32
+  latent_dim: 16
   encoder:
     conv_channels:
     - 64

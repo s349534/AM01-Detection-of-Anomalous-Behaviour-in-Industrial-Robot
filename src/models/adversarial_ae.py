@@ -396,13 +396,18 @@ def fit_aae(
     reconstruction_weight: float = 1.0,
     adversarial_weight: float = 0.1,
     discriminator_updates_per_gen: int = 1,
+    discriminator_lr_factor: float = 0.1,
     patience: int = 10,
     min_delta: float = 1e-4,
     checkpoint_path: str | Path | None = None,
     device: str | torch.device | None = None,
     metric: Literal["mse", "mae"] = "mae",
 ) -> dict[str, list[float]]:
-    """Complete AAE training loop with early stopping."""
+    """Complete AAE training loop with early stopping.
+
+    The discriminator uses a separate learning rate equal to
+    ``learning_rate * discriminator_lr_factor``.
+    """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     dev = torch.device(device)
@@ -413,7 +418,7 @@ def fit_aae(
 
     ae_params = list(model.encoder.parameters()) + list(model.decoder.parameters())
     optimizer_ae = torch.optim.Adam(ae_params, lr=learning_rate, weight_decay=weight_decay)
-    optimizer_disc = torch.optim.Adam(model.discriminator.parameters(), lr=learning_rate, betas=(0.5, 0.999))
+    optimizer_disc = torch.optim.Adam(model.discriminator.parameters(), lr=learning_rate * discriminator_lr_factor, betas=(0.5, 0.999))
 
     history: dict[str, list[float]] = {
         "train_loss": [],

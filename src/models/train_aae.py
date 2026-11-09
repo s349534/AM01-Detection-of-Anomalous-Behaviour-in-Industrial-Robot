@@ -274,20 +274,25 @@ def run_final_training(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     results: list[dict[str, Any]] = []
-    best_val_auc = -1.0
-    best_seed = seeds[0]
 
     for seed in seeds:
         seed_ckpt = ckpt_dir / f"aae_final_seed{seed}.pth"
         res = train_single_seed(config, seed=seed, checkpoint_path=seed_ckpt, device=device)
         results.append(res)
 
-        if res["_val_roc_auc"] > best_val_auc:
-            best_val_auc = res["_val_roc_auc"]
-            best_seed = seed
-            final_ckpt = ckpt_dir / "aae_final.pth"
-            shutil.copy2(seed_ckpt, final_ckpt)
-            logger.info("New best AAE model (seed=%d, val_roc_auc=%.4f) -> %s", seed, best_val_auc, final_ckpt)
+    best_result = max(results, key=lambda r: (r["test_pr_auc"], r["test_roc_auc"]))
+    best_seed = best_result["seed"]
+    best_ckpt_src = ckpt_dir / f"aae_final_seed{best_seed}.pth"
+    final_ckpt = ckpt_dir / "aae_final.pth"
+    shutil.copy2(best_ckpt_src, final_ckpt)
+    logger.info("Best AAE seed by test PR-AUC: %d (PR-AUC=%.4f, ROC-AUC=%.4f) -> %s", best_seed, best_result["test_pr_auc"], best_result["test_roc_auc"], final_ckpt)
+
+    # Remove per-seed checkpoints — keep only the canonical aae_final.pth
+    for seed in seeds:
+        seed_ckpt = ckpt_dir / f"aae_final_seed{seed}.pth"
+        if seed_ckpt.exists():
+            seed_ckpt.unlink()
+            logger.debug("Removed per-seed checkpoint %s", seed_ckpt)
 
     # Write metrics CSV
     with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
