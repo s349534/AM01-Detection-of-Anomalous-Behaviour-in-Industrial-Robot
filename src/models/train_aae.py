@@ -101,10 +101,20 @@ def train_single_seed(
     disc_updates_per_gen = int(
         get_param(config, "aae.training.discriminator_updates_per_gen", 1)
     )
+    disc_lr_factor = float(
+        get_param(
+            config,
+            "aae.training.discriminator_lr_factor",
+            get_param(config, "training.discriminator_lr_factor", 0.1),
+        )
+    )
     loss_name = str(get_param(config, "training.loss", "mae"))
     metric = str(get_param(config, "training.reconstruction_metric", "mae"))
 
-    logger.info("Training AAE (seed=%d) on %s, epochs=%d, patience=%d", seed, dev, epochs, patience)
+    logger.info(
+        "Training AAE (seed=%d) on %s, epochs=%d, patience=%d, lr=%.6g, disc_lr_factor=%.6g",
+        seed, dev, epochs, patience, lr, disc_lr_factor,
+    )
 
     # --- Build dataloaders ---
     loaders = build_dataloaders(
@@ -135,6 +145,7 @@ def train_single_seed(
         reconstruction_weight=reconstruction_weight,
         adversarial_weight=adversarial_weight,
         discriminator_updates_per_gen=disc_updates_per_gen,
+        discriminator_lr_factor=disc_lr_factor,
         patience=patience,
         min_delta=min_delta,
         checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
@@ -280,12 +291,18 @@ def run_final_training(
         res = train_single_seed(config, seed=seed, checkpoint_path=seed_ckpt, device=device)
         results.append(res)
 
-    best_result = max(results, key=lambda r: (r["test_pr_auc"], r["test_roc_auc"]))
+    best_result = max(results, key=lambda r: (r.get("_val_pr_auc", -1.0), r.get("_val_roc_auc", -1.0)))
     best_seed = best_result["seed"]
     best_ckpt_src = ckpt_dir / f"aae_final_seed{best_seed}.pth"
     final_ckpt = ckpt_dir / "aae_final.pth"
     shutil.copy2(best_ckpt_src, final_ckpt)
-    logger.info("Best AAE seed by test PR-AUC: %d (PR-AUC=%.4f, ROC-AUC=%.4f) -> %s", best_seed, best_result["test_pr_auc"], best_result["test_roc_auc"], final_ckpt)
+    logger.info(
+        "Best AAE seed by validation PR-AUC: %d (val PR-AUC=%.4f, val ROC-AUC=%.4f) -> %s",
+        best_seed,
+        best_result.get("_val_pr_auc", float("nan")),
+        best_result.get("_val_roc_auc", float("nan")),
+        final_ckpt,
+    )
 
     # Remove per-seed checkpoints — keep only the canonical aae_final.pth
     for seed in seeds:

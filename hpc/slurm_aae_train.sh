@@ -46,7 +46,6 @@ if [[ -d "${HOME}/am01_project" ]]; then
         --exclude='.git/' \
         --exclude='__pycache__/' \
         --exclude='.ipynb_checkpoints/' \
-        --exclude='data/raw/' \
         --exclude='*.pth' --exclude='*.pt' --exclude='*.ckpt' \
         "${HOME}/am01_project/" "${SCRATCH_DIR}/${SCRATCH_PROJECT}/"
     echo "Synced project to scratch."

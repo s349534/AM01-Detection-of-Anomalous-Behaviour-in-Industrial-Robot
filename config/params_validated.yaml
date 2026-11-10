@@ -81,6 +81,7 @@ aae:
     reconstruction_weight: 1.4
     adversarial_weight: 0.001
     discriminator_updates_per_gen: 1
+    discriminator_lr_factor: 0.1
   discriminator:
     hidden_layers:
     - 16

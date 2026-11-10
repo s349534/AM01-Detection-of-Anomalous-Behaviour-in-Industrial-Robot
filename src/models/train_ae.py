@@ -174,9 +174,20 @@ def train_single_seed(
     train_time_sec = time.time() - start_time
     best_epoch = history.get("best_epoch", 0) if history else 0
 
-    # --- Evaluate on the TEST set (threshold calibrated on validation) ---
+    # --- Evaluate on validation (for model/seed selection) and TEST set ---
     # The decision threshold is calibrated on validation (val_normal + val_anomaly)
     # and then applied unchanged to the test set.
+    val_normal_errors = compute_errors_on_loader(model, val_normal_loader, dev, metric="mae")
+    val_anomaly_errors = compute_errors_on_loader(model, val_anomaly_loader, dev, metric="mae")
+    val_errors = np.concatenate([val_normal_errors, val_anomaly_errors])
+    val_labels = np.concatenate([
+        np.zeros(len(val_normal_errors), dtype=np.int32),
+        np.ones(len(val_anomaly_errors), dtype=np.int32),
+    ])
+    val_auc = calculate_auc(val_labels, val_errors)
+    val_pr_auc = float(val_auc["pr_auc"])
+    val_roc_auc = float(val_auc["roc_auc"])
+
     threshold, _val_metrics = calibrate_threshold(
         model, val_normal_loader, val_anomaly_loader, dev, metric="mae", method="f1_optimal"
     )
@@ -191,9 +202,9 @@ def train_single_seed(
     cm = test_metrics["confusion_matrix"]
 
     logger.info(
-        "Test metrics (seed=%d): ROC-AUC=%.4f, PR-AUC=%.4f, F1=%.4f, acc=%.4f "
-        "[TN=%d FP=%d FN=%d TP=%d]",
-        seed, test_metrics["roc_auc"], test_metrics["pr_auc"], test_metrics["f1"],
+        "Seed %d: val PR-AUC=%.4f, val ROC-AUC=%.4f | test PR-AUC=%.4f, test ROC-AUC=%.4f, F1=%.4f, acc=%.4f [TN=%d FP=%d FN=%d TP=%d]",
+        seed, val_pr_auc, val_roc_auc,
+        test_metrics["pr_auc"], test_metrics["roc_auc"], test_metrics["f1"],
         test_metrics["accuracy"], cm["tn"], cm["fp"], cm["fn"], cm["tp"],
     )
 
@@ -216,6 +227,9 @@ def train_single_seed(
         "train_time_sec": round(train_time_sec, 2),
         "best_epoch": best_epoch,
         "threshold": round(float(threshold), 6),
+        # Validation-set metrics (used for model/seed selection)
+        "_val_pr_auc": val_pr_auc,
+        "_val_roc_auc": val_roc_auc,
         # Test-set metrics (threshold calibrated on validation)
         "test_pr_auc": round(test_metrics["pr_auc"], 6),
         "test_roc_auc": round(test_metrics["roc_auc"], 6),
@@ -318,17 +332,18 @@ def run_final_training(
                                    checkpoint_path=save_ckpt, device=device)
         all_results.append(result)
 
-    # --- Select best seed by test PR-AUC (tie-break: ROC-AUC) ---
+    # --- Select best seed by validation PR-AUC (tie-break: ROC-AUC) ---
     best_result = max(all_results, key=lambda r: (
-        r["test_pr_auc"], r["test_roc_auc"]
+        r.get("_val_pr_auc", -1.0), r.get("_val_roc_auc", -1.0)
     ))
     best_seed = best_result["seed"]
-    logger.info("Best seed by test PR-AUC: %d (PR-AUC=%.4f, ROC-AUC=%.4f)",
-                best_seed, best_result["test_pr_auc"], best_result["test_roc_auc"])
+    logger.info("Best seed by validation PR-AUC: %d (val PR-AUC=%.4f, val ROC-AUC=%.4f)",
+                best_seed, best_result.get("_val_pr_auc", float("nan")),
+                best_result.get("_val_roc_auc", float("nan")))
 
-    # --- Log final test metrics for BEST SEED (not aggregate) ---
+    # --- Log test metrics for BEST SEED (selected on validation, not test) ---
     logger.info("=" * 70)
-    logger.info("FINAL TEST METRICS - BEST SEED: %d (selected by test PR-AUC)", best_seed)
+    logger.info("TEST METRICS - BEST SEED: %d (selected by validation PR-AUC)", best_seed)
     logger.info("=" * 70)
     logger.info("  Test PR-AUC:        %.4f", best_result["test_pr_auc"])
     logger.info("  Test ROC-AUC:       %.4f", best_result["test_roc_auc"])

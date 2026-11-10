@@ -112,13 +112,20 @@ def train_and_evaluate_aae(
     disc_updates_per_gen = int(
         get_param(config, "training.discriminator_updates_per_gen", 1)
     )
+    disc_lr_factor = float(
+        get_param(
+            config,
+            "aae.training.discriminator_lr_factor",
+            get_param(config, "training.discriminator_lr_factor", 0.1),
+        )
+    )
     loss_name = str(get_param(config, "training.loss", "mae"))
     metric = str(get_param(config, "training.reconstruction_metric", "mae"))
 
     logger.info(
-        "AAE Run %d (seed=%d): W=%d, latent_dim=%d, disc_hidden=%s, recon_w=%.2f, adv_w=%.3f, epochs=%d",
+        "AAE Run %d (seed=%d): W=%d, latent_dim=%d, disc_hidden=%s, recon_w=%.2f, adv_w=%.3f, disc_lr_factor=%.6g, epochs=%d",
         run_id, seed, window_size, latent_dim, list(disc_hidden),
-        reconstruction_weight, adversarial_weight, epochs,
+        reconstruction_weight, adversarial_weight, disc_lr_factor, epochs,
     )
 
     # --- Build dataloaders (train, val_normal, val_anomaly) ---
@@ -149,6 +156,7 @@ def train_and_evaluate_aae(
         reconstruction_weight=reconstruction_weight,
         adversarial_weight=adversarial_weight,
         discriminator_updates_per_gen=disc_updates_per_gen,
+        discriminator_lr_factor=disc_lr_factor,
         patience=patience,
         min_delta=min_delta,
         checkpoint_path=None,
