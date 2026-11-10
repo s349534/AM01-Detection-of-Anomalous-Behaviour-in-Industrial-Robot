@@ -240,7 +240,7 @@
     "val_anomaly": 0.5,
     "val_normal": 0.5
   },
-  "timestamp": "2026-11-07T17:18:52.331149",
+  "timestamp": "2026-11-10T16:22:31.745060",
   "version": "1.0",
   "window_size": 32
 }
