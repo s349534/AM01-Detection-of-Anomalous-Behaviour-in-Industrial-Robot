@@ -304,13 +304,6 @@ def run_final_training(
         final_ckpt,
     )
 
-    # Remove per-seed checkpoints — keep only the canonical aae_final.pth
-    for seed in seeds:
-        seed_ckpt = ckpt_dir / f"aae_final_seed{seed}.pth"
-        if seed_ckpt.exists():
-            seed_ckpt.unlink()
-            logger.debug("Removed per-seed checkpoint %s", seed_ckpt)
-
     # Write metrics CSV
     with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=FINAL_METRICS_COLUMNS)

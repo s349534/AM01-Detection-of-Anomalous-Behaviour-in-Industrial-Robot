@@ -373,13 +373,6 @@ def run_final_training(
     shutil.copy2(best_ckpt_src, best_ckpt_dst)
     logger.info("Copied best checkpoint to %s", best_ckpt_dst)
 
-    # Remove per-seed checkpoints — keep only the canonical ae_baseline.pth
-    for seed in seeds:
-        seed_ckpt = ckpt_dir / f"ae_baseline_seed{seed}.pth"
-        if seed_ckpt.exists():
-            seed_ckpt.unlink()
-            logger.debug("Removed per-seed checkpoint %s", seed_ckpt)
-
     # --- Write the final metrics CSV: one row per trained seed + MEAN+/-STD row ---
     # TEST metrics only — the validation metrics are in validation_results_ae.csv.
     with open(metrics_path, "w", newline="", encoding="utf-8") as f:
